@@ -828,7 +828,18 @@ function fileUrl(f) {
 }
 
 const app = express();
+app.disable('x-powered-by'); // ne pas annoncer la techno du serveur
 app.set('trust proxy', 1); // m10 : derrière Render, req.ip = vraie IP cliente (pas de x-forwarded-for falsifiable)
+// ---------- durcissement sécurité v1.54 : headers ----------
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+  if (req.secure || req.headers['x-forwarded-proto'] === 'https')
+    res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  next();
+});
 app.use(express.json({ limit: '2mb' }));
 
 // ---------- helpers ----------
@@ -988,8 +999,8 @@ app.post('/api/auth/register', async (req, res) => {
     username = (username || '').toLowerCase().trim();
     if (!validUsername(username))
       return res.status(400).json({ error: "pseudo invalide (lettres, chiffres, . _ — 2 à 24)" });
-    if (!password || password.length < 4)
-      return res.status(400).json({ error: 'mot de passe : 4 caractères minimum' });
+    if (!password || password.length < 8)
+      return res.status(400).json({ error: 'mot de passe : 8 caractères minimum' });
     email = (email || '').trim().toLowerCase() || null;
     if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))
       return res.status(400).json({ error: 'e-mail invalide' });
@@ -3352,9 +3363,11 @@ app.post('/api/live/:id/gift', auth, async (req, res) => {
     const g = GIFT_CATALOG.find(x => x.id === String((req.body || {}).gift_id || ''));
     if (!g) return res.status(400).json({ error: 'cadeau inconnu' });
     const me = await get1('SELECT * FROM users WHERE id=?', req.userId);
-    if (!me || me.coins < g.cost) return res.status(400).json({ error: 'pas assez de pièces' });
+    if (!me) return res.status(400).json({ error: 'compte introuvable' });
     if (Number(l.user_id) === Number(req.userId)) return res.status(400).json({ error: 'impossible' });
-    await runSql('UPDATE users SET coins=coins-? WHERE id=?', g.cost, req.userId);
+    // débit atomique anti double-envoi (race condition)
+    const debited = await runSqlChanges('UPDATE users SET coins=coins-? WHERE id=? AND coins>=?', g.cost, req.userId, g.cost);
+    if (!debited) return res.status(400).json({ error: 'pas assez de pièces' });
     await runSql('UPDATE users SET coins=coins+? WHERE id=?', g.cost, l.user_id);
     await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
       req.userId, -g.cost, 'cadeau live ' + g.id, now());
