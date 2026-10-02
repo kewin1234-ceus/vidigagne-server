@@ -830,6 +830,63 @@ app.get('/api/calls/:id/signal', auth, async (req, res) => {
     res.json({ signals: rows.map(s => ({ id: s.id, kind: s.kind, from: s.from_user_id, payload: s.payload })) });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
+// v1.62 : import en masse de musiques libres de droits (admin)
+// Body: { tracks: [{title, artist, genre, url}] } — télécharge chaque MP3, l'envoie
+// sur Cloudinary et l'insère dans la table sounds (user_id=0 = catalogue système).
+app.post('/api/admin/sounds/bulk-import', async (req, res) => {
+  const t = req.headers['x-admin-token'];
+  if (!process.env.ADMIN_TOKEN || t !== process.env.ADMIN_TOKEN)
+    return res.status(403).json({ error: 'non autorisé' });
+  if (!USE_CLOUDINARY || !cloudinary)
+    return res.status(500).json({ error: 'Cloudinary non configuré' });
+  const tracks = ((req.body || {}).tracks || []).slice(0, 60);
+  if (!tracks.length) return res.status(400).json({ error: 'tracks requis' });
+  const https = require('https'), http = require('http');
+  const results = [];
+  const dl = (url) => new Promise((resolve, reject) => {
+    const mod = url.startsWith('https') ? https : http;
+    const rq = mod.get(url, { timeout: 60000, headers: { 'User-Agent': 'VidiGagne/1.0' } }, (rs) => {
+      if (rs.statusCode >= 300 && rs.statusCode < 400 && rs.headers.location)
+        return resolve(dl(rs.headers.location));
+      if (rs.statusCode !== 200) { rs.resume(); return reject(new Error('HTTP ' + rs.statusCode)); }
+      const chunks = []; let size = 0;
+      rs.on('data', (c) => { size += c.length; chunks.push(c);
+        if (size > 20 * 1024 * 1024) { rq.destroy(); reject(new Error('fichier trop gros')); } });
+      rs.on('end', () => resolve(Buffer.concat(chunks)));
+      rs.on('error', reject);
+    });
+    rq.on('timeout', () => { rq.destroy(); reject(new Error('timeout')); });
+    rq.on('error', reject);
+  });
+  for (const tr of tracks) {
+    const title = String(tr.title || 'Sans titre').slice(0, 200);
+    try {
+      // évite les doublons
+      const ex = await get1('SELECT id FROM sounds WHERE title=? AND artist=?',
+        title, String(tr.artist || ''));
+      if (ex) { results.push({ title, status: 'doublon' }); continue; }
+      const buf = await dl(String(tr.url));
+      if (buf.length < 50000) throw new Error('fichier trop petit');
+      // vérifie que c'est bien un MP3 (ID3 ou frame sync)
+      const isMp3 = (buf[0] === 0x49 && buf[1] === 0x44 && buf[2] === 0x33) ||
+                    (buf[0] === 0xFF && (buf[1] & 0xE0) === 0xE0);
+      if (!isMp3) throw new Error('pas un MP3');
+      const up = await new Promise((resolve, reject) => {
+        const st = cloudinary.uploader.upload_stream(
+          { resource_type: 'video', folder: 'vidigagne/sounds', format: 'mp3' },
+          (err, r) => err ? reject(err) : resolve(r));
+        st.end(buf);
+      });
+      await runSql(`INSERT INTO sounds(user_id,title,artist,audio_url,use_count,created_at)
+        VALUES(0,?,?,?,0,?)`, title, String(tr.artist || '').slice(0, 200),
+        up.secure_url, now());
+      results.push({ title, status: 'ok' });
+    } catch (e) {
+      results.push({ title, status: 'erreur: ' + e.message });
+    }
+  }
+  res.json({ ok: true, imported: results.filter(r => r.status === 'ok').length, results });
+});
 // v1.58 : recherche par image
     await pool.query(`CREATE TABLE IF NOT EXISTS verification_requests(
       id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL UNIQUE, status TEXT NOT NULL DEFAULT 'pending',
