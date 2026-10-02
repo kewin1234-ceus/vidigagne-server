@@ -231,6 +231,63 @@ CREATE TABLE IF NOT EXISTS poll_votes(
   user_id INTEGER NOT NULL,
   option_id INTEGER NOT NULL,
   PRIMARY KEY(poll_id, user_id)
+);
+CREATE TABLE IF NOT EXISTS notifications(
+  id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+  user_id INTEGER NOT NULL,
+  type TEXT NOT NULL,
+  actor_id INTEGER,
+  video_id INTEGER,
+  text TEXT NOT NULL DEFAULT '',
+  is_read INTEGER NOT NULL DEFAULT 0,
+  created_at BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS notif_user_idx ON notifications(user_id, created_at);
+CREATE TABLE IF NOT EXISTS reports(
+  id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+  reporter_id INTEGER NOT NULL,
+  target_type TEXT NOT NULL,
+  target_id INTEGER NOT NULL,
+  reason TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'pending',
+  created_at BIGINT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS collections(
+  id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+  user_id INTEGER NOT NULL,
+  name TEXT NOT NULL,
+  is_private INTEGER NOT NULL DEFAULT 0,
+  created_at BIGINT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS collection_items(
+  collection_id INTEGER NOT NULL,
+  video_id INTEGER NOT NULL,
+  added_at BIGINT NOT NULL,
+  PRIMARY KEY(collection_id, video_id)
+);
+CREATE TABLE IF NOT EXISTS reposts(
+  user_id INTEGER NOT NULL,
+  video_id INTEGER NOT NULL,
+  created_at BIGINT NOT NULL,
+  PRIMARY KEY(user_id, video_id)
+);
+CREATE TABLE IF NOT EXISTS blocks(
+  user_id INTEGER NOT NULL,
+  blocked_id INTEGER NOT NULL,
+  created_at BIGINT NOT NULL,
+  PRIMARY KEY(user_id, blocked_id)
+);
+CREATE TABLE IF NOT EXISTS hidden_videos(
+  user_id INTEGER NOT NULL,
+  video_id INTEGER NOT NULL,
+  created_at BIGINT NOT NULL,
+  PRIMARY KEY(user_id, video_id)
+);
+CREATE TABLE IF NOT EXISTS watch_history(
+  user_id INTEGER NOT NULL,
+  video_id INTEGER NOT NULL,
+  watched_at BIGINT NOT NULL,
+  PRIMARY KEY(user_id, video_id)
 );`;
   if (USE_PG) { await pool.query(schema); }
   else { lite.exec(schema); }
@@ -270,6 +327,9 @@ CREATE TABLE IF NOT EXISTS poll_votes(
   await mig('videos', 'scheduled_at', `BIGINT`);
   await mig('users', 'verified', `INTEGER NOT NULL DEFAULT 0`);
   await mig('comments', 'video_url', `TEXT`);
+  // serveur v9 : modération MVP (vidéos masquées, comptes suspendus)
+  await mig('videos', 'hidden', `INTEGER NOT NULL DEFAULT 0`);
+  await mig('users', 'suspended', `INTEGER NOT NULL DEFAULT 0`);
 }
 
 // une ligne ou undefined
@@ -358,10 +418,49 @@ async function auth(req, res, next) {
   const h = req.headers.authorization || '';
   const m = h.match(/^Bearer (.+)$/);
   if (!m) return res.status(401).json({ error: 'token requis' });
-  const row = await get1('SELECT user_id FROM tokens WHERE token=?', m[1]);
+  const row = await get1('SELECT t.user_id, u.suspended FROM tokens t JOIN users u ON u.id=t.user_id WHERE t.token=?', m[1]);
   if (!row) return res.status(401).json({ error: 'token invalide' });
+  if (Number(row.suspended)) return res.status(403).json({ error: 'compte suspendu' });
   req.userId = row.user_id;
   next();
+}
+// id de l'utilisateur courant depuis le jeton, sans exiger l'auth (null si anonyme)
+async function optUserId(req) {
+  try {
+    const h = req.headers.authorization || '';
+    const m = h.match(/^Bearer (.+)$/);
+    if (!m) return null;
+    const t = await get1('SELECT user_id FROM tokens WHERE token=?', m[1]);
+    return t ? t.user_id : null;
+  } catch (e) { return null; }
+}
+// notifie un utilisateur (jamais soi-même)
+async function notify(userId, type, actorId, videoId, text) {
+  try {
+    if (!userId || Number(userId) === Number(actorId)) return;
+    await runSql('INSERT INTO notifications(user_id,type,actor_id,video_id,text,is_read,created_at) VALUES(?,?,?,?,?,0,?)',
+      userId, type, actorId || null, videoId || null, String(text || '').slice(0, 200), now());
+  } catch (e) {}
+}
+// vrai si a a bloqué b, ou b a bloqué a
+async function isBlocked(a, b) {
+  if (!a || !b || Number(a) === Number(b)) return false;
+  const r = await get1('SELECT 1 FROM blocks WHERE (user_id=? AND blocked_id=?) OR (user_id=? AND blocked_id=?)',
+    a, b, b, a);
+  return !!r;
+}
+// upsert historique de visionnage
+async function touchHistory(userId, videoId) {
+  if (!userId || !videoId) return;
+  try {
+    if (USE_PG) {
+      await runSql(`INSERT INTO watch_history(user_id,video_id,watched_at) VALUES(?,?,?)
+        ON CONFLICT(user_id,video_id) DO UPDATE SET watched_at=EXCLUDED.watched_at`, userId, videoId, now());
+    } else {
+      await runSql('INSERT OR REPLACE INTO watch_history(user_id,video_id,watched_at) VALUES(?,?,?)',
+        userId, videoId, now());
+    }
+  } catch (e) {}
 }
 function pubUser(u) {
   return { id: u.id, username: u.username, name: u.name, avatar: u.avatar, bio: u.bio, verified: !!u.verified };
@@ -542,6 +641,7 @@ app.post('/api/gifts', auth, async (req, res) => {
       dest.id, g.cost, 'cadeau reçu ' + g.id, now());
     await runSql('INSERT INTO gifts(from_id,to_id,video_id,gift,cost,created_at) VALUES(?,?,?,?,?,?)',
       req.userId, dest.id, video_id || null, g.id, g.cost, now());
+    await notify(dest.id, 'gift', req.userId, video_id || null, g.id);
     res.json({ ok: true, coins: me.coins - g.cost });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
@@ -591,7 +691,7 @@ app.get('/api/trending/hashtags', async (req, res) => {
 });
 app.get('/api/hashtag/:tag', async (req, res) => {
   const tag = String(req.params.tag || '').toLowerCase();
-  const rows = await allRows('SELECT * FROM videos ORDER BY created_at DESC LIMIT 500');
+  const rows = await allRows('SELECT * FROM videos WHERE hidden=0 ORDER BY created_at DESC LIMIT 500');
   const out = [];
   for (const v of rows) {
     if (extractTags((v.description || '') + ' ' + (v.tags || '')).includes(tag)) out.push(await videoJSON(v, 0));
@@ -1122,15 +1222,30 @@ app.get('/api/feed', async (req, res) => {
     if (m) { const t = await get1('SELECT user_id FROM tokens WHERE token=?', m[1]); if (t) meId = t.user_id; }
     const mode = req.query.mode === 'following' && meId ? 'following' : 'foryou';
     let rows;
-    // les vidéos programmées (scheduled_at futur) sont exclues du feed public
+    // les vidéos programmées (scheduled_at futur), masquées (modération) ou "pas intéressé" sont exclues ;
+    // les vidéos d'utilisateurs bloqués (dans les deux sens) aussi
+    const blockFilter = alias => ` AND NOT EXISTS (SELECT 1 FROM blocks b WHERE (b.user_id=? AND b.blocked_id=${alias}.user_id) OR (b.user_id=${alias}.user_id AND b.blocked_id=?))`;
     if (mode === 'following') {
-      rows = await allRows(
-        `SELECT v.* FROM videos v JOIN follows f ON f.followed_id=v.user_id
-         WHERE f.follower_id=? AND (v.scheduled_at IS NULL OR v.scheduled_at <= ?)
-         ORDER BY v.created_at DESC LIMIT 50`, meId, now());
+      let sql = `SELECT v.* FROM videos v JOIN follows f ON f.followed_id=v.user_id
+         WHERE f.follower_id=? AND (v.scheduled_at IS NULL OR v.scheduled_at <= ?) AND v.hidden=0`;
+      const params = [meId, now()];
+      sql += ' AND NOT EXISTS (SELECT 1 FROM hidden_videos hv WHERE hv.user_id=? AND hv.video_id=v.id)';
+      params.push(meId);
+      sql += blockFilter('v');
+      params.push(meId, meId);
+      sql += ' ORDER BY v.created_at DESC LIMIT 50';
+      rows = await allRows(sql, ...params);
     } else {
-      rows = await allRows(
-        'SELECT * FROM videos WHERE (scheduled_at IS NULL OR scheduled_at <= ?) ORDER BY created_at DESC LIMIT 50', now());
+      let sql = 'SELECT * FROM videos WHERE (scheduled_at IS NULL OR scheduled_at <= ?) AND hidden=0';
+      const params = [now()];
+      if (meId) {
+        sql += ' AND NOT EXISTS (SELECT 1 FROM hidden_videos hv WHERE hv.user_id=? AND hv.video_id=videos.id)';
+        params.push(meId);
+        sql += blockFilter('videos');
+        params.push(meId, meId);
+      }
+      sql += ' ORDER BY created_at DESC LIMIT 50';
+      rows = await allRows(sql, ...params);
     }
     const videos = [];
     for (const v of rows) videos.push(await videoJSON(v, meId));
@@ -1154,8 +1269,8 @@ app.get('/api/videos/mine', auth, async (req, res) => {
 app.get('/api/videos/:id', async (req, res) => {
   const v = await get1('SELECT * FROM videos WHERE id=?', req.params.id);
   if (!v) return res.status(404).json({ error: 'vidéo introuvable' });
-  // vidéo programmée : seul le propriétaire peut la voir avant l'heure de publication
-  if (v.scheduled_at && Number(v.scheduled_at) > now()) {
+  // vidéo programmée ou masquée par la modération : seul le propriétaire peut la voir
+  if ((v.scheduled_at && Number(v.scheduled_at) > now()) || Number(v.hidden)) {
     const h = req.headers.authorization || '';
     const m = h.match(/^Bearer (.+)$/);
     let meId = null;
@@ -1180,22 +1295,31 @@ app.post('/api/videos/:id/view', async (req, res) => {
       const row = await get1('SELECT user_id FROM tokens WHERE token=?', m[1]);
       if (row) viewerId = row.user_id;
     }
-    if (viewerId && Number(viewerId) === Number(v.user_id))
+    if (viewerId && Number(viewerId) === Number(v.user_id)) {
+      await touchHistory(viewerId, v.id);
       return res.json({ ok: true, counted: false, reason: 'self' });
+    }
     const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim().slice(0, 45);
     const dayAgo = now() - 86400000;
     const dup = viewerId
       ? await get1('SELECT 1 FROM video_views WHERE video_id=? AND viewer_id=? AND created_at>?', v.id, viewerId, dayAgo)
       : await get1('SELECT 1 FROM video_views WHERE video_id=? AND viewer_id IS NULL AND ip=? AND created_at>?', v.id, ip, dayAgo);
-    if (dup) return res.json({ ok: true, counted: false, reason: 'duplicate' });
+    if (dup) {
+      await touchHistory(viewerId, v.id);
+      return res.json({ ok: true, counted: false, reason: 'duplicate' });
+    }
     const cnt = viewerId
       ? await get1('SELECT COUNT(*) AS c FROM video_views WHERE viewer_id=? AND created_at>?', viewerId, dayAgo)
       : await get1('SELECT COUNT(*) AS c FROM video_views WHERE viewer_id IS NULL AND ip=? AND created_at>?', ip, dayAgo);
-    if (Number(cnt.c) >= 100) return res.json({ ok: true, counted: false, reason: 'rate-limit' });
+    if (Number(cnt.c) >= 100) {
+      await touchHistory(viewerId, v.id);
+      return res.json({ ok: true, counted: false, reason: 'rate-limit' });
+    }
     const adShown = (req.body || {}).ad_shown ? 1 : 0;
     await runSql('INSERT INTO video_views(video_id,viewer_id,ip,ad_shown,created_at) VALUES(?,?,?,?,?)',
       v.id, viewerId, ip, adShown, now());
     await runSql('UPDATE videos SET views=views+1' + (adShown ? ', ad_views=ad_views+1' : '') + ' WHERE id=?', v.id);
+    await touchHistory(viewerId, v.id);
     res.json({ ok: true, counted: true, ad_shown: !!adShown });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
@@ -1205,8 +1329,10 @@ app.post('/api/videos/:id/like', auth, async (req, res) => {
   try {
     const v = await get1('SELECT * FROM videos WHERE id=?', req.params.id);
     if (!v) return res.status(404).json({ error: 'vidéo introuvable' });
+    const alreadyLiked = await get1('SELECT 1 FROM likes WHERE user_id=? AND video_id=?', req.userId, v.id);
     await insertIgnore('INSERT OR IGNORE INTO likes(user_id,video_id,created_at) VALUES(?,?,?)',
       req.userId, v.id, now());
+    if (!alreadyLiked) await notify(v.user_id, 'like', req.userId, v.id, '');
     // +1 pièce au créateur quand quelqu'un aime (plafond 100/jour)
     const dayStart = new Date().setHours(0, 0, 0, 0);
     const earned = Number((await get1(
@@ -1241,7 +1367,7 @@ app.post('/api/videos/:id/comments', auth, upload.single('video'), async (req, r
   try {
     const text = String((req.body || {}).text || '').trim().slice(0, 500);
     if (!text) return res.status(400).json({ error: 'commentaire vide' });
-    const v = await get1('SELECT 1 FROM videos WHERE id=?', req.params.id);
+    const v = await get1('SELECT * FROM videos WHERE id=?', req.params.id);
     if (!v) return res.status(404).json({ error: 'vidéo introuvable' });
     // réponse vidéo optionnelle (même stockage que l'upload de vidéo)
     let videoUrl = null;
@@ -1253,6 +1379,7 @@ app.post('/api/videos/:id/comments', auth, upload.single('video'), async (req, r
     const c = await get1(
       `SELECT c.*, u.username, u.name, u.avatar FROM comments c
        JOIN users u ON u.id=c.user_id WHERE c.id=?`, id);
+    await notify(v.user_id, 'comment', req.userId, v.id, text.slice(0, 100));
     res.json({ comment: c });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
@@ -1274,6 +1401,8 @@ app.post('/api/conversations', auth, async (req, res) => {
     if (!other) return res.status(404).json({ error: 'utilisateur introuvable' });
     if (Number(other.id) === Number(req.userId))
       return res.status(400).json({ error: 'impossible de se parler à soi-même' });
+    if (await isBlocked(req.userId, other.id))
+      return res.status(403).json({ error: 'utilisateur bloqué' });
     const a = Math.min(Number(req.userId), Number(other.id));
     const b = Math.max(Number(req.userId), Number(other.id));
     let conv = await get1('SELECT * FROM conversations WHERE user1_id=? AND user2_id=?', a, b);
@@ -1334,6 +1463,9 @@ app.post('/api/conversations/:id/messages', auth, async (req, res) => {
   try {
     const c = await convOf(req.params.id, req.userId);
     if (!c) return res.status(404).json({ error: 'conversation introuvable' });
+    const otherId = Number(c.user1_id) === Number(req.userId) ? c.user2_id : c.user1_id;
+    if (await isBlocked(req.userId, otherId))
+      return res.status(403).json({ error: 'utilisateur bloqué' });
     const text = String((req.body || {}).text || '').trim().slice(0, 2000);
     if (!text) return res.status(400).json({ error: 'message vide' });
     const t = now();
@@ -1346,6 +1478,7 @@ app.post('/api/conversations/:id/messages', auth, async (req, res) => {
       c.id, req.userId, t);
     await runSql('UPDATE conversation_reads SET last_read_at=? WHERE conversation_id=? AND user_id=?',
       t, c.id, req.userId);
+    await notify(otherId, 'message', req.userId, null, text.slice(0, 100));
     const m = await get1('SELECT * FROM messages WHERE id=?', id);
     res.json({ message: { id: m.id, sender_id: m.sender_id, text: m.text, created_at: Number(m.created_at) } });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
@@ -1452,6 +1585,314 @@ app.post('/api/admin/users/:id/verify', async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 
+// ==================== SERVEUR v9 : MVP phase 2 ====================
+// ---------- notifications ----------
+app.get('/api/notifications', auth, async (req, res) => {
+  try {
+    const rows = await allRows('SELECT * FROM notifications WHERE user_id=? ORDER BY created_at DESC LIMIT 20', req.userId);
+    const out = [];
+    for (const n of rows) {
+      const actor = n.actor_id ? await get1('SELECT * FROM users WHERE id=?', n.actor_id) : null;
+      const vid = n.video_id ? await get1('SELECT * FROM videos WHERE id=?', n.video_id) : null;
+      out.push({
+        id: n.id, type: n.type, text: n.text || '', is_read: !!n.is_read,
+        created_at: Number(n.created_at),
+        actor: actor ? pubUser(actor) : null,
+        video: vid ? { id: vid.id, thumb: fileUrl(vid.file) } : null,
+      });
+    }
+    res.json({ notifications: out });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.post('/api/notifications/read', auth, async (req, res) => {
+  try {
+    const id = Number((req.body || {}).id) || 0;
+    if (id) await runSql('UPDATE notifications SET is_read=1 WHERE id=? AND user_id=?', id, req.userId);
+    else await runSql('UPDATE notifications SET is_read=1 WHERE user_id=?', req.userId);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.get('/api/notifications/unread-count', auth, async (req, res) => {
+  try {
+    const c = await get1('SELECT COUNT(*) AS c FROM notifications WHERE user_id=? AND is_read=0', req.userId);
+    res.json({ unread: Number(c.c) });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+
+// ---------- signalements ----------
+app.post('/api/reports', auth, async (req, res) => {
+  try {
+    const target_type = String((req.body || {}).target_type || '');
+    const target_id = Number((req.body || {}).target_id) || 0;
+    const reason = String((req.body || {}).reason || '').trim().slice(0, 500);
+    if (!['video', 'user', 'comment', 'message'].includes(target_type))
+      return res.status(400).json({ error: 'type de cible invalide' });
+    if (!target_id) return res.status(400).json({ error: 'cible requise' });
+    const id = await insertId(
+      'INSERT INTO reports(reporter_id,target_type,target_id,reason,status,created_at) VALUES(?,?,?,?,?,?)',
+      req.userId, target_type, target_id, reason, 'pending', now());
+    res.json({ ok: true, id });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.get('/api/admin/reports', adminAuth, async (req, res) => {
+  try {
+    const status = String(req.query.status || 'pending');
+    if (!['pending', 'dismissed', 'resolved'].includes(status))
+      return res.status(400).json({ error: 'statut invalide' });
+    const rows = await allRows('SELECT * FROM reports WHERE status=? ORDER BY created_at DESC LIMIT 100', status);
+    res.json({ reports: rows.map(r => ({ ...r, created_at: Number(r.created_at) })) });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// auteur d'une cible signalée (pour suspend_user)
+async function reportAuthor(r) {
+  try {
+    if (r.target_type === 'user') return await get1('SELECT * FROM users WHERE id=?', r.target_id);
+    let uid = null;
+    if (r.target_type === 'video') {
+      const v = await get1('SELECT user_id FROM videos WHERE id=?', r.target_id);
+      uid = v && v.user_id;
+    } else if (r.target_type === 'comment') {
+      const c = await get1('SELECT user_id FROM comments WHERE id=?', r.target_id);
+      uid = c && c.user_id;
+    } else if (r.target_type === 'message') {
+      const m = await get1('SELECT sender_id FROM messages WHERE id=?', r.target_id);
+      uid = m && m.sender_id;
+    }
+    return uid ? await get1('SELECT * FROM users WHERE id=?', uid) : null;
+  } catch (e) { return null; }
+}
+app.post('/api/admin/reports/:id/review', adminAuth, async (req, res) => {
+  try {
+    const r = await get1('SELECT * FROM reports WHERE id=?', req.params.id);
+    if (!r) return res.status(404).json({ error: 'signalement introuvable' });
+    const action = String((req.body || {}).action || '');
+    if (!['dismiss', 'hide_video', 'suspend_user'].includes(action))
+      return res.status(400).json({ error: 'action invalide' });
+    if (action === 'dismiss') {
+      await runSql("UPDATE reports SET status='dismissed' WHERE id=?", r.id);
+    } else if (action === 'hide_video') {
+      if (r.target_type === 'video') await runSql('UPDATE videos SET hidden=1 WHERE id=?', r.target_id);
+      else if (r.target_type === 'comment') await runSql('DELETE FROM comments WHERE id=?', r.target_id);
+      else if (r.target_type === 'message') await runSql('DELETE FROM messages WHERE id=?', r.target_id);
+      else if (r.target_type === 'user') await runSql('UPDATE videos SET hidden=1 WHERE user_id=?', r.target_id);
+      await runSql("UPDATE reports SET status='resolved' WHERE id=?", r.id);
+    } else if (action === 'suspend_user') {
+      const author = await reportAuthor(r);
+      if (author) await runSql('UPDATE users SET suspended=1 WHERE id=?', author.id);
+      await runSql("UPDATE reports SET status='resolved' WHERE id=?", r.id);
+    }
+    res.json({ ok: true, action });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+
+// ---------- collections ----------
+async function collOf(id, userId) {
+  const c = await get1('SELECT * FROM collections WHERE id=?', id);
+  if (!c) return null;
+  if (Number(c.user_id) !== Number(userId)) return null;
+  return c;
+}
+app.post('/api/collections', auth, async (req, res) => {
+  try {
+    const name = String((req.body || {}).name || '').trim().slice(0, 60);
+    if (!name) return res.status(400).json({ error: 'nom requis' });
+    const id = await insertId('INSERT INTO collections(user_id,name,is_private,created_at) VALUES(?,?,0,?)',
+      req.userId, name, now());
+    res.json({ ok: true, id });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.get('/api/collections', auth, async (req, res) => {
+  try {
+    const rows = await allRows('SELECT * FROM collections WHERE user_id=? ORDER BY created_at DESC', req.userId);
+    const out = [];
+    for (const c of rows) {
+      const n = await get1('SELECT COUNT(*) AS c FROM collection_items WHERE collection_id=?', c.id);
+      out.push({ id: c.id, name: c.name, is_private: !!c.is_private, count: Number(n.c), created_at: Number(c.created_at) });
+    }
+    res.json({ collections: out });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.patch('/api/collections/:id', auth, async (req, res) => {
+  try {
+    const c = await collOf(req.params.id, req.userId);
+    if (!c) return res.status(404).json({ error: 'collection introuvable' });
+    const b = req.body || {};
+    if (b.name !== undefined) {
+      const name = String(b.name).trim().slice(0, 60);
+      if (!name) return res.status(400).json({ error: 'nom requis' });
+      await runSql('UPDATE collections SET name=? WHERE id=?', name, c.id);
+    }
+    if (b.is_private !== undefined)
+      await runSql('UPDATE collections SET is_private=? WHERE id=?', b.is_private ? 1 : 0, c.id);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.delete('/api/collections/:id', auth, async (req, res) => {
+  try {
+    const c = await collOf(req.params.id, req.userId);
+    if (!c) return res.status(404).json({ error: 'collection introuvable' });
+    await runSql('DELETE FROM collection_items WHERE collection_id=?', c.id);
+    await runSql('DELETE FROM collections WHERE id=?', c.id);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.post('/api/collections/:id/items', auth, async (req, res) => {
+  try {
+    const c = await collOf(req.params.id, req.userId);
+    if (!c) return res.status(404).json({ error: 'collection introuvable' });
+    const video_id = Number((req.body || {}).video_id) || 0;
+    const v = await get1('SELECT 1 FROM videos WHERE id=?', video_id);
+    if (!v) return res.status(404).json({ error: 'vidéo introuvable' });
+    await insertIgnore('INSERT OR IGNORE INTO collection_items(collection_id,video_id,added_at) VALUES(?,?,?)',
+      c.id, video_id, now());
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.delete('/api/collections/:id/items/:video_id', auth, async (req, res) => {
+  try {
+    const c = await collOf(req.params.id, req.userId);
+    if (!c) return res.status(404).json({ error: 'collection introuvable' });
+    await runSql('DELETE FROM collection_items WHERE collection_id=? AND video_id=?', c.id, req.params.video_id);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.get('/api/collections/:id', async (req, res) => {
+  try {
+    const c = await get1('SELECT * FROM collections WHERE id=?', req.params.id);
+    if (!c) return res.status(404).json({ error: 'collection introuvable' });
+    const meId = await optUserId(req);
+    if (Number(c.is_private) && (!meId || Number(meId) !== Number(c.user_id)))
+      return res.status(403).json({ error: 'collection privée' });
+    const items = await allRows('SELECT video_id FROM collection_items WHERE collection_id=? ORDER BY added_at DESC', c.id);
+    const videos = [];
+    for (const it of items) {
+      const v = await get1('SELECT * FROM videos WHERE id=? AND hidden=0', it.video_id);
+      if (v) videos.push(await videoJSON(v, meId));
+    }
+    res.json({ collection: { id: c.id, name: c.name, is_private: !!c.is_private, videos } });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+
+// ---------- reposts ----------
+app.post('/api/videos/:id/repost', auth, async (req, res) => {
+  try {
+    const v = await get1('SELECT * FROM videos WHERE id=?', req.params.id);
+    if (!v) return res.status(404).json({ error: 'vidéo introuvable' });
+    await insertIgnore('INSERT OR IGNORE INTO reposts(user_id,video_id,created_at) VALUES(?,?,?)',
+      req.userId, v.id, now());
+    await notify(v.user_id, 'repost', req.userId, v.id, '');
+    const c = await get1('SELECT COUNT(*) AS c FROM reposts WHERE video_id=?', v.id);
+    res.json({ ok: true, reposts: Number(c.c) });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.delete('/api/videos/:id/repost', auth, async (req, res) => {
+  try {
+    await runSql('DELETE FROM reposts WHERE user_id=? AND video_id=?', req.userId, req.params.id);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.get('/api/users/:username/reposts', async (req, res) => {
+  try {
+    const u = await get1('SELECT * FROM users WHERE username=?', String(req.params.username).toLowerCase());
+    if (!u) return res.status(404).json({ error: 'utilisateur introuvable' });
+    const rows = await allRows('SELECT video_id FROM reposts WHERE user_id=? ORDER BY created_at DESC LIMIT 50', u.id);
+    const videos = [];
+    for (const r of rows) {
+      const v = await get1('SELECT * FROM videos WHERE id=? AND hidden=0', r.video_id);
+      if (v) videos.push(await videoJSON(v, null));
+    }
+    res.json({ videos });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+
+// ---------- blocage ----------
+app.post('/api/blocks', auth, async (req, res) => {
+  try {
+    const username = String((req.body || {}).username || '').toLowerCase().trim();
+    const u = await get1('SELECT * FROM users WHERE username=?', username);
+    if (!u) return res.status(404).json({ error: 'utilisateur introuvable' });
+    if (Number(u.id) === Number(req.userId)) return res.status(400).json({ error: 'impossible' });
+    await insertIgnore('INSERT OR IGNORE INTO blocks(user_id,blocked_id,created_at) VALUES(?,?,?)',
+      req.userId, u.id, now());
+    // le blocage coupe les abonnements dans les deux sens, façon TikTok
+    await runSql('DELETE FROM follows WHERE (follower_id=? AND followed_id=?) OR (follower_id=? AND followed_id=?)',
+      req.userId, u.id, u.id, req.userId);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.delete('/api/blocks/:username', auth, async (req, res) => {
+  try {
+    const u = await get1('SELECT * FROM users WHERE username=?', String(req.params.username).toLowerCase());
+    if (u) await runSql('DELETE FROM blocks WHERE user_id=? AND blocked_id=?', req.userId, u.id);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.get('/api/blocks', auth, async (req, res) => {
+  try {
+    const rows = await allRows('SELECT blocked_id FROM blocks WHERE user_id=? ORDER BY created_at DESC', req.userId);
+    const out = [];
+    for (const r of rows) {
+      const u = await get1('SELECT * FROM users WHERE id=?', r.blocked_id);
+      if (u) out.push(pubUser(u));
+    }
+    res.json({ blocked: out });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+
+// ---------- pas intéressé ----------
+app.post('/api/videos/:id/hide', auth, async (req, res) => {
+  try {
+    const v = await get1('SELECT 1 FROM videos WHERE id=?', req.params.id);
+    if (!v) return res.status(404).json({ error: 'vidéo introuvable' });
+    await insertIgnore('INSERT OR IGNORE INTO hidden_videos(user_id,video_id,created_at) VALUES(?,?,?)',
+      req.userId, req.params.id, now());
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.delete('/api/videos/:id/hide', auth, async (req, res) => {
+  try {
+    await runSql('DELETE FROM hidden_videos WHERE user_id=? AND video_id=?', req.userId, req.params.id);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+
+// ---------- historique de visionnage ----------
+app.get('/api/history', auth, async (req, res) => {
+  try {
+    const rows = await allRows('SELECT video_id, watched_at FROM watch_history WHERE user_id=? ORDER BY watched_at DESC LIMIT 30', req.userId);
+    const out = [];
+    for (const r of rows) {
+      const v = await get1('SELECT * FROM videos WHERE id=? AND hidden=0', r.video_id);
+      if (!v) continue;
+      const j = await videoJSON(v, req.userId);
+      j.watched_at = Number(r.watched_at);
+      out.push(j);
+    }
+    res.json({ history: out });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+
+// ---------- dashboard admin ----------
+app.get('/api/admin/stats', adminAuth, async (req, res) => {
+  try {
+    const cnt = async (sql, ...p) => Number((await get1(sql, ...p)).c);
+    const weekAgo = now() - 7 * 86400000;
+    res.json({
+      users_total: await cnt('SELECT COUNT(*) AS c FROM users'),
+      users_7d: await cnt('SELECT COUNT(*) AS c FROM users WHERE created_at>?', weekAgo),
+      videos_total: await cnt('SELECT COUNT(*) AS c FROM videos'),
+      videos_7d: await cnt('SELECT COUNT(*) AS c FROM videos WHERE created_at>?', weekAgo),
+      views_total: await cnt('SELECT COUNT(*) AS c FROM video_views'),
+      likes_total: await cnt('SELECT COUNT(*) AS c FROM likes'),
+      comments_total: await cnt('SELECT COUNT(*) AS c FROM comments'),
+      reports_pending: await cnt("SELECT COUNT(*) AS c FROM reports WHERE status='pending'"),
+      kyc_pending: await cnt("SELECT COUNT(*) AS c FROM id_verifications WHERE status='pending'"),
+      withdrawals_pending: await cnt("SELECT COUNT(*) AS c FROM withdrawals WHERE status='pending'"),
+      gifts_7d: await cnt('SELECT COUNT(*) AS c FROM gifts WHERE created_at>?', weekAgo),
+    });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+
 // ---------- abonnements ----------
 app.post('/api/follow/:username', auth, async (req, res) => {
   const u = await get1('SELECT * FROM users WHERE username=?', String(req.params.username).toLowerCase());
@@ -1459,6 +1900,7 @@ app.post('/api/follow/:username', auth, async (req, res) => {
   if (Number(u.id) === Number(req.userId)) return res.status(400).json({ error: 'impossible de se suivre soi-même' });
   await insertIgnore('INSERT OR IGNORE INTO follows(follower_id,followed_id,created_at) VALUES(?,?,?)',
     req.userId, u.id, now());
+  await notify(u.id, 'follow', req.userId, null, '');
   res.json({ following: true });
 });
 
@@ -1472,8 +1914,12 @@ app.get('/api/users/:username', async (req, res) => {
   try {
     const u = await get1('SELECT * FROM users WHERE username=?', String(req.params.username).toLowerCase());
     if (!u) return res.status(404).json({ error: 'utilisateur introuvable' });
+    // profil inaccessible si blocage dans un sens ou l'autre (sauf soi-même)
+    const meId = await optUserId(req);
+    if (meId && Number(meId) !== Number(u.id) && await isBlocked(meId, u.id))
+      return res.status(403).json({ error: 'utilisateur bloqué' });
     const vids = await allRows(
-      'SELECT * FROM videos WHERE user_id=? AND (scheduled_at IS NULL OR scheduled_at <= ?) ORDER BY created_at DESC', u.id, now());
+      'SELECT * FROM videos WHERE user_id=? AND hidden=0 AND (scheduled_at IS NULL OR scheduled_at <= ?) ORDER BY created_at DESC', u.id, now());
     const followers = Number((await get1('SELECT COUNT(*) AS c FROM follows WHERE followed_id=?', u.id)).c);
     const following = Number((await get1('SELECT COUNT(*) AS c FROM follows WHERE follower_id=?', u.id)).c);
     const likes = Number((await get1(
@@ -1499,7 +1945,7 @@ app.get('/api/search', async (req, res) => {
     const users = await allRows(
       'SELECT id,username,name,avatar FROM users WHERE username LIKE ? OR name LIKE ? LIMIT 20', q, q);
     const vids = await allRows(
-      'SELECT * FROM videos WHERE (LOWER(description) LIKE ? OR LOWER(tags) LIKE ?) AND (scheduled_at IS NULL OR scheduled_at <= ?) ORDER BY created_at DESC LIMIT 20', q, q, now());
+      'SELECT * FROM videos WHERE (LOWER(description) LIKE ? OR LOWER(tags) LIKE ?) AND (scheduled_at IS NULL OR scheduled_at <= ?) AND hidden=0 ORDER BY created_at DESC LIMIT 20', q, q, now());
     const videos = [];
     for (const v of vids) videos.push(await videoJSON(v, null));
     res.json({ users, videos });
