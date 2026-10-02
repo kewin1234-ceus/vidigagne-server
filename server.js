@@ -471,6 +471,76 @@ CREATE TABLE IF NOT EXISTS review_queue(
   reason TEXT NOT NULL DEFAULT '',
   status TEXT NOT NULL DEFAULT 'pending',
   created_at BIGINT NOT NULL
+);
+-- ==================== V12 : GROUPES ====================
+CREATE TABLE IF NOT EXISTS chat_groups(
+  id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+  name TEXT NOT NULL DEFAULT '',
+  avatar TEXT NOT NULL DEFAULT '',
+  creator_id INTEGER NOT NULL,
+  created_at BIGINT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS group_members(
+  group_id INTEGER NOT NULL,
+  user_id INTEGER NOT NULL,
+  joined_at BIGINT NOT NULL,
+  PRIMARY KEY(group_id, user_id)
+);
+CREATE TABLE IF NOT EXISTS group_messages(
+  id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+  group_id INTEGER NOT NULL,
+  sender_id INTEGER NOT NULL,
+  text TEXT NOT NULL,
+  created_at BIGINT NOT NULL
+);
+-- ==================== V12 : SÉRIES PAYANTES ====================
+CREATE TABLE IF NOT EXISTS series(
+  id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+  creator_id INTEGER NOT NULL,
+  title TEXT NOT NULL DEFAULT '',
+  description TEXT NOT NULL DEFAULT '',
+  cover TEXT NOT NULL DEFAULT '',
+  price_coins INTEGER NOT NULL DEFAULT 0,
+  created_at BIGINT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS series_items(
+  series_id INTEGER NOT NULL,
+  video_id INTEGER NOT NULL,
+  position INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(series_id, video_id)
+);
+CREATE TABLE IF NOT EXISTS series_purchases(
+  series_id INTEGER NOT NULL,
+  user_id INTEGER NOT NULL,
+  created_at BIGINT NOT NULL,
+  UNIQUE(series_id, user_id)
+);
+-- ==================== V12 : ALGO POUR TOI ====================
+CREATE TABLE IF NOT EXISTS watch_events(
+  id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+  user_id INTEGER NOT NULL,
+  video_id INTEGER NOT NULL,
+  watch_ms INTEGER NOT NULL DEFAULT 0,
+  completed INTEGER NOT NULL DEFAULT 0,
+  created_at BIGINT NOT NULL
+);
+-- ==================== V12 : JUMELAGE FAMILIAL ====================
+CREATE TABLE IF NOT EXISTS family_codes(
+  code TEXT PRIMARY KEY,
+  parent_id INTEGER NOT NULL,
+  created_at BIGINT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS family_links(
+  parent_id INTEGER NOT NULL,
+  teen_id INTEGER NOT NULL,
+  created_at BIGINT NOT NULL,
+  PRIMARY KEY(parent_id, teen_id)
+);
+CREATE TABLE IF NOT EXISTS family_settings(
+  teen_id INTEGER PRIMARY KEY,
+  screen_time_min INTEGER NOT NULL DEFAULT 60,
+  restricted_mode INTEGER NOT NULL DEFAULT 0,
+  dm_policy TEXT NOT NULL DEFAULT 'all'
 );`;
   if (USE_PG) { await pool.query(schema); }
   else { lite.exec(schema); }
@@ -545,6 +615,16 @@ CREATE TABLE IF NOT EXISTS review_queue(
   await mig('users', 'seller_verified', `INTEGER NOT NULL DEFAULT 0`);
   await mig('videos', 'review_status', `TEXT NOT NULL DEFAULT 'ok'`);
   await mig('comments', 'review_status', `TEXT NOT NULL DEFAULT 'ok'`);
+  // serveur v12 : photos, filtres commentaires, séries payantes, algo, famille
+  await mig('videos', 'media_type', `TEXT NOT NULL DEFAULT 'video'`);
+  await mig('videos', 'photos', `TEXT NOT NULL DEFAULT '[]'`);
+  await mig('videos', 'captions', `TEXT NOT NULL DEFAULT '[]'`);
+  await mig('videos', 'series_id', `INTEGER`);
+  await mig('users', 'comment_keywords', `TEXT NOT NULL DEFAULT '[]'`);
+  try {
+    if (USE_PG) await pool.query('CREATE INDEX IF NOT EXISTS watch_events_user_video_idx ON watch_events(user_id,video_id)');
+    else lite.exec('CREATE INDEX IF NOT EXISTS watch_events_user_video_idx ON watch_events(user_id,video_id)');
+  } catch (e) {}
   // catégories de boutique par défaut
   try {
     const n = await get1('SELECT COUNT(*) AS c FROM categories');
@@ -726,13 +806,35 @@ async function videoJSON(v, meId) {
     subscribed = !!(await get1('SELECT 1 FROM creator_subs WHERE creator_id=? AND subscriber_id=? AND active=1 AND expires_at>?',
       v.user_id, meId, now()));
   }
+  // v12 : photos (carrousel) — tableaux parsés en sécurité
+  let photos = [];
+  try { const p = JSON.parse(v.photos || '[]'); if (Array.isArray(p)) photos = p.filter(x => typeof x === 'string'); } catch (e) {}
+  let captions = [];
+  try { const c = JSON.parse(v.captions || '[]'); if (Array.isArray(c)) captions = c.map(x => String(x)); } catch (e) {}
+  // v12 : série payante — verrou si la vidéo est dans une série, que je ne suis pas
+  // le créateur et que je ne l'ai pas achetée
+  const seriesId = v.series_id ? Number(v.series_id) : null;
+  let seriesLocked = false;
+  if (seriesId && meId && Number(v.user_id) !== Number(meId)) {
+    const bought = await get1('SELECT 1 FROM series_purchases WHERE series_id=? AND user_id=?', seriesId, meId);
+    seriesLocked = !bought;
+  }
   return {
     id: v.id, desc: v.description, tags: v.tags, sound: v.sound || '', duration: Number(v.duration) || 0,
     url: fileUrl(v.file), visibility: v.visibility || 'public', subscribed,
+    media_type: v.media_type || 'video', photos, captions,
+    series_id: seriesId, series_locked: seriesLocked,
     views: Number(v.views), likes: Number(likes), comments: Number(cmts), liked,
     created_at: Number(v.created_at),
     user: pubUser(u),
   };
+}
+// parse les mots-clés de filtre de commentaires (v12)
+function parseKeywords(s) {
+  try {
+    const a = JSON.parse(s || '[]');
+    return Array.isArray(a) ? a.map(x => String(x).toLowerCase()).filter(x => x.length) : [];
+  } catch (e) { return []; }
 }
 
 // ---------- auth ----------
@@ -838,6 +940,23 @@ async function storeImage(file, folder) {
   fs.renameSync(file.path, path.join(UP, fname));
   return fname;
 }
+// v12 : photos multiples (carrousels) — max 10 images
+const uploadPhotos = multer({
+  storage: USE_CLOUDINARY ? multer.memoryStorage() : multer.diskStorage({ destination: UP }),
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10 Mo par image
+  fileFilter: (req, file, cb) => {
+    if (/^image\//.test(file.mimetype)) cb(null, true);
+    else cb(new Error('seules les images sont acceptées'));
+  },
+});
+// valide et normalise le champ captions (string JSON) -> string JSON sûre
+function cleanCaptions(raw) {
+  try {
+    const c = JSON.parse(raw);
+    if (Array.isArray(c)) return JSON.stringify(c.map(x => String(x).slice(0, 200)));
+  } catch (e) {}
+  return '[]';
+}
 
 app.post('/api/videos', auth, upload.single('video'), async (req, res) => {
   try {
@@ -853,15 +972,43 @@ app.post('/api/videos', auth, upload.single('video'), async (req, res) => {
     let visibility = String(b.visibility || 'public');
     if (visibility === 'subscribers_only') visibility = 'subscribers'; // valeur envoyée par l'app
     if (!['public', 'subscribers', 'private'].includes(visibility)) visibility = 'public';
+    const captions = b.captions ? cleanCaptions(b.captions) : '[]';
     const id = await insertId(
-      'INSERT INTO videos(user_id,file,description,tags,sound,duration,scheduled_at,visibility,created_at) VALUES(?,?,?,?,?,?,?,?,?)',
+      'INSERT INTO videos(user_id,file,description,tags,sound,duration,scheduled_at,visibility,captions,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)',
       req.userId, fname, descText, String(b.tags || '').slice(0, 300),
-      String(b.sound || '').slice(0, 120), Number(b.duration) || 0, scheduledAt, visibility, now());
+      String(b.sound || '').slice(0, 120), Number(b.duration) || 0, scheduledAt, visibility, captions, now());
     // pièces : +10 par publication
     await runSql('UPDATE users SET coins=coins+10 WHERE id=?', req.userId);
     await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
       req.userId, 10, 'publication vidéo #' + id, now());
     // modération auto V3 : scan du texte (sans IA externe)
+    const badW = scanBanned(descText + ' ' + String(b.tags || ''));
+    if (badW) {
+      await runSql(`UPDATE videos SET hidden=1, review_status='pending' WHERE id=?`, id);
+      await flagForReview('video', id, 'mot interdit : ' + badW);
+    }
+    const v = await get1('SELECT * FROM videos WHERE id=?', id);
+    res.json({ video: await videoJSON(v, req.userId), pending_review: !!badW });
+  } catch (e) { res.status(500).json({ error: 'échec du téléversement' }); }
+});
+
+// ---------- v12 : publication photo (carrousel, max 10 images) ----------
+app.post('/api/photos', auth, uploadPhotos.array('photos', 10), async (req, res) => {
+  try {
+    const files = req.files || [];
+    if (!files.length) return res.status(400).json({ error: 'aucune photo reçue (1 à 10 images)' });
+    const raw = [];
+    for (const f of files) raw.push(await storeImage(f, 'vidigagne/photos'));
+    const urls = raw.map(fileUrl);
+    const b = req.body || {};
+    const descText = String(b.description || b.desc || '').slice(0, 500);
+    const captions = b.captions ? cleanCaptions(b.captions) : '[]';
+    const id = await insertId(
+      `INSERT INTO videos(user_id,file,description,tags,media_type,photos,captions,visibility,created_at)
+       VALUES(?,?,?,?,?,?,?,?,?)`,
+      req.userId, raw[0], descText, String(b.tags || '').slice(0, 300),
+      'photo', JSON.stringify(urls), captions, 'public', now());
+    // modération auto : même scan que les vidéos
     const badW = scanBanned(descText + ' ' + String(b.tags || ''));
     if (badW) {
       await runSql(`UPDATE videos SET hidden=1, review_status='pending' WHERE id=?`, id);
@@ -1501,6 +1648,69 @@ function setupLiveWs(server) {
   });
 }
 
+// ---------- v12 : algo « Pour toi » personnalisé ----------
+// tags d'une vidéo : texte libre séparé par des virgules -> tableau normalisé
+function tagsOf(v) {
+  return String(v.tags || '').split(',').map(t => t.trim().toLowerCase()).filter(t => t.length > 1);
+}
+// Score = 0.35*affinité_créateur + 0.25*affinité_tags + 0.25*like_rate
+//         + 0.15*récence − 0.9*déjà_vu_en_entier. SQL portable PG/SQLite :
+// les agrégats simples sont en SQL, le reste est calculé en JS.
+async function scoreForYou(candidates, meId) {
+  if (!candidates.length) return [];
+  // affinité créateur : taux de complétion moyen de mes watch_events par créateur
+  const creatorRows = await allRows(
+    `SELECT v.user_id AS uid, AVG(we.completed) AS r FROM watch_events we
+     JOIN videos v ON v.id=we.video_id WHERE we.user_id=? GROUP BY v.user_id`, meId);
+  const affCreator = {};
+  for (const r of creatorRows) affCreator[r.uid] = Number(r.r) || 0;
+  // mes événements (tags + vidéos déjà vues en entier)
+  const evRows = await allRows(
+    `SELECT we.video_id, we.completed, v.tags AS vtags FROM watch_events we
+     JOIN videos v ON v.id=we.video_id WHERE we.user_id=?`, meId);
+  const seenFull = new Set();
+  const evByVideo = {};
+  for (const e of evRows) {
+    if (Number(e.completed) === 1) seenFull.add(Number(e.video_id));
+    (evByVideo[e.video_id] = evByVideo[e.video_id] || []).push(e);
+  }
+  const evTags = {};
+  for (const vid of Object.keys(evByVideo)) evTags[vid] = tagsOf({ tags: evByVideo[vid][0].vtags });
+  // likes par vidéo candidate
+  const ids = candidates.map(v => v.id);
+  const likeRows = await allRows(
+    `SELECT video_id, COUNT(*) AS c FROM likes WHERE video_id IN (${ids.map(() => '?').join(',')}) GROUP BY video_id`,
+    ...ids);
+  const likeCount = {};
+  for (const r of likeRows) likeCount[r.video_id] = Number(r.c);
+  const tnow = now();
+  const scored = candidates.map(v => {
+    const vtags = tagsOf(v);
+    // affinité tags : complétion moyenne de mes événements sur des vidéos partageant ≥1 tag
+    let tSum = 0, tN = 0;
+    if (vtags.length) {
+      for (const vid of Object.keys(evByVideo)) {
+        if (Number(vid) === Number(v.id)) continue;
+        if (evTags[vid].some(t => vtags.includes(t))) {
+          for (const e of evByVideo[vid]) { tSum += Number(e.completed) || 0; tN++; }
+        }
+      }
+    }
+    const affTags = tN ? tSum / tN : 0;
+    const likeRate = (likeCount[v.id] || 0) / ((Number(v.views) || 0) + 1);
+    const hours = Math.max(0, (tnow - Number(v.created_at)) / 3600000);
+    const recency = 1 / (1 + hours / 24);
+    const score = 0.35 * (affCreator[v.user_id] || 0)
+      + 0.25 * affTags
+      + 0.25 * likeRate
+      + 0.15 * recency
+      - 0.9 * (seenFull.has(Number(v.id)) ? 1 : 0);
+    return { v, score };
+  });
+  scored.sort((a, b) => b.score - a.score);
+  return scored.slice(0, 50).map(s => s.v);
+}
+
 app.get('/api/feed', async (req, res) => {
   try {
     const h = req.headers.authorization || '';
@@ -1535,8 +1745,14 @@ app.get('/api/feed', async (req, res) => {
       }
       const vf = visFilter('videos', meId);
       sql += vf.clause; params.push(...vf.params);
-      sql += ' ORDER BY created_at DESC LIMIT 50';
-      rows = await allRows(sql, ...params);
+      if (meId) {
+        // v12 : utilisateurs connectés → score personnalisé « Pour toi »
+        sql += ' ORDER BY created_at DESC LIMIT 200';
+        rows = await scoreForYou(await allRows(sql, ...params), meId);
+      } else {
+        sql += ' ORDER BY created_at DESC LIMIT 50';
+        rows = await allRows(sql, ...params);
+      }
     }
     const videos = [];
     for (const v of rows) videos.push(await videoJSON(v, meId));
@@ -1654,7 +1870,19 @@ app.get('/api/videos/:id/comments', async (req, res) => {
      JOIN users u ON u.id=c.user_id
      WHERE c.video_id=? AND (c.review_status IS NULL OR c.review_status<>'pending')
      ORDER BY c.created_at ASC LIMIT 200`, req.params.id);
-  res.json({ comments: rows });
+  // v12 : exclut les commentaires contenant un mot-clé filtré par le propriétaire
+  let kws = [];
+  try {
+    const v = await get1('SELECT user_id FROM videos WHERE id=?', req.params.id);
+    if (v) {
+      const o = await get1('SELECT comment_keywords FROM users WHERE id=?', v.user_id);
+      kws = parseKeywords(o && o.comment_keywords);
+    }
+  } catch (e) {}
+  const filtered = kws.length
+    ? rows.filter(c => !kws.some(k => String(c.text || '').toLowerCase().includes(k)))
+    : rows;
+  res.json({ comments: filtered });
 });
 
 app.post('/api/videos/:id/comments', auth, upload.single('video'), async (req, res) => {
@@ -1663,6 +1891,11 @@ app.post('/api/videos/:id/comments', auth, upload.single('video'), async (req, r
     if (!text) return res.status(400).json({ error: 'commentaire vide' });
     const v = await get1('SELECT * FROM videos WHERE id=?', req.params.id);
     if (!v) return res.status(404).json({ error: 'vidéo introuvable' });
+    // v12 : filtres de commentaires du propriétaire (insensible à la casse)
+    const owner = await get1('SELECT comment_keywords FROM users WHERE id=?', v.user_id);
+    const kws = parseKeywords(owner && owner.comment_keywords);
+    if (kws.length && kws.some(k => text.toLowerCase().includes(k)))
+      return res.status(400).json({ error: 'comment_blocked' });
     // réponse vidéo optionnelle (même stockage que l'upload de vidéo)
     let videoUrl = null;
     if (req.file) videoUrl = fileUrl(await storeVideo(req.file));
@@ -1766,6 +1999,16 @@ app.post('/api/conversations/:id/messages', auth, async (req, res) => {
     const otherId = Number(c.user1_id) === Number(req.userId) ? c.user2_id : c.user1_id;
     if (await isBlocked(req.userId, otherId))
       return res.status(403).json({ error: 'utilisateur bloqué' });
+    // v12 : jumelage familial — politique DM du destinataire (s'il est sous contrôle parental)
+    const fset = await get1('SELECT dm_policy FROM family_settings WHERE teen_id=?', otherId);
+    if (fset) {
+      const pol = fset.dm_policy || 'all';
+      if (pol === 'none') return res.status(400).json({ error: 'messages privés désactivés pour ce compte' });
+      if (pol === 'followers') {
+        const fol = await get1('SELECT 1 FROM follows WHERE follower_id=? AND followed_id=?', otherId, req.userId);
+        if (!fol) return res.status(400).json({ error: 'ce compte n\'accepte les messages que de ses abonnements' });
+      }
+    }
     const text = String((req.body || {}).text || '').trim().slice(0, 2000);
     if (!text) return res.status(400).json({ error: 'message vide' });
     const t = now();
@@ -3343,6 +3586,362 @@ app.post('/api/admin/review/:type/:id', adminAuth, async (req, res) => {
   }
   await runSql(`UPDATE review_queue SET status=? WHERE id=?`, decision === 'approve' ? 'approved' : 'rejected', q.id);
   res.json({ ok: true, decision });
+});
+
+// ==================== SERVEUR v12 ====================
+// ---------- utilitaire : id d'un utilisateur par pseudo (pour les groupes) ----------
+app.get('/api/users/:username/id', auth, async (req, res) => {
+  try {
+    const u = await get1('SELECT id FROM users WHERE username=?', String(req.params.username || '').toLowerCase().trim());
+    if (!u) return res.status(404).json({ error: 'utilisateur introuvable' });
+    res.json({ id: u.id });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+
+// ---------- groupes de discussion ----------
+async function isGroupMember(groupId, userId) {
+  const r = await get1('SELECT 1 FROM group_members WHERE group_id=? AND user_id=?', groupId, userId);
+  return !!r;
+}
+app.post('/api/groups', auth, async (req, res) => {
+  try {
+    const b = req.body || {};
+    const name = String(b.name || '').trim().slice(0, 60) || 'Groupe';
+    const avatar = String(b.avatar || '').slice(0, 500);
+    let memberIds = b.member_ids;
+    if (!Array.isArray(memberIds)) memberIds = [];
+    // déduplique, exclut le créateur, ne garde que des ids valides
+    const uniq = [...new Set(memberIds.map(x => Number(x)).filter(x => x && x !== Number(req.userId)))];
+    const gid = await insertId('INSERT INTO chat_groups(name,avatar,creator_id,created_at) VALUES(?,?,?,?)',
+      name, avatar, req.userId, now());
+    await insertIgnore('INSERT OR IGNORE INTO group_members(group_id,user_id,joined_at) VALUES(?,?,?)',
+      gid, req.userId, now());
+    for (const uid of uniq) {
+      const u = await get1('SELECT id FROM users WHERE id=?', uid);
+      if (u) await insertIgnore('INSERT OR IGNORE INTO group_members(group_id,user_id,joined_at) VALUES(?,?,?)',
+        gid, uid, now());
+    }
+    res.json({ group: { id: gid, name, avatar } });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.get('/api/groups', auth, async (req, res) => {
+  try {
+    const rows = await allRows(
+      `SELECT g.* FROM chat_groups g JOIN group_members gm ON gm.group_id=g.id
+       WHERE gm.user_id=? ORDER BY g.created_at DESC`, req.userId);
+    const out = [];
+    for (const g of rows) {
+      const members = await allRows(
+        `SELECT u.id,u.username,u.avatar FROM group_members gm
+         JOIN users u ON u.id=gm.user_id WHERE gm.group_id=? ORDER BY gm.joined_at ASC`, g.id);
+      const last = await get1('SELECT * FROM group_messages WHERE group_id=? ORDER BY id DESC LIMIT 1', g.id);
+      const unread = Number((await get1(
+        'SELECT COUNT(*) AS c FROM group_messages WHERE group_id=? AND sender_id!=?', g.id, req.userId)).c);
+      out.push({
+        id: g.id, name: g.name, avatar: g.avatar || '',
+        members: members.map(m => ({ id: m.id, username: m.username, avatar: m.avatar })),
+        last_message: last ? { id: last.id, sender_id: last.sender_id, text: last.text, created_at: Number(last.created_at) } : null,
+        unread,
+      });
+    }
+    res.json({ groups: out });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.get('/api/groups/:id/messages', auth, async (req, res) => {
+  try {
+    if (!await isGroupMember(req.params.id, req.userId))
+      return res.status(403).json({ error: 'non membre du groupe' });
+    const before = Number(req.query.before) || 0;
+    const rows = before > 0
+      ? await allRows('SELECT * FROM group_messages WHERE group_id=? AND id<? ORDER BY id DESC LIMIT 50', req.params.id, before)
+      : await allRows('SELECT * FROM group_messages WHERE group_id=? ORDER BY id DESC LIMIT 50', req.params.id);
+    rows.reverse();
+    res.json({ messages: rows.map(m => ({ id: m.id, sender_id: m.sender_id, text: m.text, created_at: Number(m.created_at) })) });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.post('/api/groups/:id/messages', auth, async (req, res) => {
+  try {
+    const gid = req.params.id;
+    if (!await isGroupMember(gid, req.userId))
+      return res.status(403).json({ error: 'non membre du groupe' });
+    const text = String((req.body || {}).text || '').trim().slice(0, 2000);
+    if (!text) return res.status(400).json({ error: 'message vide' });
+    const id = await insertId('INSERT INTO group_messages(group_id,sender_id,text,created_at) VALUES(?,?,?,?)',
+      gid, req.userId, text, now());
+    const g = await get1('SELECT name FROM chat_groups WHERE id=?', gid);
+    const others = await allRows('SELECT user_id FROM group_members WHERE group_id=? AND user_id!=?', gid, req.userId);
+    for (const o of others) await notify(o.user_id, 'group_message', req.userId, null, (g ? g.name + ' : ' : '') + text.slice(0, 100));
+    res.json({ message: { id, sender_id: req.userId, text, created_at: now() } });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.post('/api/groups/:id/members', auth, async (req, res) => {
+  try {
+    const gid = req.params.id;
+    if (!await isGroupMember(gid, req.userId))
+      return res.status(403).json({ error: 'non membre du groupe' });
+    const uid = Number((req.body || {}).user_id);
+    if (!uid) return res.status(400).json({ error: 'user_id requis' });
+    const u = await get1('SELECT id,username FROM users WHERE id=?', uid);
+    if (!u) return res.status(404).json({ error: 'utilisateur introuvable' });
+    await insertIgnore('INSERT OR IGNORE INTO group_members(group_id,user_id,joined_at) VALUES(?,?,?)',
+      gid, uid, now());
+    res.json({ ok: true, user: { id: u.id, username: u.username } });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.delete('/api/groups/:id/leave', auth, async (req, res) => {
+  try {
+    const gid = req.params.id;
+    if (!await isGroupMember(gid, req.userId))
+      return res.status(403).json({ error: 'non membre du groupe' });
+    await runSql('DELETE FROM group_members WHERE group_id=? AND user_id=?', gid, req.userId);
+    const rest = Number((await get1('SELECT COUNT(*) AS c FROM group_members WHERE group_id=?', gid)).c);
+    if (!rest) {
+      // groupe vide : on le supprime avec ses messages
+      await runSql('DELETE FROM group_messages WHERE group_id=?', gid);
+      await runSql('DELETE FROM chat_groups WHERE id=?', gid);
+      return res.json({ ok: true, deleted: true });
+    }
+    res.json({ ok: true, deleted: false });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+
+// ---------- filtres de commentaires (paramètres) ----------
+app.get('/api/settings/comment-filters', auth, async (req, res) => {
+  try {
+    const u = await get1('SELECT comment_keywords FROM users WHERE id=?', req.userId);
+    res.json({ keywords: parseKeywords(u && u.comment_keywords) });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.put('/api/settings/comment-filters', auth, async (req, res) => {
+  try {
+    let kw = (req.body || {}).keywords;
+    if (!Array.isArray(kw)) return res.status(400).json({ error: 'keywords doit être un tableau' });
+    kw = kw.map(x => String(x).trim().toLowerCase()).filter(x => x.length > 0 && x.length <= 30).slice(0, 50);
+    await runSql('UPDATE users SET comment_keywords=? WHERE id=?', JSON.stringify(kw), req.userId);
+    res.json({ keywords: kw });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+
+// ---------- séries payantes ----------
+app.post('/api/series', auth, async (req, res) => {
+  try {
+    const b = req.body || {};
+    const title = String(b.title || '').trim().slice(0, 80);
+    if (!title) return res.status(400).json({ error: 'titre requis' });
+    const price = Math.floor(Number(b.price_coins));
+    if (!price || price < 10 || price > 100000)
+      return res.status(400).json({ error: 'prix invalide (10 à 100000 pièces)' });
+    const id = await insertId(
+      'INSERT INTO series(creator_id,title,description,cover,price_coins,created_at) VALUES(?,?,?,?,?,?)',
+      req.userId, title, String(b.description || '').slice(0, 500),
+      String(b.cover || '').slice(0, 500), price, now());
+    res.json({ series: { id, title, price_coins: price } });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.get('/api/series/mine', auth, async (req, res) => {
+  try {
+    const rows = await allRows('SELECT * FROM series WHERE creator_id=? ORDER BY created_at DESC', req.userId);
+    res.json({ series: rows.map(s => ({ id: s.id, title: s.title, description: s.description, cover: s.cover,
+      price_coins: Number(s.price_coins), created_at: Number(s.created_at) })) });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.get('/api/series/purchased', auth, async (req, res) => {
+  try {
+    const rows = await allRows(
+      `SELECT s.* FROM series s JOIN series_purchases p ON p.series_id=s.id
+       WHERE p.user_id=? ORDER BY p.created_at DESC`, req.userId);
+    res.json({ series: rows.map(s => ({ id: s.id, title: s.title, description: s.description, cover: s.cover,
+      price_coins: Number(s.price_coins), creator_id: s.creator_id, created_at: Number(s.created_at) })) });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.get('/api/series/:id', async (req, res) => {
+  try {
+    const meId = await optUserId(req);
+    const s = await get1('SELECT * FROM series WHERE id=?', req.params.id);
+    if (!s) return res.status(404).json({ error: 'série introuvable' });
+    const isOwner = meId && Number(s.creator_id) === Number(meId);
+    const purchased = meId && !isOwner
+      ? !!(await get1('SELECT 1 FROM series_purchases WHERE series_id=? AND user_id=?', s.id, meId))
+      : false;
+    const items = await allRows(
+      `SELECT v.* FROM series_items si JOIN videos v ON v.id=si.video_id
+       WHERE si.series_id=? ORDER BY si.position ASC, v.created_at ASC`, s.id);
+    const videos = [];
+    for (const v of items) {
+      const j = await videoJSON(v, meId);
+      j.locked = !isOwner && !purchased;
+      videos.push(j);
+    }
+    res.json({
+      series: { id: s.id, title: s.title, description: s.description, cover: s.cover,
+        price_coins: Number(s.price_coins), creator_id: s.creator_id, created_at: Number(s.created_at) },
+      videos, purchased: !!purchased,
+    });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.post('/api/series/:id/videos', auth, async (req, res) => {
+  try {
+    const s = await get1('SELECT * FROM series WHERE id=?', req.params.id);
+    if (!s) return res.status(404).json({ error: 'série introuvable' });
+    if (Number(s.creator_id) !== Number(req.userId))
+      return res.status(403).json({ error: 'réservé au créateur de la série' });
+    const v = await get1('SELECT * FROM videos WHERE id=?', Number((req.body || {}).video_id));
+    if (!v) return res.status(404).json({ error: 'vidéo introuvable' });
+    if (Number(v.user_id) !== Number(req.userId))
+      return res.status(403).json({ error: 'cette vidéo ne vous appartient pas' });
+    if (v.series_id) return res.status(400).json({ error: 'vidéo déjà dans une série' });
+    const pos = Number((await get1('SELECT COUNT(*) AS c FROM series_items WHERE series_id=?', s.id)).c);
+    await insertIgnore('INSERT OR IGNORE INTO series_items(series_id,video_id,position) VALUES(?,?,?)',
+      s.id, v.id, pos);
+    await runSql('UPDATE videos SET series_id=? WHERE id=?', s.id, v.id);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.delete('/api/series/:id/videos/:video_id', auth, async (req, res) => {
+  try {
+    const s = await get1('SELECT * FROM series WHERE id=?', req.params.id);
+    if (!s) return res.status(404).json({ error: 'série introuvable' });
+    if (Number(s.creator_id) !== Number(req.userId))
+      return res.status(403).json({ error: 'réservé au créateur de la série' });
+    await runSql('DELETE FROM series_items WHERE series_id=? AND video_id=?', s.id, req.params.video_id);
+    await runSql('UPDATE videos SET series_id=NULL WHERE id=? AND series_id=?', req.params.video_id, s.id);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.post('/api/series/:id/buy', auth, async (req, res) => {
+  try {
+    const s = await get1('SELECT * FROM series WHERE id=?', req.params.id);
+    if (!s) return res.status(404).json({ error: 'série introuvable' });
+    if (Number(s.creator_id) === Number(req.userId))
+      return res.status(400).json({ error: 'impossible d\'acheter votre propre série' });
+    const already = await get1('SELECT 1 FROM series_purchases WHERE series_id=? AND user_id=?', s.id, req.userId);
+    if (already) return res.status(400).json({ error: 'série déjà achetée' });
+    const price = Number(s.price_coins);
+    const me = await get1('SELECT coins FROM users WHERE id=?', req.userId);
+    if (!me || Number(me.coins) < price)
+      return res.status(400).json({ error: 'pas assez de pièces' });
+    const creatorShare = Math.floor(price * 0.9); // 90 % créateur, 10 % plateforme
+    await runSql('UPDATE users SET coins=coins-? WHERE id=?', price, req.userId);
+    await runSql('UPDATE users SET coins=coins+? WHERE id=?', creatorShare, s.creator_id);
+    await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
+      req.userId, -price, 'achat série #' + s.id, now());
+    await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
+      s.creator_id, creatorShare, 'vente série #' + s.id, now());
+    await insertIgnore('INSERT OR IGNORE INTO series_purchases(series_id,user_id,created_at) VALUES(?,?,?)',
+      s.id, req.userId, now());
+    await notify(s.creator_id, 'series_buy', req.userId, null, String(price));
+    res.json({ ok: true, coins: Number(me.coins) - price });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+
+// ---------- algo « Pour toi » : événements de visionnage ----------
+app.post('/api/watch', auth, async (req, res) => {
+  try {
+    const b = req.body || {};
+    const videoId = Number(b.video_id);
+    if (!videoId) return res.status(400).json({ error: 'video_id requis' });
+    const v = await get1('SELECT id FROM videos WHERE id=?', videoId);
+    if (!v) return res.status(404).json({ error: 'vidéo introuvable' });
+    const watchMs = Math.max(0, Math.floor(Number(b.watch_ms) || 0));
+    const completed = Number(b.completed) === 1 ? 1 : 0;
+    await runSql('INSERT INTO watch_events(user_id,video_id,watch_ms,completed,created_at) VALUES(?,?,?,?,?)',
+      req.userId, videoId, watchMs, completed, now());
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+
+// ---------- jumelage familial ----------
+app.post('/api/family/code', auth, async (req, res) => {
+  try {
+    // un seul code actif par parent + purge des expirés
+    await runSql('DELETE FROM family_codes WHERE parent_id=? OR created_at<?', req.userId, now() - 15 * 60 * 1000);
+    const code = String(Math.floor(100000 + Math.random() * 900000));
+    await runSql('INSERT INTO family_codes(code,parent_id,created_at) VALUES(?,?,?)', code, req.userId, now());
+    res.json({ code, expires_in: 900 });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.post('/api/family/pair', auth, async (req, res) => {
+  try {
+    const code = String((req.body || {}).code || '').trim();
+    const fc = await get1('SELECT * FROM family_codes WHERE code=?', code);
+    if (!fc) return res.status(400).json({ error: 'code invalide' });
+    if (now() - Number(fc.created_at) > 15 * 60 * 1000) {
+      await runSql('DELETE FROM family_codes WHERE code=?', code);
+      return res.status(400).json({ error: 'code expiré' });
+    }
+    if (Number(fc.parent_id) === Number(req.userId))
+      return res.status(400).json({ error: 'impossible de se jumeler à soi-même' });
+    const already = await get1('SELECT 1 FROM family_links WHERE parent_id=? AND teen_id=?', fc.parent_id, req.userId);
+    if (already) return res.status(400).json({ error: 'déjà jumelé' });
+    await insertIgnore('INSERT OR IGNORE INTO family_links(parent_id,teen_id,created_at) VALUES(?,?,?)',
+      fc.parent_id, req.userId, now());
+    await insertIgnore('INSERT OR IGNORE INTO family_settings(teen_id) VALUES(?)', req.userId);
+    await runSql('DELETE FROM family_codes WHERE code=?', code);
+    res.json({ ok: true, parent_id: fc.parent_id });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.get('/api/family/children', auth, async (req, res) => {
+  try {
+    const links = await allRows('SELECT teen_id FROM family_links WHERE parent_id=?', req.userId);
+    const out = [];
+    for (const l of links) {
+      const t = await get1('SELECT id,username,avatar FROM users WHERE id=?', l.teen_id);
+      const s = await get1('SELECT * FROM family_settings WHERE teen_id=?', l.teen_id);
+      if (t) out.push({
+        teen: { id: t.id, username: t.username, avatar: t.avatar },
+        settings: s ? { screen_time_min: Number(s.screen_time_min),
+          restricted_mode: Number(s.restricted_mode), dm_policy: s.dm_policy } : null,
+      });
+    }
+    res.json({ children: out });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.put('/api/family/children/:teen_id/settings', auth, async (req, res) => {
+  try {
+    const teenId = Number(req.params.teen_id);
+    const link = await get1('SELECT 1 FROM family_links WHERE parent_id=? AND teen_id=?', req.userId, teenId);
+    if (!link) return res.status(403).json({ error: 'non autorisé' });
+    const b = req.body || {};
+    const stm = Math.floor(Number(b.screen_time_min));
+    if (isNaN(stm) || stm < 0 || stm > 480)
+      return res.status(400).json({ error: 'screen_time_min invalide (0 à 480)' });
+    const rm = Number(b.restricted_mode) === 1 ? 1 : 0;
+    const dmp = String(b.dm_policy || 'all');
+    if (!['all', 'followers', 'none'].includes(dmp))
+      return res.status(400).json({ error: 'dm_policy invalide (all|followers|none)' });
+    await runSql('UPDATE family_settings SET screen_time_min=?, restricted_mode=?, dm_policy=? WHERE teen_id=?',
+      stm, rm, dmp, teenId);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.get('/api/family/my-settings', auth, async (req, res) => {
+  try {
+    const link = await get1('SELECT parent_id FROM family_links WHERE teen_id=?', req.userId);
+    if (!link) return res.json({ is_teen: false, settings: null, parent: null });
+    const s = await get1('SELECT * FROM family_settings WHERE teen_id=?', req.userId);
+    const p = await get1('SELECT id,username,avatar FROM users WHERE id=?', link.parent_id);
+    res.json({
+      is_teen: true,
+      settings: s ? { screen_time_min: Number(s.screen_time_min),
+        restricted_mode: Number(s.restricted_mode), dm_policy: s.dm_policy } : null,
+      parent: p ? { id: p.id, username: p.username, avatar: p.avatar } : null,
+    });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.delete('/api/family/children/:teen_id', auth, async (req, res) => {
+  try {
+    const teenId = Number(req.params.teen_id);
+    // résiliable des deux côtés : le parent retire l'enfant, ou l'enfant se retire
+    const asParent = await get1('SELECT 1 FROM family_links WHERE parent_id=? AND teen_id=?', req.userId, teenId);
+    const asTeen = await get1('SELECT 1 FROM family_links WHERE parent_id=? AND teen_id=?', teenId, req.userId);
+    if (!asParent && !asTeen) return res.status(404).json({ error: 'lien introuvable' });
+    await runSql('DELETE FROM family_links WHERE (parent_id=? AND teen_id=?) OR (parent_id=? AND teen_id=?)',
+      req.userId, teenId, teenId, req.userId);
+    const teenGone = asParent ? teenId : req.userId;
+    const still = await get1('SELECT 1 FROM family_links WHERE teen_id=?', teenGone);
+    if (!still) await runSql('DELETE FROM family_settings WHERE teen_id=?', teenGone);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 
 // ---------- publication programmée : publie les vidéos dont l'heure est passée ----------
