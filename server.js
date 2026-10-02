@@ -565,6 +565,30 @@ app.post('/api/auth/phone', async (req, res) => {
 
 app.use('/uploads', express.static(UP, { maxAge: '7d' }));
 
+// ---- pages publiques (page d'accueil + confidentialité, requises pour OAuth) ----
+const PAGE_STYLE = `<style>body{font-family:system-ui,-apple-system,sans-serif;max-width:720px;margin:0 auto;padding:32px 20px;color:#111;line-height:1.6}h1{font-size:28px}a{color:#0a7aff}footer{margin-top:40px;font-size:13px;color:#888}</style>`;
+app.get('/', (req, res) => res.type('html').send(`<!DOCTYPE html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>VidiGagne</title>${PAGE_STYLE}</head><body>
+<h1>🎬 VidiGagne</h1>
+<p><strong>Regarde des vidéos, gagne des pièces.</strong> VidiGagne est une application mobile de vidéos courtes : crée ton compte (téléphone, e-mail ou Google), regarde des vidéos, publie les tiennes et accumule des pièces convertibles en gains.</p>
+<ul><li>📱 Application Android (bientôt sur Google Play)</li><li>💰 1000 pièces = 2&nbsp;$ de retrait minimum</li><li>🌍 Disponible dans tous les pays</li></ul>
+<p><a href="/privacy">Règles de confidentialité</a></p>
+<footer>VidiGagne — contact : ceuskewin1234@gmail.com</footer></body></html>`));
+app.get('/privacy', (req, res) => res.type('html').send(`<!DOCTYPE html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>VidiGagne — Confidentialité</title>${PAGE_STYLE}</head><body>
+<h1>Règles de confidentialité — VidiGagne</h1>
+<p><em>Dernière mise à jour : 2 octobre 2026.</em></p>
+<h2>Données collectées</h2><ul>
+<li><strong>Compte :</strong> pseudo, nom affiché, mot de passe chiffré.</li>
+<li><strong>E-mail</strong> (si inscription par e-mail) : pour la connexion et la récupération de compte.</li>
+<li><strong>Téléphone</strong> (si inscription par téléphone) : numéro vérifié par code SMS via Firebase.</li>
+<li><strong>Google</strong> (si connexion Google) : nom, adresse e-mail et photo de profil fournis par Google.</li>
+<li><strong>Contenu :</strong> vidéos publiées, descriptions, likes, commentaires, abonnements.</li>
+<li><strong>Gains :</strong> solde de pièces lié au compte.</li></ul>
+<h2>Utilisation</h2><p>Ces données servent uniquement au fonctionnement de l'application : gestion du compte, affichage du profil, diffusion des vidéos et calcul des gains. Nous ne vendons aucune donnée personnelle.</p>
+<h2>Hébergement</h2><p>Les données sont hébergées par Neon (base de données, Oregon, États-Unis) et Cloudinary (vidéos). Les serveurs applicatifs sont hébergés par Render.</p>
+<h2>Suppression</h2><p>Tu peux supprimer ton compte et tes données à tout moment depuis l'application (Profil → Paramètres) ou en écrivant à ceuskewin1234@gmail.com.</p>
+<h2>Contact</h2><p>ceuskewin1234@gmail.com</p>
+<footer>VidiGagne</footer></body></html>`));
+
 app.get('/api/health', (req, res) => res.json({
   ok: true, name: 'VidiGagne Server v2', time: now(),
   db: USE_PG ? 'postgres' : 'sqlite',
