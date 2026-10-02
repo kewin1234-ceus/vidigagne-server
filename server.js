@@ -351,7 +351,127 @@ CREATE TABLE IF NOT EXISTS creator_subs(
   active INTEGER NOT NULL DEFAULT 1,
   created_at BIGINT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS csub_active_idx ON creator_subs(creator_id, subscriber_id, active);`;
+CREATE INDEX IF NOT EXISTS csub_active_idx ON creator_subs(creator_id, subscriber_id, active);
+-- ==================== V3 : BOUTIQUE ====================
+CREATE TABLE IF NOT EXISTS categories(
+  id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+  name TEXT UNIQUE NOT NULL
+);
+CREATE TABLE IF NOT EXISTS products(
+  id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+  seller_id INTEGER NOT NULL,
+  category_id INTEGER,
+  title TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  price_coins INTEGER NOT NULL DEFAULT 0,
+  stock INTEGER NOT NULL DEFAULT 0,
+  image_url TEXT NOT NULL DEFAULT '',
+  active INTEGER NOT NULL DEFAULT 1,
+  created_at BIGINT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS cart(
+  user_id INTEGER NOT NULL,
+  product_id INTEGER NOT NULL,
+  qty INTEGER NOT NULL DEFAULT 1,
+  PRIMARY KEY(user_id, product_id)
+);
+CREATE TABLE IF NOT EXISTS orders(
+  id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+  buyer_id INTEGER NOT NULL,
+  total_coins INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'completed',
+  coupon_code TEXT,
+  affiliate_id INTEGER,
+  created_at BIGINT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS order_items(
+  id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+  order_id INTEGER NOT NULL,
+  product_id INTEGER NOT NULL,
+  seller_id INTEGER NOT NULL,
+  qty INTEGER NOT NULL,
+  price_coins INTEGER NOT NULL,
+  fee_coins INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS video_products(
+  video_id INTEGER NOT NULL,
+  product_id INTEGER NOT NULL,
+  PRIMARY KEY(video_id, product_id)
+);
+CREATE TABLE IF NOT EXISTS coupons(
+  id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+  code TEXT UNIQUE NOT NULL,
+  discount_pct INTEGER NOT NULL DEFAULT 0,
+  discount_coins INTEGER NOT NULL DEFAULT 0,
+  seller_id INTEGER,
+  min_coins INTEGER NOT NULL DEFAULT 0,
+  expires_at BIGINT,
+  active INTEGER NOT NULL DEFAULT 1,
+  max_uses INTEGER NOT NULL DEFAULT 0,
+  used_count INTEGER NOT NULL DEFAULT 0,
+  created_at BIGINT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS affiliates(
+  id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+  user_id INTEGER UNIQUE NOT NULL,
+  code TEXT UNIQUE NOT NULL,
+  rate_pct INTEGER NOT NULL DEFAULT 5,
+  created_at BIGINT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS affiliate_sales(
+  id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+  affiliate_id INTEGER NOT NULL,
+  order_id INTEGER NOT NULL,
+  commission_coins INTEGER NOT NULL DEFAULT 0,
+  created_at BIGINT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS platform_fees(
+  id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+  order_id INTEGER NOT NULL,
+  coins INTEGER NOT NULL DEFAULT 0,
+  created_at BIGINT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS seller_payouts(
+  id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+  seller_id INTEGER NOT NULL,
+  coins INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'done',
+  created_at BIGINT NOT NULL
+);
+-- ==================== V3 : LIVE SHOPPING ====================
+CREATE TABLE IF NOT EXISTS live_products(
+  live_id INTEGER NOT NULL,
+  product_id INTEGER NOT NULL,
+  pinned_at BIGINT NOT NULL,
+  PRIMARY KEY(live_id, product_id)
+);
+-- ==================== V3 : PUBLICITÉ ====================
+CREATE TABLE IF NOT EXISTS ad_campaigns(
+  id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+  user_id INTEGER NOT NULL,
+  title TEXT NOT NULL,
+  budget_coins INTEGER NOT NULL DEFAULT 0,
+  spent_coins INTEGER NOT NULL DEFAULT 0,
+  product_id INTEGER,
+  status TEXT NOT NULL DEFAULT 'active',
+  target TEXT NOT NULL DEFAULT '',
+  created_at BIGINT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS ad_events(
+  id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+  campaign_id INTEGER NOT NULL,
+  type TEXT NOT NULL,
+  created_at BIGINT NOT NULL
+);
+-- ==================== V3 : MODÉRATION AUTO ====================
+CREATE TABLE IF NOT EXISTS review_queue(
+  id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+  item_type TEXT NOT NULL,
+  item_id INTEGER NOT NULL,
+  reason TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'pending',
+  created_at BIGINT NOT NULL
+);`;
   if (USE_PG) { await pool.query(schema); }
   else { lite.exec(schema); }
   // migrations : colonnes d'authentification sociale
@@ -419,6 +539,21 @@ CREATE INDEX IF NOT EXISTS csub_active_idx ON creator_subs(creator_id, subscribe
   await mig('lives', 'gifts_total', `INTEGER NOT NULL DEFAULT 0`);
   await mig('lives', 'chat_total', `INTEGER NOT NULL DEFAULT 0`);
   await mig('gifts', 'live_id', `INTEGER`);
+  // serveur v11 (V3) : boutique, live shopping, publicité, modération auto
+  await mig('users', 'seller_name', `TEXT NOT NULL DEFAULT ''`);
+  await mig('users', 'seller_bio', `TEXT NOT NULL DEFAULT ''`);
+  await mig('users', 'seller_verified', `INTEGER NOT NULL DEFAULT 0`);
+  await mig('videos', 'review_status', `TEXT NOT NULL DEFAULT 'ok'`);
+  await mig('comments', 'review_status', `TEXT NOT NULL DEFAULT 'ok'`);
+  // catégories de boutique par défaut
+  try {
+    const n = await get1('SELECT COUNT(*) AS c FROM categories');
+    if (!Number(n.c)) {
+      for (const c of ['Mode', 'Beauté', 'Électronique', 'Maison', 'Sport', 'Alimentation', 'Jouets', 'Autre']) {
+        await runSql('INSERT INTO categories(name) VALUES(?)', c);
+      }
+    }
+  } catch (e) {}
 }
 
 // une ligne ou undefined
@@ -726,8 +861,14 @@ app.post('/api/videos', auth, upload.single('video'), async (req, res) => {
     await runSql('UPDATE users SET coins=coins+10 WHERE id=?', req.userId);
     await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
       req.userId, 10, 'publication vidéo #' + id, now());
+    // modération auto V3 : scan du texte (sans IA externe)
+    const badW = scanBanned(descText + ' ' + String(b.tags || ''));
+    if (badW) {
+      await runSql(`UPDATE videos SET hidden=1, review_status='pending' WHERE id=?`, id);
+      await flagForReview('video', id, 'mot interdit : ' + badW);
+    }
     const v = await get1('SELECT * FROM videos WHERE id=?', id);
-    res.json({ video: await videoJSON(v, req.userId) });
+    res.json({ video: await videoJSON(v, req.userId), pending_review: !!badW });
   } catch (e) { res.status(500).json({ error: 'échec du téléversement' }); }
 });
 
@@ -1511,7 +1652,8 @@ app.get('/api/videos/:id/comments', async (req, res) => {
   const rows = await allRows(
     `SELECT c.*, u.username, u.name, u.avatar FROM comments c
      JOIN users u ON u.id=c.user_id
-     WHERE c.video_id=? ORDER BY c.created_at ASC LIMIT 200`, req.params.id);
+     WHERE c.video_id=? AND (c.review_status IS NULL OR c.review_status<>'pending')
+     ORDER BY c.created_at ASC LIMIT 200`, req.params.id);
   res.json({ comments: rows });
 });
 
@@ -1528,6 +1670,12 @@ app.post('/api/videos/:id/comments', auth, upload.single('video'), async (req, r
     const id = await insertId(
       'INSERT INTO comments(video_id,user_id,text,reply_to,video_url,created_at) VALUES(?,?,?,?,?,?)',
       req.params.id, req.userId, text, replyTo, videoUrl, now());
+    // modération auto V3 : scan du texte (sans IA externe)
+    const badC = scanBanned(text);
+    if (badC) {
+      await runSql(`UPDATE comments SET review_status='pending' WHERE id=?`, id);
+      await flagForReview('comment', id, 'mot interdit : ' + badC);
+    }
     const c = await get1(
       `SELECT c.*, u.username, u.name, u.avatar FROM comments c
        JOIN users u ON u.id=c.user_id WHERE c.id=?`, id);
@@ -2717,6 +2865,485 @@ app.get('/api/users/:username/subscription', auth, async (req, res) => {
 async function expireSubs() {
   try { await runSql('UPDATE creator_subs SET active=0 WHERE active=1 AND expires_at<=?', now()); } catch (e) {}
 }
+
+// ==================== SERVEUR v11 — V3 ====================
+// BOUTIQUE + LIVE SHOPPING + PUBLICITÉ + MODÉRATION AUTO + FINANCIER
+const PLATFORM_FEE_PCT = 10;   // commission plateforme sur chaque vente
+const AFFILIATE_RATE_PCT = 5;  // commission d'affiliation par défaut (% du total)
+const AD_COST_IMPRESSION = 1;  // pièces débitées du budget par impression
+const AD_COST_CLICK = 5;       // pièces débitées du budget par clic
+
+// ---------- modération auto (honnête : simple filtre de mots, sans IA externe) ----------
+// Liste configurable : insultes graves, discriminations, menaces, arnaques courantes.
+const BANNED_WORDS = [
+  'connard', 'connasse', 'salope', 'salaud', 'pute', 'enculé', 'encule', 'fdp', 'ntm',
+  'nique ta', 'nique ton', 'ferme ta gueule', 'tg ',
+  'nègre', 'négro', 'bougnoule', 'youpin', 'bicot', 'sale arabe', 'sale juif',
+  'je vais te tuer', 'va mourir', 'suicide-toi', 'je te tue',
+  'argent facile', 'doublez votre argent', 'crypto x100', 'gagner de l’argent sans rien faire',
+];
+function scanBanned(text) {
+  const t = ' ' + String(text || '').toLowerCase().normalize('NFC') + ' ';
+  for (const w of BANNED_WORDS) {
+    if (t.includes(w.toLowerCase())) return w;
+  }
+  return null;
+}
+async function flagForReview(itemType, itemId, reason) {
+  try {
+    await runSql(`INSERT INTO review_queue(item_type,item_id,reason,status,created_at) VALUES(?,?,?,'pending',?)`,
+      itemType, itemId, String(reason || '').slice(0, 200), now());
+  } catch (e) {}
+}
+
+// ---------- boutique : helpers ----------
+function productJSON(p) {
+  return {
+    id: p.id, seller_id: p.seller_id, category_id: p.category_id || null,
+    title: p.title, description: p.description || '',
+    price_coins: Number(p.price_coins) || 0, stock: Number(p.stock) || 0,
+    image: p.image_url ? fileUrl(p.image_url) : null,
+    active: !!p.active, created_at: Number(p.created_at) || 0,
+  };
+}
+async function requireSeller(req, res) {
+  const u = await get1('SELECT * FROM users WHERE id=?', req.userId);
+  if (!u || !u.seller_name) { res.status(403).json({ error: 'devenez vendeur pour continuer' }); return null; }
+  return u;
+}
+
+// ---------- boutique : catégories ----------
+app.get('/api/shop/categories', async (req, res) => {
+  const rows = await allRows('SELECT * FROM categories ORDER BY name ASC');
+  res.json({ categories: rows });
+});
+
+// ---------- boutique : devenir vendeur / profil vendeur ----------
+app.post('/api/shop/seller', auth, async (req, res) => {
+  const name = String((req.body || {}).name || '').trim().slice(0, 60);
+  const bio = String((req.body || {}).bio || '').trim().slice(0, 200);
+  if (!name) return res.status(400).json({ error: 'nom de boutique requis' });
+  const u = await get1('SELECT * FROM users WHERE id=?', req.userId);
+  if (u.seller_name) return res.status(400).json({ error: 'déjà vendeur' });
+  await runSql('UPDATE users SET seller_name=?, seller_bio=? WHERE id=?', name, bio, req.userId);
+  res.json({ ok: true, seller_name: name });
+});
+app.get('/api/shop/sellers/:username', async (req, res) => {
+  const u = await get1('SELECT * FROM users WHERE username=?', String(req.params.username).toLowerCase());
+  if (!u || !u.seller_name) return res.status(404).json({ error: 'vendeur introuvable' });
+  const prods = await allRows('SELECT * FROM products WHERE seller_id=? AND active=1 ORDER BY created_at DESC', u.id);
+  res.json({
+    seller: { username: u.username, name: u.name, avatar: u.avatar,
+      seller_name: u.seller_name, seller_bio: u.seller_bio || '', seller_verified: !!u.seller_verified },
+    products: prods.map(productJSON),
+  });
+});
+
+// ---------- boutique : produits (CRUD vendeur) ----------
+app.post('/api/shop/products', auth, uploadImg.single('image'), async (req, res) => {
+  try {
+    const seller = await requireSeller(req, res); if (!seller) return;
+    const b = req.body || {};
+    const title = String(b.title || '').trim().slice(0, 100);
+    const price = Math.floor(Number(b.price_coins));
+    const stock = Math.floor(Number(b.stock));
+    const category_id = b.category_id ? Number(b.category_id) : null;
+    if (!title) return res.status(400).json({ error: 'titre requis' });
+    if (!price || price < 1 || price > 100000000) return res.status(400).json({ error: 'prix invalide (1 pièce minimum)' });
+    if (!(stock >= 0) || stock > 1000000) return res.status(400).json({ error: 'stock invalide' });
+    if (category_id) {
+      const c = await get1('SELECT 1 FROM categories WHERE id=?', category_id);
+      if (!c) return res.status(400).json({ error: 'catégorie invalide' });
+    }
+    let imageUrl = '';
+    if (req.file) imageUrl = await storeImage(req.file, 'vidigagne/products');
+    const id = await insertId(
+      'INSERT INTO products(seller_id,category_id,title,description,price_coins,stock,image_url,active,created_at) VALUES(?,?,?,?,?,?,?,?,?)',
+      req.userId, category_id, title, String(b.description || '').slice(0, 1000), price, stock, imageUrl, 1, now());
+    const p = await get1('SELECT * FROM products WHERE id=?', id);
+    res.json({ ok: true, product: productJSON(p) });
+  } catch (e) { res.status(500).json({ error: 'échec de la création du produit' }); }
+});
+app.put('/api/shop/products/:id', auth, uploadImg.single('image'), async (req, res) => {
+  try {
+    const seller = await requireSeller(req, res); if (!seller) return;
+    const p = await get1('SELECT * FROM products WHERE id=?', req.params.id);
+    if (!p) return res.status(404).json({ error: 'produit introuvable' });
+    if (Number(p.seller_id) !== Number(req.userId)) return res.status(403).json({ error: 'non autorisé' });
+    const b = req.body || {};
+    const title = b.title !== undefined ? String(b.title).trim().slice(0, 100) : p.title;
+    const price = b.price_coins !== undefined ? Math.floor(Number(b.price_coins)) : Number(p.price_coins);
+    const stock = b.stock !== undefined ? Math.floor(Number(b.stock)) : Number(p.stock);
+    const description = b.description !== undefined ? String(b.description).slice(0, 1000) : p.description;
+    if (!title) return res.status(400).json({ error: 'titre requis' });
+    if (!price || price < 1 || price > 100000000) return res.status(400).json({ error: 'prix invalide (1 pièce minimum)' });
+    if (!(stock >= 0) || stock > 1000000) return res.status(400).json({ error: 'stock invalide' });
+    let imageUrl = p.image_url;
+    if (req.file) imageUrl = await storeImage(req.file, 'vidigagne/products');
+    await runSql('UPDATE products SET title=?, description=?, price_coins=?, stock=?, image_url=? WHERE id=?',
+      title, description, price, stock, imageUrl, p.id);
+    const upd = await get1('SELECT * FROM products WHERE id=?', p.id);
+    res.json({ ok: true, product: productJSON(upd) });
+  } catch (e) { res.status(500).json({ error: 'échec de la modification' }); }
+});
+app.delete('/api/shop/products/:id', auth, async (req, res) => {
+  const seller = await requireSeller(req, res); if (!seller) return;
+  const p = await get1('SELECT * FROM products WHERE id=?', req.params.id);
+  if (!p) return res.status(404).json({ error: 'produit introuvable' });
+  if (Number(p.seller_id) !== Number(req.userId)) return res.status(403).json({ error: 'non autorisé' });
+  await runSql('UPDATE products SET active=0 WHERE id=?', p.id);
+  res.json({ ok: true });
+});
+app.get('/api/shop/products/:id', async (req, res) => {
+  const p = await get1('SELECT * FROM products WHERE id=? AND active=1', req.params.id);
+  if (!p) return res.status(404).json({ error: 'produit introuvable' });
+  const s = await get1('SELECT username, seller_name FROM users WHERE id=?', p.seller_id);
+  res.json({ product: { ...productJSON(p), seller_username: s ? s.username : null, seller_name: s ? s.seller_name : null } });
+});
+async function shopSearch(req, res) {
+  const q = '%' + String(req.query.q || '').toLowerCase() + '%';
+  const cat = (req.query.category_id || req.query.category) ? Number(req.query.category_id || req.query.category) : null;
+  let sql = 'SELECT * FROM products WHERE active=1 AND stock>0 AND (LOWER(title) LIKE ? OR LOWER(description) LIKE ?)';
+  const params = [q, q];
+  if (cat) { sql += ' AND category_id=?'; params.push(cat); }
+  sql += ' ORDER BY created_at DESC LIMIT 50';
+  const rows = await allRows(sql, ...params);
+  res.json({ products: rows.map(productJSON) });
+}
+app.get('/api/shop/search', shopSearch);
+// alias utilisé par l'app (mêmes paramètres)
+app.get('/api/shop/products', shopSearch);
+
+// ---------- boutique : panier ----------
+app.get('/api/shop/cart', auth, async (req, res) => {
+  const rows = await allRows('SELECT c.qty, p.* FROM cart c JOIN products p ON p.id=c.product_id WHERE c.user_id=?', req.userId);
+  res.json({ items: rows.map(r => ({ qty: Number(r.qty), product: productJSON(r) })) });
+});
+app.post('/api/shop/cart', auth, async (req, res) => {
+  const pid = Number((req.body || {}).product_id);
+  const qty = Math.floor(Number((req.body || {}).qty)) || 1;
+  if (!pid || qty < 1 || qty > 99) return res.status(400).json({ error: 'quantité invalide' });
+  const p = await get1('SELECT * FROM products WHERE id=? AND active=1', pid);
+  if (!p) return res.status(404).json({ error: 'produit introuvable' });
+  if (Number(p.seller_id) === Number(req.userId)) return res.status(400).json({ error: 'vous ne pouvez pas acheter vos propres produits' });
+  if (USE_PG) {
+    await runSql('INSERT INTO cart(user_id,product_id,qty) VALUES(?,?,?) ON CONFLICT(user_id,product_id) DO UPDATE SET qty=EXCLUDED.qty',
+      req.userId, pid, qty);
+  } else {
+    await runSql('INSERT OR REPLACE INTO cart(user_id,product_id,qty) VALUES(?,?,?)', req.userId, pid, qty);
+  }
+  res.json({ ok: true });
+});
+app.delete('/api/shop/cart/:product_id', auth, async (req, res) => {
+  await runSql('DELETE FROM cart WHERE user_id=? AND product_id=?', req.userId, req.params.product_id);
+  res.json({ ok: true });
+});
+
+// ---------- boutique : coupons (vendeur) ----------
+app.post('/api/shop/coupons', auth, async (req, res) => {
+  try {
+    const seller = await requireSeller(req, res); if (!seller) return;
+    const b = req.body || {};
+    const code = String(b.code || '').toUpperCase().replace(/[^A-Z0-9-]/g, '').slice(0, 20);
+    const discount_pct = Math.floor(Number(b.discount_pct)) || 0;
+    const discount_coins = Math.floor(Number(b.discount_coins)) || 0;
+    if (!code) return res.status(400).json({ error: 'code requis' });
+    if (discount_pct < 0 || discount_pct > 90) return res.status(400).json({ error: 'pourcentage invalide (0 à 90)' });
+    if (discount_coins < 0) return res.status(400).json({ error: 'montant invalide' });
+    if (!discount_pct && !discount_coins) return res.status(400).json({ error: 'réduction requise' });
+    const ex = await get1('SELECT 1 FROM coupons WHERE code=?', code);
+    if (ex) return res.status(409).json({ error: 'ce code existe déjà' });
+    const expires_at = b.expires_at ? Number(b.expires_at) : null;
+    const id = await insertId(
+      'INSERT INTO coupons(code,discount_pct,discount_coins,seller_id,min_coins,expires_at,active,max_uses,used_count,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)',
+      code, discount_pct, discount_coins, req.userId,
+      Math.max(0, Math.floor(Number(b.min_coins)) || 0), expires_at, 1,
+      Math.max(0, Math.floor(Number(b.max_uses)) || 0), 0, now());
+    res.json({ ok: true, id, code });
+  } catch (e) { res.status(500).json({ error: 'échec de la création du coupon' }); }
+});
+
+// ---------- boutique : commande ----------
+app.post('/api/shop/orders', auth, async (req, res) => {
+  try {
+    const items = await allRows(
+      'SELECT c.qty, c.product_id, p.* FROM cart c JOIN products p ON p.id=c.product_id WHERE c.user_id=?', req.userId);
+    if (!items.length) return res.status(400).json({ error: 'panier vide' });
+    // --- validation complète AVANT tout débit (pas de double-débit) ---
+    let subtotal = 0;
+    for (const it of items) {
+      if (!it.active) return res.status(400).json({ error: 'produit indisponible : ' + it.title });
+      if (Number(it.seller_id) === Number(req.userId)) return res.status(400).json({ error: 'vous ne pouvez pas acheter vos propres produits' });
+      if (Number(it.stock) < Number(it.qty)) return res.status(400).json({ error: 'stock insuffisant : ' + it.title });
+      subtotal += Number(it.price_coins) * Number(it.qty);
+    }
+    // coupon
+    let discount = 0, coupon = null;
+    const couponCode = String((req.body || {}).coupon_code || '').toUpperCase().trim();
+    if (couponCode) {
+      coupon = await get1('SELECT * FROM coupons WHERE code=?', couponCode);
+      if (!coupon || !Number(coupon.active)) return res.status(400).json({ error: 'coupon invalide' });
+      if (coupon.expires_at && Number(coupon.expires_at) <= now()) return res.status(400).json({ error: 'coupon expiré' });
+      if (Number(coupon.max_uses) > 0 && Number(coupon.used_count) >= Number(coupon.max_uses))
+        return res.status(400).json({ error: 'coupon épuisé' });
+      if (subtotal < Number(coupon.min_coins)) return res.status(400).json({ error: 'montant minimum non atteint pour ce coupon' });
+      if (coupon.seller_id && !items.some(it => Number(it.seller_id) === Number(coupon.seller_id)))
+        return res.status(400).json({ error: "ce coupon ne s'applique pas à votre panier" });
+      if (Number(coupon.discount_pct) > 0) discount = Math.floor(subtotal * Number(coupon.discount_pct) / 100);
+      else discount = Number(coupon.discount_coins);
+      discount = Math.min(discount, subtotal);
+    }
+    const total = subtotal - discount;
+    // affiliation (?ref=CODE)
+    let affiliate = null;
+    const ref = String((req.body || {}).ref || '').toUpperCase().trim();
+    if (ref) affiliate = await get1('SELECT * FROM affiliates WHERE code=?', ref);
+    // solde acheteur
+    const me = await get1('SELECT coins FROM users WHERE id=?', req.userId);
+    if (!me || Number(me.coins) < total) return res.status(400).json({ error: 'pas assez de pièces' });
+    // --- exécution (séquentielle, une seule fois) ---
+    await runSql('UPDATE users SET coins=coins-? WHERE id=?', total, req.userId);
+    await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
+      req.userId, -total, 'commande boutique', now());
+    const orderId = await insertId(
+      'INSERT INTO orders(buyer_id,total_coins,status,coupon_code,affiliate_id,created_at) VALUES(?,?,?,?,?,?)',
+      req.userId, total, 'completed', coupon ? coupon.code : null, affiliate ? affiliate.id : null, now());
+    let platformTotal = 0;
+    for (const it of items) {
+      const line = Number(it.price_coins) * Number(it.qty);
+      const fee = Math.floor(line * PLATFORM_FEE_PCT / 100);
+      const net = line - fee;
+      platformTotal += fee;
+      await runSql('INSERT INTO order_items(order_id,product_id,seller_id,qty,price_coins,fee_coins) VALUES(?,?,?,?,?,?)',
+        orderId, it.product_id, it.seller_id, it.qty, it.price_coins, fee);
+      await runSql('UPDATE products SET stock=stock-? WHERE id=? AND stock>=?', it.qty, it.product_id, it.qty);
+      await runSql('UPDATE users SET coins=coins+? WHERE id=?', net, it.seller_id);
+      await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
+        it.seller_id, net, 'vente boutique #' + orderId, now());
+    }
+    if (platformTotal > 0) await runSql('INSERT INTO platform_fees(order_id,coins,created_at) VALUES(?,?,?)', orderId, platformTotal, now());
+    if (coupon) await runSql('UPDATE coupons SET used_count=used_count+1 WHERE id=?', coupon.id);
+    if (affiliate) {
+      const comm = Math.min(Math.floor(total * Number(affiliate.rate_pct) / 100), platformTotal);
+      if (comm > 0) await insertId('INSERT INTO affiliate_sales(affiliate_id,order_id,commission_coins,created_at) VALUES(?,?,?,?)',
+        affiliate.id, orderId, comm, now());
+    }
+    await runSql('DELETE FROM cart WHERE user_id=?', req.userId);
+    res.json({ ok: true, order_id: orderId, total_coins: total, discount_coins: discount });
+  } catch (e) { res.status(500).json({ error: 'échec de la commande' }); }
+});
+app.get('/api/shop/orders', auth, async (req, res) => {
+  const orders = await allRows('SELECT * FROM orders WHERE buyer_id=? ORDER BY created_at DESC LIMIT 50', req.userId);
+  for (const o of orders) {
+    o.items = await allRows('SELECT oi.*, p.title FROM order_items oi LEFT JOIN products p ON p.id=oi.product_id WHERE oi.order_id=?', o.id);
+    o.total_coins = Number(o.total_coins);
+  }
+  res.json({ orders });
+});
+app.get('/api/shop/sales', auth, async (req, res) => {
+  const seller = await requireSeller(req, res); if (!seller) return;
+  const items = await allRows(
+    `SELECT oi.*, p.title, o.created_at, u.username AS buyer FROM order_items oi
+     JOIN orders o ON o.id=oi.order_id
+     LEFT JOIN products p ON p.id=oi.product_id
+     LEFT JOIN users u ON u.id=o.buyer_id
+     WHERE oi.seller_id=? ORDER BY o.created_at DESC LIMIT 100`, req.userId);
+  res.json({ sales: items });
+});
+
+// ---------- boutique : produits attachés aux vidéos ----------
+app.post('/api/videos/:id/products', auth, async (req, res) => {
+  const v = await get1('SELECT * FROM videos WHERE id=?', req.params.id);
+  if (!v) return res.status(404).json({ error: 'vidéo introuvable' });
+  const p = await get1('SELECT * FROM products WHERE id=? AND active=1', Number((req.body || {}).product_id));
+  if (!p) return res.status(404).json({ error: 'produit introuvable' });
+  const isOwner = Number(v.user_id) === Number(req.userId);
+  const isSeller = Number(p.seller_id) === Number(req.userId);
+  if (!isOwner && !isSeller) return res.status(403).json({ error: 'non autorisé' });
+  await insertIgnore('INSERT OR IGNORE INTO video_products(video_id,product_id) VALUES(?,?)', v.id, p.id);
+  res.json({ ok: true });
+});
+app.get('/api/videos/:id/products', async (req, res) => {
+  const rows = await allRows(
+    'SELECT p.* FROM video_products vp JOIN products p ON p.id=vp.product_id WHERE vp.video_id=? AND p.active=1',
+    req.params.id);
+  res.json({ products: rows.map(productJSON) });
+});
+
+// ---------- boutique : affiliation ----------
+function affiliateCode() { return 'VG-' + crypto.randomBytes(4).toString('hex').toUpperCase(); }
+app.post('/api/shop/affiliate', auth, async (req, res) => {
+  const ex = await get1('SELECT * FROM affiliates WHERE user_id=?', req.userId);
+  if (ex) return res.json({ ok: true, code: ex.code, rate_pct: Number(ex.rate_pct) });
+  let code = affiliateCode();
+  for (let i = 0; i < 5; i++) {
+    const c = await get1('SELECT 1 FROM affiliates WHERE code=?', code);
+    if (!c) break;
+    code = affiliateCode();
+  }
+  await insertId('INSERT INTO affiliates(user_id,code,rate_pct,created_at) VALUES(?,?,?,?)',
+    req.userId, code, AFFILIATE_RATE_PCT, now());
+  res.json({ ok: true, code, rate_pct: AFFILIATE_RATE_PCT });
+});
+app.get('/api/shop/affiliate/stats', auth, async (req, res) => {
+  const a = await get1('SELECT * FROM affiliates WHERE user_id=?', req.userId);
+  if (!a) return res.json({ affiliate: null });
+  const s = await get1('SELECT COUNT(*) AS n, COALESCE(SUM(commission_coins),0) AS t FROM affiliate_sales WHERE affiliate_id=?', a.id);
+  res.json({ affiliate: { code: a.code, rate_pct: Number(a.rate_pct), sales: Number(s.n), total_commission: Number(s.t) } });
+});
+
+// ---------- boutique : financier vendeur ----------
+app.get('/api/shop/payouts', auth, async (req, res) => {
+  const seller = await requireSeller(req, res); if (!seller) return;
+  const e = await get1('SELECT COALESCE(SUM(price_coins*qty - fee_coins),0) AS s FROM order_items WHERE seller_id=?', req.userId);
+  const p = await get1('SELECT COALESCE(SUM(coins),0) AS s FROM seller_payouts WHERE seller_id=?', req.userId);
+  const earned = Number(e.s), paid = Number(p.s);
+  res.json({ earned_coins: earned, paid_out_coins: paid, pending_coins: earned - paid });
+});
+app.post('/api/shop/payout', auth, async (req, res) => {
+  const seller = await requireSeller(req, res); if (!seller) return;
+  const e = await get1('SELECT COALESCE(SUM(price_coins*qty - fee_coins),0) AS s FROM order_items WHERE seller_id=?', req.userId);
+  const p = await get1('SELECT COALESCE(SUM(coins),0) AS s FROM seller_payouts WHERE seller_id=?', req.userId);
+  const pending = Number(e.s) - Number(p.s);
+  if (!pending || pending <= 0) return res.status(400).json({ error: 'aucun gain en attente' });
+  let amount = (req.body && req.body.coins != null) ? Math.floor(Number(req.body.coins)) : pending;
+  if (!amount || amount < 1) return res.status(400).json({ error: 'montant invalide' });
+  if (amount > pending) return res.status(400).json({ error: 'montant supérieur aux gains en attente' });
+  await insertId('INSERT INTO seller_payouts(seller_id,coins,status,created_at) VALUES(?,?,?,?)',
+    req.userId, amount, 'done', now());
+  await runSql('UPDATE users SET coins=coins+? WHERE id=?', amount, req.userId);
+  await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
+    req.userId, amount, 'versement vendeur', now());
+  res.json({ ok: true, coins: amount });
+});
+
+// ---------- financier : historique ----------
+app.get('/api/finance/ledger', auth, async (req, res) => {
+  const rows = await allRows('SELECT * FROM ledger WHERE user_id=? ORDER BY created_at DESC LIMIT 100', req.userId);
+  res.json({ ledger: rows });
+});
+
+// ==================== V3 : LIVE SHOPPING ====================
+app.post('/api/live/:id/products', auth, async (req, res) => {
+  const l = await liveById(req.params.id);
+  if (!l) return res.status(404).json({ error: 'live introuvable' });
+  if (l.ended_at) return res.status(403).json({ error: 'live terminé' });
+  if (Number(l.user_id) !== Number(req.userId)) return res.status(403).json({ error: 'réservé au diffuseur' });
+  const p = await get1('SELECT * FROM products WHERE id=? AND seller_id=? AND active=1',
+    Number((req.body || {}).product_id), req.userId);
+  if (!p) return res.status(404).json({ error: 'produit introuvable' });
+  await insertIgnore('INSERT OR IGNORE INTO live_products(live_id,product_id,pinned_at) VALUES(?,?,?)', l.id, p.id, now());
+  res.json({ ok: true });
+});
+app.get('/api/live/:id/products', async (req, res) => {
+  const l = await liveById(req.params.id);
+  if (!l) return res.status(404).json({ error: 'live introuvable' });
+  const rows = await allRows(
+    'SELECT p.* FROM live_products lp JOIN products p ON p.id=lp.product_id WHERE lp.live_id=? AND p.active=1 ORDER BY lp.pinned_at ASC',
+    l.id);
+  res.json({ products: rows.map(productJSON) });
+});
+
+// ==================== V3 : PUBLICITÉ ====================
+app.post('/api/ads/campaigns', auth, async (req, res) => {
+  try {
+    const b = req.body || {};
+    const title = String(b.title || '').trim().slice(0, 80);
+    const budget = Math.floor(Number(b.budget_coins));
+    const target = String(b.target || '').slice(0, 80);
+    const product_id = b.product_id ? Number(b.product_id) : null;
+    if (!title) return res.status(400).json({ error: 'titre requis' });
+    if (!budget || budget < 10) return res.status(400).json({ error: 'budget minimum : 10 pièces' });
+    if (product_id) {
+      const p = await get1('SELECT * FROM products WHERE id=? AND seller_id=? AND active=1', product_id, req.userId);
+      if (!p) return res.status(400).json({ error: 'produit invalide' });
+    }
+    const me = await get1('SELECT coins FROM users WHERE id=?', req.userId);
+    if (!me || Number(me.coins) < budget) return res.status(400).json({ error: 'pas assez de pièces' });
+    await runSql('UPDATE users SET coins=coins-? WHERE id=?', budget, req.userId);
+    await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
+      req.userId, -budget, 'campagne publicitaire', now());
+    const id = await insertId(
+      `INSERT INTO ad_campaigns(user_id,title,budget_coins,spent_coins,product_id,status,target,created_at)
+       VALUES(?,?,?,?,?,'active',?,?)`,
+      req.userId, title, budget, 0, product_id, target, now());
+    res.json({ ok: true, id });
+  } catch (e) { res.status(500).json({ error: 'échec de la création de la campagne' }); }
+});
+app.get('/api/ads/campaigns', auth, async (req, res) => {
+  const rows = await allRows('SELECT * FROM ad_campaigns WHERE user_id=? ORDER BY created_at DESC', req.userId);
+  const out = [];
+  for (const c of rows) {
+    const im = await get1(`SELECT COUNT(*) AS n FROM ad_events WHERE campaign_id=? AND type='impression'`, c.id);
+    const cl = await get1(`SELECT COUNT(*) AS n FROM ad_events WHERE campaign_id=? AND type='click'`, c.id);
+    out.push({ id: c.id, title: c.title, budget_coins: Number(c.budget_coins), spent_coins: Number(c.spent_coins),
+      product_id: c.product_id || null, status: c.status, target: c.target || '',
+      impressions: Number(im.n), clicks: Number(cl.n), created_at: Number(c.created_at) });
+  }
+  res.json({ campaigns: out });
+});
+app.post('/api/ads/:id/event', async (req, res) => {
+  const type = String((req.body || {}).type || '');
+  if (!['impression', 'click'].includes(type)) return res.status(400).json({ error: 'type invalide' });
+  const c = await get1('SELECT * FROM ad_campaigns WHERE id=?', req.params.id);
+  if (!c || c.status !== 'active') return res.status(404).json({ error: 'campagne introuvable ou inactive' });
+  const cost = type === 'click' ? AD_COST_CLICK : AD_COST_IMPRESSION;
+  if (Number(c.spent_coins) + cost > Number(c.budget_coins)) {
+    await runSql(`UPDATE ad_campaigns SET status='paused' WHERE id=?`, c.id);
+    return res.status(400).json({ error: 'budget épuisé' });
+  }
+  await runSql('INSERT INTO ad_events(campaign_id,type,created_at) VALUES(?,?,?)', c.id, type, now());
+  await runSql('UPDATE ad_campaigns SET spent_coins=spent_coins+? WHERE id=?', cost, c.id);
+  res.json({ ok: true });
+});
+app.get('/api/ads/feed', async (req, res) => {
+  const rows = await allRows(
+    `SELECT * FROM ad_campaigns WHERE status='active' AND spent_coins < budget_coins ORDER BY created_at DESC LIMIT 20`);
+  if (!rows.length) return res.json({ ads: [] });
+  const c = rows[Math.floor(Math.random() * rows.length)];
+  let product = null;
+  if (c.product_id) {
+    const p = await get1('SELECT * FROM products WHERE id=? AND active=1', c.product_id);
+    if (p) product = productJSON(p);
+  }
+  res.json({ ads: [{ id: c.id, title: c.title, target: c.target || '', product }] });
+});
+
+// ==================== V3 : MODÉRATION AUTO (file de revue admin) ====================
+app.get('/api/admin/review-queue', adminAuth, async (req, res) => {
+  const rows = await allRows(`SELECT * FROM review_queue WHERE status='pending' ORDER BY created_at ASC LIMIT 100`);
+  const out = [];
+  for (const r of rows) {
+    let item = null;
+    if (r.item_type === 'video') {
+      const v = await get1('SELECT * FROM videos WHERE id=?', r.item_id);
+      if (v) item = { id: v.id, desc: v.description, user_id: v.user_id, url: fileUrl(v.file) };
+    } else if (r.item_type === 'comment') {
+      const c = await get1('SELECT c.*, u.username FROM comments c LEFT JOIN users u ON u.id=c.user_id WHERE c.id=?', r.item_id);
+      if (c) item = c;
+    }
+    out.push({ id: r.id, item_type: r.item_type, item_id: r.item_id, reason: r.reason,
+      created_at: Number(r.created_at), item });
+  }
+  res.json({ queue: out });
+});
+app.post('/api/admin/review/:type/:id', adminAuth, async (req, res) => {
+  const type = req.params.type;
+  const decision = String((req.body || {}).decision || '');
+  if (!['video', 'comment'].includes(type)) return res.status(400).json({ error: 'type invalide' });
+  if (!['approve', 'reject'].includes(decision)) return res.status(400).json({ error: 'décision invalide' });
+  const q = await get1(`SELECT * FROM review_queue WHERE item_type=? AND item_id=? AND status='pending' ORDER BY created_at DESC`,
+    type, req.params.id);
+  if (!q) return res.status(404).json({ error: 'élément introuvable dans la file' });
+  if (type === 'video') {
+    if (decision === 'approve') await runSql(`UPDATE videos SET hidden=0, review_status='ok' WHERE id=?`, req.params.id);
+    else await runSql(`UPDATE videos SET review_status='rejected' WHERE id=?`, req.params.id);
+  } else {
+    await runSql(`UPDATE comments SET review_status=? WHERE id=?`, decision === 'approve' ? 'ok' : 'rejected', req.params.id);
+  }
+  await runSql(`UPDATE review_queue SET status=? WHERE id=?`, decision === 'approve' ? 'approved' : 'rejected', q.id);
+  res.json({ ok: true, decision });
+});
 
 // ---------- publication programmée : publie les vidéos dont l'heure est passée ----------
 async function publishDue() {
