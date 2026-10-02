@@ -586,6 +586,8 @@ CREATE TABLE IF NOT EXISTS family_settings(
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS ref_code TEXT`);
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by INTEGER`);
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS storage_bytes BIGINT DEFAULT 0`); // v1.54 : quota stockage
+    await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS audio_url TEXT DEFAULT ''`); // v1.57 : messages vocaux
+    await pool.query(`ALTER TABLE group_messages ADD COLUMN IF NOT EXISTS audio_url TEXT DEFAULT ''`);
     await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS users_email_uidx ON users(email)`);
     await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS users_google_uidx ON users(google_id)`);
     await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS users_phone_uidx ON users(phone)`);
@@ -598,6 +600,11 @@ CREATE TABLE IF NOT EXISTS family_settings(
     if (!cols.includes('sub_enabled')) lite.exec(`ALTER TABLE users ADD COLUMN sub_enabled INTEGER DEFAULT 0`);
     if (!cols.includes('sub_price')) lite.exec(`ALTER TABLE users ADD COLUMN sub_price INTEGER DEFAULT 0`);
     if (!cols.includes('storage_bytes')) lite.exec(`ALTER TABLE users ADD COLUMN storage_bytes INTEGER DEFAULT 0`); // v1.54 : quota stockage
+    // v1.57 : messages vocaux
+    for (const t of ['messages', 'group_messages']) {
+      const mc = lite.prepare(`PRAGMA table_info(${t})`).all().map(c => c.name);
+      if (!mc.includes('audio_url')) lite.exec(`ALTER TABLE ${t} ADD COLUMN audio_url TEXT DEFAULT ''`);
+    }
     for (const c of ['first_name', 'last_name', 'birthdate']) {
       if (!cols.includes(c)) lite.exec(`ALTER TABLE users ADD COLUMN ${c} TEXT DEFAULT ''`);
     }
@@ -1194,6 +1201,36 @@ async function storeImage(file, folder) {
   fs.renameSync(file.path, path.join(UP, fname));
   return fname;
 }
+// v1.57 : messages vocaux — upload audio (max 2 Mo, ~2 min)
+const uploadVoice = multer({
+  storage: USE_CLOUDINARY ? multer.memoryStorage() : multer.diskStorage({ destination: UP }),
+  limits: { fileSize: 2 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    if (/^audio\//.test(file.mimetype)) cb(null, true);
+    else cb(new Error('seul l\u2019audio est accepté'));
+  },
+});
+async function storeVoice(file) {
+  const ext = '.webm';
+  if (USE_CLOUDINARY) {
+    const tmp = path.join(os.tmpdir(), 'vgvoice' + Date.now() + '_' + crypto.randomBytes(6).toString('hex') + ext);
+    fs.writeFileSync(tmp, file.buffer);
+    try {
+      const up = await cloudinary.uploader.upload(tmp, { resource_type: 'video', folder: 'vidigagne/voice' });
+      return up.secure_url;
+    } finally { fs.unlink(tmp, () => {}); }
+  }
+  const fname = 'voice' + Date.now() + '_' + crypto.randomBytes(6).toString('hex') + ext;
+  fs.renameSync(file.path, path.join(UP, fname));
+  return fname;
+}
+app.post('/api/upload/voice', auth, uploadVoice.single('audio'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'aucun fichier audio' });
+    const url = await storeVoice(req.file);
+    res.json({ url: fileUrl(url) });
+  } catch (e) { res.status(400).json({ error: e.message || 'upload impossible' }); }
+});
 // v12 : photos multiples (carrousels) — max 10 images
 const uploadPhotos = multer({
   storage: USE_CLOUDINARY ? multer.memoryStorage() : multer.diskStorage({ destination: UP }),
@@ -2160,6 +2197,36 @@ app.get('/api/videos/mine', auth, async (req, res) => {
     res.json({ videos });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
+// v1.57 : statistiques détaillées d'une vidéo (propriétaire uniquement) — style TikTok Studio
+app.get('/api/videos/:id/stats', auth, async (req, res) => {
+  try {
+    const vid = Number(req.params.id);
+    const v = await get1('SELECT * FROM videos WHERE id=?', vid);
+    if (!v) return res.status(404).json({ error: 'vidéo introuvable' });
+    if (Number(v.user_id) !== Number(req.userId))
+      return res.status(403).json({ error: 'réservé au créateur' });
+    const views = (await get1('SELECT COUNT(*) AS c FROM video_views WHERE video_id=?', vid)).c || 0;
+    const likes = (await get1('SELECT COUNT(*) AS c FROM likes WHERE video_id=?', vid)).c || 0;
+    const comments = (await get1('SELECT COUNT(*) AS c FROM comments WHERE video_id=?', vid)).c || 0;
+    const shares = Number(v.shares) || 0;
+    const w = await get1('SELECT COUNT(*) AS n, AVG(watch_ms) AS avg_ms, SUM(completed) AS comp FROM watch_events WHERE video_id=?', vid);
+    const watchN = Number(w.n) || 0;
+    const avgWatchS = watchN ? Math.round((Number(w.avg_ms) || 0) / 1000) : 0;
+    const completionPct = watchN ? Math.round(100 * (Number(w.comp) || 0) / watchN) : 0;
+    // vues par jour (7 derniers jours)
+    const dayMs = 86400000, t0 = now() - 7 * dayMs, perDay = [];
+    for (let d = 0; d < 7; d++) {
+      const a = t0 + d * dayMs, b = a + dayMs;
+      const c = (await get1('SELECT COUNT(*) AS c FROM video_views WHERE video_id=? AND created_at>=? AND created_at<?', vid, a, b)).c || 0;
+      perDay.push({ day: new Date(a).toISOString().slice(0, 10), views: c });
+    }
+    // nouveaux abonnés gagnés via cette vidéo (follows après sa publication)
+    const newFollows = (await get1(
+      'SELECT COUNT(*) AS c FROM follows WHERE followed_id=? AND created_at>=?', v.user_id, Number(v.created_at))).c || 0;
+    res.json({ stats: { views, likes, comments, shares, watch_events: watchN,
+      avg_watch_s: avgWatchS, completion_pct: completionPct, per_day: perDay, new_follows: newFollows } });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
 app.get('/api/videos/:id', async (req, res) => {
   const v = await get1('SELECT * FROM videos WHERE id=?', req.params.id);
   if (!v) return res.status(404).json({ error: 'vidéo introuvable' });
@@ -2449,7 +2516,7 @@ app.get('/api/conversations/:id/messages', auth, async (req, res) => {
       : await allRows('SELECT * FROM messages WHERE conversation_id=? ORDER BY id DESC LIMIT 50', c.id);
     rows.reverse(); // ordre chronologique
     res.json({ messages: rows.map(function (m) {
-      return { id: m.id, sender_id: m.sender_id, text: m.text, created_at: Number(m.created_at) };
+      return { id: m.id, sender_id: m.sender_id, text: m.text, audio_url: m.audio_url || '', created_at: Number(m.created_at) };
     }) });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
@@ -2472,11 +2539,12 @@ app.post('/api/conversations/:id/messages', auth, async (req, res) => {
       }
     }
     const text = String((req.body || {}).text || '').trim().slice(0, 2000);
-    if (!text) return res.status(400).json({ error: 'message vide' });
+    const audioUrl = String((req.body || {}).audio_url || '').slice(0, 500); // v1.57 : message vocal
+    if (!text && !audioUrl) return res.status(400).json({ error: 'message vide' });
     const t = now();
     const id = await insertId(
-      'INSERT INTO messages(conversation_id,sender_id,text,created_at) VALUES(?,?,?,?)',
-      c.id, req.userId, text, t);
+      'INSERT INTO messages(conversation_id,sender_id,text,audio_url,created_at) VALUES(?,?,?,?,?)',
+      c.id, req.userId, text, audioUrl, t);
     await runSql('UPDATE conversations SET updated_at=? WHERE id=?', t, c.id);
     // l'expéditeur a lu son propre message
     await insertIgnore('INSERT OR IGNORE INTO conversation_reads(conversation_id,user_id,last_read_at) VALUES(?,?,?)',
@@ -4290,7 +4358,7 @@ app.get('/api/groups/:id/messages', auth, async (req, res) => {
       ? await allRows('SELECT * FROM group_messages WHERE group_id=? AND id<? ORDER BY id DESC LIMIT 50', req.params.id, before)
       : await allRows('SELECT * FROM group_messages WHERE group_id=? ORDER BY id DESC LIMIT 50', req.params.id);
     rows.reverse();
-    res.json({ messages: rows.map(m => ({ id: m.id, sender_id: m.sender_id, text: m.text, created_at: Number(m.created_at) })) });
+    res.json({ messages: rows.map(m => ({ id: m.id, sender_id: m.sender_id, text: m.text, audio_url: m.audio_url || '', created_at: Number(m.created_at) })) });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 app.post('/api/groups/:id/messages', auth, async (req, res) => {
@@ -4299,13 +4367,14 @@ app.post('/api/groups/:id/messages', auth, async (req, res) => {
     if (!await isGroupMember(gid, req.userId))
       return res.status(403).json({ error: 'non membre du groupe' });
     const text = String((req.body || {}).text || '').trim().slice(0, 2000);
-    if (!text) return res.status(400).json({ error: 'message vide' });
-    const id = await insertId('INSERT INTO group_messages(group_id,sender_id,text,created_at) VALUES(?,?,?,?)',
-      gid, req.userId, text, now());
+    const audioUrl = String((req.body || {}).audio_url || '').slice(0, 500); // v1.57 : message vocal
+    if (!text && !audioUrl) return res.status(400).json({ error: 'message vide' });
+    const id = await insertId('INSERT INTO group_messages(group_id,sender_id,text,audio_url,created_at) VALUES(?,?,?,?,?)',
+      gid, req.userId, text, audioUrl, now());
     const g = await get1('SELECT name FROM chat_groups WHERE id=?', gid);
     const others = await allRows('SELECT user_id FROM group_members WHERE group_id=? AND user_id!=?', gid, req.userId);
-    for (const o of others) await notify(o.user_id, 'group_message', req.userId, null, (g ? g.name + ' : ' : '') + text.slice(0, 100));
-    res.json({ message: { id, sender_id: req.userId, text, created_at: now() } });
+    for (const o of others) await notify(o.user_id, 'group_message', req.userId, null, (g ? g.name + ' : ' : '') + (text || '🎤 message vocal').slice(0, 100));
+    res.json({ message: { id, sender_id: req.userId, text, audio_url: audioUrl, created_at: now() } });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 app.post('/api/groups/:id/members', auth, async (req, res) => {
