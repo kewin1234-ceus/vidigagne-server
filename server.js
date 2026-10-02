@@ -53,7 +53,7 @@ CREATE TABLE IF NOT EXISTS videos(
   id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
   user_id INTEGER NOT NULL,
   file TEXT NOT NULL,
-  desc TEXT NOT NULL DEFAULT '',
+  description TEXT NOT NULL DEFAULT '',
   tags TEXT NOT NULL DEFAULT '',
   views INTEGER NOT NULL DEFAULT 0,
   created_at BIGINT NOT NULL
@@ -206,7 +206,7 @@ async function videoJSON(v, meId) {
   const cmts = (await get1('SELECT COUNT(*) AS c FROM comments WHERE video_id=?', v.id)).c;
   const liked = meId ? !!(await get1('SELECT 1 FROM likes WHERE user_id=? AND video_id=?', meId, v.id)) : false;
   return {
-    id: v.id, desc: v.desc, tags: v.tags,
+    id: v.id, desc: v.description, tags: v.tags,
     url: fileUrl(v.file),
     views: Number(v.views), likes: Number(likes), comments: Number(cmts), liked,
     created_at: Number(v.created_at),
@@ -284,10 +284,11 @@ app.post('/api/videos', auth, upload.single('video'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'aucune vidéo reçue' });
     const fname = await storeVideo(req.file);
-    const { desc, tags } = req.body || {};
+    const b = req.body || {};
+    const descText = String(b.description || b.desc || '').slice(0, 500);
     const id = await insertId(
-      'INSERT INTO videos(user_id,file,desc,tags,created_at) VALUES(?,?,?,?,?)',
-      req.userId, fname, String(desc || '').slice(0, 500), String(tags || '').slice(0, 300), now());
+      'INSERT INTO videos(user_id,file,description,tags,created_at) VALUES(?,?,?,?,?)',
+      req.userId, fname, descText, String(b.tags || '').slice(0, 300), now());
     // pièces : +10 par publication
     await runSql('UPDATE users SET coins=coins+10 WHERE id=?', req.userId);
     await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
@@ -426,7 +427,7 @@ app.get('/api/search', async (req, res) => {
     const users = await allRows(
       'SELECT id,username,name,avatar FROM users WHERE username LIKE ? OR name LIKE ? LIMIT 20', q, q);
     const vids = await allRows(
-      'SELECT * FROM videos WHERE LOWER(desc) LIKE ? OR LOWER(tags) LIKE ? ORDER BY created_at DESC LIMIT 20', q, q);
+      'SELECT * FROM videos WHERE LOWER(description) LIKE ? OR LOWER(tags) LIKE ? ORDER BY created_at DESC LIMIT 20', q, q);
     const videos = [];
     for (const v of vids) videos.push(await videoJSON(v, null));
     res.json({ users, videos });
