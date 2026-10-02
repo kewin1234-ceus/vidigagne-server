@@ -37,6 +37,9 @@ CREATE TABLE IF NOT EXISTS users(
   id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
   username TEXT UNIQUE NOT NULL,
   name TEXT NOT NULL DEFAULT '',
+  first_name TEXT NOT NULL DEFAULT '',
+  last_name TEXT NOT NULL DEFAULT '',
+  birthdate TEXT NOT NULL DEFAULT '',
   pass_hash TEXT NOT NULL,
   pass_salt TEXT NOT NULL,
   avatar TEXT NOT NULL DEFAULT '🙂',
@@ -169,6 +172,19 @@ CREATE TABLE IF NOT EXISTS video_views(
   ip TEXT NOT NULL DEFAULT '',
   ad_shown INTEGER NOT NULL DEFAULT 0,
   created_at BIGINT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS ad_reward_claims(
+  id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+  user_id INTEGER NOT NULL,
+  ip TEXT NOT NULL DEFAULT '',
+  created_at BIGINT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS ad_daily(
+  day TEXT PRIMARY KEY,
+  points_distributed INTEGER NOT NULL DEFAULT 0,
+  ad_revenue_usd REAL NOT NULL DEFAULT 0,
+  point_value_usd REAL,
+  computed_at BIGINT
 );
 CREATE TABLE IF NOT EXISTS payment_methods(
   id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
@@ -551,6 +567,9 @@ CREATE TABLE IF NOT EXISTS family_settings(
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS phone TEXT`);
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS sub_enabled INTEGER DEFAULT 0`);
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS sub_price INTEGER DEFAULT 0`);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS first_name TEXT DEFAULT ''`);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_name TEXT DEFAULT ''`);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS birthdate TEXT DEFAULT ''`);
     await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS users_email_uidx ON users(email)`);
     await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS users_google_uidx ON users(google_id)`);
     await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS users_phone_uidx ON users(phone)`);
@@ -562,6 +581,9 @@ CREATE TABLE IF NOT EXISTS family_settings(
     }
     if (!cols.includes('sub_enabled')) lite.exec(`ALTER TABLE users ADD COLUMN sub_enabled INTEGER DEFAULT 0`);
     if (!cols.includes('sub_price')) lite.exec(`ALTER TABLE users ADD COLUMN sub_price INTEGER DEFAULT 0`);
+    for (const c of ['first_name', 'last_name', 'birthdate']) {
+      if (!cols.includes(c)) lite.exec(`ALTER TABLE users ADD COLUMN ${c} TEXT DEFAULT ''`);
+    }
     lite.exec(`CREATE UNIQUE INDEX IF NOT EXISTS users_email_uidx ON users(email)`);
     lite.exec(`CREATE UNIQUE INDEX IF NOT EXISTS users_google_uidx ON users(google_id)`);
     lite.exec(`CREATE UNIQUE INDEX IF NOT EXISTS users_phone_uidx ON users(phone)`);
@@ -849,6 +871,7 @@ async function touchHistory(userId, videoId) {
 }
 function pubUser(u) {
   return { id: u.id, username: u.username, name: u.name, avatar: u.avatar, bio: u.bio, verified: !!u.verified,
+    first_name: u.first_name || '', last_name: u.last_name || '', birthdate: u.birthdate || '',
     sub_enabled: Number(u.sub_enabled) || 0, sub_price: Number(u.sub_price) || 0 };
 }
 async function videoJSON(v, meId) {
@@ -901,7 +924,7 @@ function parseKeywords(s) {
 // ---------- auth ----------
 app.post('/api/auth/register', async (req, res) => {
   try {
-    let { username, name, password, email } = req.body || {};
+    let { username, name, password, email, first_name, last_name, birthdate } = req.body || {};
     username = (username || '').toLowerCase().trim();
     if (!validUsername(username))
       return res.status(400).json({ error: "pseudo invalide (lettres, chiffres, . _ — 2 à 24)" });
@@ -910,6 +933,9 @@ app.post('/api/auth/register', async (req, res) => {
     email = (email || '').trim().toLowerCase() || null;
     if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))
       return res.status(400).json({ error: 'e-mail invalide' });
+    first_name = String(first_name || '').trim().slice(0, 40);
+    last_name = String(last_name || '').trim().slice(0, 40);
+    birthdate = /^\d{4}-\d{2}-\d{2}$/.test(birthdate || '') ? birthdate : '';
     const exists = await get1('SELECT 1 FROM users WHERE username=?', username);
     if (exists) return res.status(409).json({ error: 'ce pseudo est déjà pris' }); // unicité serveur
     if (email) {
@@ -918,8 +944,8 @@ app.post('/api/auth/register', async (req, res) => {
     }
     const salt = crypto.randomBytes(16).toString('hex');
     const id = await insertId(
-      'INSERT INTO users(username,name,email,pass_hash,pass_salt,created_at) VALUES(?,?,?,?,?,?)',
-      username, (name || username).slice(0, 40), email, hashPass(password, salt), salt, now());
+      'INSERT INTO users(username,name,first_name,last_name,birthdate,email,pass_hash,pass_salt,created_at) VALUES(?,?,?,?,?,?,?,?,?)',
+      username, (name || username).slice(0, 40), first_name, last_name, birthdate, email, hashPass(password, salt), salt, now());
     const token = crypto.randomBytes(32).toString('hex');
     await runSql('INSERT INTO tokens(token,user_id,created_at) VALUES(?,?,?)', token, id, now());
     const u = await get1('SELECT * FROM users WHERE id=?', id);
@@ -945,11 +971,14 @@ app.get('/api/auth/me', auth, async (req, res) => {
 });
 
 app.patch('/api/auth/me', auth, async (req, res) => {
-  const { name, avatar, bio, sub_enabled, sub_price } = req.body || {};
-  await runSql('UPDATE users SET name=COALESCE(?,name), avatar=COALESCE(?,avatar), bio=COALESCE(?,bio) WHERE id=?',
+  const { name, avatar, bio, first_name, last_name, birthdate, sub_enabled, sub_price } = req.body || {};
+  await runSql('UPDATE users SET name=COALESCE(?,name), avatar=COALESCE(?,avatar), bio=COALESCE(?,bio), first_name=COALESCE(?,first_name), last_name=COALESCE(?,last_name), birthdate=COALESCE(?,birthdate) WHERE id=?',
     name ? String(name).slice(0, 40) : null,
     avatar ? String(avatar).slice(0, 8) : null,
-    bio ? String(bio).slice(0, 150) : null, req.userId);
+    bio ? String(bio).slice(0, 150) : null,
+    first_name !== undefined ? String(first_name).trim().slice(0, 40) : null,
+    last_name !== undefined ? String(last_name).trim().slice(0, 40) : null,
+    /^\d{4}-\d{2}-\d{2}$/.test(birthdate || '') ? birthdate : null, req.userId);
   // abonnement payant au créateur : activation + prix mensuel (pièces)
   if (sub_enabled !== undefined || sub_price !== undefined) {
     const se = sub_enabled ? 1 : 0;
@@ -4133,6 +4162,83 @@ async function publishDue() {
     await runSql('UPDATE videos SET scheduled_at=NULL WHERE scheduled_at IS NOT NULL AND scheduled_at <= ?', now());
   } catch (e) {}
 }
+
+// ---------- AdMob : app-ads.txt, récompenses anti-fraude, calcul 50-50 quotidien ----------
+app.get('/app-ads.txt', (req, res) => {
+  res.type('text/plain').send('google.com, pub-5708506559717909, DIRECT, f08c47fec0942fa0\n');
+});
+function clientIp(req){
+  const f = req.headers['x-forwarded-for'] || '';
+  return (f.split(',')[0] || req.ip || '').trim();
+}
+async function bumpDailyPoints(n){
+  try{
+    const day = new Date().toISOString().slice(0,10);
+    const r = await get1('SELECT points_distributed FROM ad_daily WHERE day=?', day);
+    if(r) await runSql('UPDATE ad_daily SET points_distributed=points_distributed+? WHERE day=?', n, day);
+    else await runSql('INSERT INTO ad_daily(day,points_distributed,ad_revenue_usd) VALUES(?,?,0)', day, n);
+  }catch(e){}
+}
+// POST /api/ads/reward — récompense vidéo validée serveur (anti-fraude : 1/IP/5min, 1/user/2min)
+app.post('/api/ads/reward', auth, async (req, res) => {
+  try{
+    const ip = clientIp(req);
+    const t = now();
+    const ipHit = await get1('SELECT id FROM ad_reward_claims WHERE ip=? AND created_at>?', ip, t-5*60*1000);
+    if(ipHit) return res.status(429).json({ error: 'trop de demandes (anti-fraude)' });
+    const uHit = await get1('SELECT id FROM ad_reward_claims WHERE user_id=? AND created_at>?', req.userId, t-2*60*1000);
+    if(uHit) return res.status(429).json({ error: 'patiente 2 minutes' });
+    await runSql('INSERT INTO ad_reward_claims(user_id,ip,created_at) VALUES(?,?,?)', req.userId, ip, t);
+    await runSql('UPDATE users SET coins=coins+30 WHERE id=?', req.userId);
+    await bumpDailyPoints(30);
+    res.json({ ok:true, granted:30 });
+  }catch(e){ res.status(500).json({ error:'erreur serveur' }); }
+});
+// Calcul 50-50 du jour : 50% propriétaire, 50%/points = valeur du point
+async function computeDaily5050(dayStr){
+  try{
+    const r = await get1('SELECT points_distributed, ad_revenue_usd FROM ad_daily WHERE day=?', dayStr);
+    const pts = r ? Number(r.points_distributed||0) : 0;
+    const rev = r ? Number(r.ad_revenue_usd||0) : 0;
+    const ownerShare = +(rev*0.5).toFixed(4);
+    const pointValue = pts>0 ? +((rev*0.5)/pts).toFixed(6) : 0;
+    if(r) await runSql('UPDATE ad_daily SET point_value_usd=?, computed_at=? WHERE day=?', pointValue, now(), dayStr);
+    else await runSql('INSERT INTO ad_daily(day,points_distributed,ad_revenue_usd,point_value_usd,computed_at) VALUES(?,0,?,?,?)', dayStr, rev, pointValue, now());
+    return { day:dayStr, revenue_usd:rev, owner_share_usd:ownerShare, points:pts, point_value_usd:pointValue };
+  }catch(e){ return { error:e.message }; }
+}
+// Tableau de bord admin 50-50
+app.get('/api/admin/ads/daily', adminAuth, async (req, res) => {
+  try{
+    const rows = await allRows('SELECT * FROM ad_daily ORDER BY day DESC LIMIT 31');
+    res.json({ ok:true, days:rows });
+  }catch(e){ res.status(500).json({ error:'erreur serveur' }); }
+});
+// Saisie manuelle du revenu AdMob du jour (en attendant l'API AdMob OAuth)
+app.post('/api/admin/ads/revenue', adminAuth, async (req, res) => {
+  try{
+    const day = String(req.body.day || new Date().toISOString().slice(0,10)).slice(0,10);
+    const rev = Math.max(0, Number(req.body.revenue_usd||0));
+    const r = await get1('SELECT day FROM ad_daily WHERE day=?', day);
+    if(r) await runSql('UPDATE ad_daily SET ad_revenue_usd=? WHERE day=?', rev, day);
+    else await runSql('INSERT INTO ad_daily(day,points_distributed,ad_revenue_usd) VALUES(?,0,?)', day, rev);
+    res.json({ ok:true, ...(await computeDaily5050(day)) });
+  }catch(e){ res.status(500).json({ error:'erreur serveur' }); }
+});
+// Déclenchement quotidien à 23h59 (heure serveur, UTC sur Render)
+setInterval(async () => {
+  try{
+    const d = new Date();
+    if(d.getUTCHours()===23 && d.getUTCMinutes()===59){
+      const dayStr = d.toISOString().slice(0,10);
+      if(computeDaily5050._done !== dayStr){
+        computeDaily5050._done = dayStr;
+        const r = await computeDaily5050(dayStr);
+        console.log('50-50 calculé pour', dayStr, JSON.stringify(r));
+      }
+    }
+  }catch(e){}
+}, 30000);
 
 initDb().then(() => {
   publishDue();
