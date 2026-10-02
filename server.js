@@ -169,6 +169,29 @@ CREATE TABLE IF NOT EXISTS video_views(
   ip TEXT NOT NULL DEFAULT '',
   ad_shown INTEGER NOT NULL DEFAULT 0,
   created_at BIGINT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS payment_methods(
+  id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+  user_id INTEGER NOT NULL,
+  type TEXT NOT NULL,
+  label TEXT NOT NULL DEFAULT '',
+  account TEXT NOT NULL,
+  verified INTEGER NOT NULL DEFAULT 0,
+  paypal_payer_id TEXT,
+  created_at BIGINT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS receipts(
+  id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+  withdrawal_id INTEGER NOT NULL,
+  user_id INTEGER NOT NULL,
+  receipt_no TEXT NOT NULL,
+  coins INTEGER NOT NULL,
+  usd REAL NOT NULL,
+  method TEXT NOT NULL,
+  account TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  email_status TEXT NOT NULL DEFAULT 'pending',
+  created_at BIGINT NOT NULL
 );`;
   if (USE_PG) { await pool.query(schema); }
   else { lite.exec(schema); }
@@ -557,25 +580,7 @@ app.post('/api/comments/:id/pin', auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 // ---------- retraits ----------
-app.post('/api/withdraw', auth, async (req, res) => {
-  try {
-    const { coins, method, account } = req.body || {};
-    const n = Math.floor(+coins);
-    if (!n || n < 1000) return res.status(400).json({ error: 'minimum 1000 pièces (2 $)' });
-    if (!['moncash', 'natcash'].includes(method)) return res.status(400).json({ error: 'méthode invalide' });
-    if (!String(account || '').trim()) return res.status(400).json({ error: 'numéro requis' });
-    const me = await get1('SELECT * FROM users WHERE id=?', req.userId);
-    if (!me || me.coins < n) return res.status(400).json({ error: 'pas assez de pièces' });
-    const usd = Math.floor(n / 500 * 100) / 100;
-    await runSql('UPDATE users SET coins=coins-? WHERE id=?', n, req.userId);
-    await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
-      req.userId, -n, 'retrait ' + method, now());
-    const id = await insertId(
-      'INSERT INTO withdrawals(user_id,coins,usd,method,account,status,created_at) VALUES(?,?,?,?,?,?,?)',
-      req.userId, n, usd, method, String(account).trim(), 'pending', now());
-    res.json({ ok: true, id, usd, status: 'pending' });
-  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
-});
+// (remplacé par la version v2 avec moyens de paiement + reçus ci-dessous)
 app.get('/api/withdraw', auth, async (req, res) => {
   const rows = await allRows('SELECT * FROM withdrawals WHERE user_id=? ORDER BY created_at DESC', req.userId);
   res.json({ withdrawals: rows });
@@ -728,6 +733,174 @@ box.innerHTML=d.pending.map(p=>'<div class="card" id="k'+p.id+'"><div><b>@'+p.us
 async function rev(id,ok){await fetch('/api/kyc/'+id+'/review',{method:'POST',headers:{'Content-Type':'application/json','x-admin-token':T},body:JSON.stringify({approve:ok})});
 document.getElementById('k'+id).remove();const box=document.getElementById('list');if(!box.children.length)box.innerHTML='<p>Aucune demande en attente ✅</p>'}
 load();</script></body></html>`);
+});
+// ---------- MOYENS DE PAIEMENT ----------
+// PayPal : monde entier (avec autorisation OAuth PayPal quand configuré).
+// MonCash / NatCash : Haïti (numéro confirmé par l'utilisateur).
+const PAY_METHODS = ['paypal', 'moncash', 'natcash'];
+app.get('/api/payment-methods', auth, async (req, res) => {
+  const rows = await allRows('SELECT id,type,label,account,verified,created_at FROM payment_methods WHERE user_id=? ORDER BY created_at DESC', req.userId);
+  res.json({ methods: rows });
+});
+app.post('/api/payment-methods', auth, async (req, res) => {
+  try {
+    const type = String((req.body || {}).type || '');
+    const account = String((req.body || {}).account || '').trim();
+    if (!PAY_METHODS.includes(type)) return res.status(400).json({ error: 'moyen invalide' });
+    if (type === 'paypal') {
+      if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(account)) return res.status(400).json({ error: 'e-mail PayPal invalide' });
+    } else {
+      if (!/^\+?[0-9]{8,15}$/.test(account.replace(/[\s-]/g, ''))) return res.status(400).json({ error: 'numéro invalide' });
+    }
+    const label = type === 'paypal' ? 'PayPal — Monde' : (type === 'moncash' ? 'MonCash — Haïti' : 'NatCash — Haïti');
+    const id = await insertId('INSERT INTO payment_methods(user_id,type,label,account,verified,created_at) VALUES(?,?,?,?,?,?)',
+      req.userId, type, label, account, 0, now()).catch(() => null);
+    // l'utilisateur autorise explicitement ce moyen pour ses retraits
+    res.json({ ok: true, id });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.delete('/api/payment-methods/:id', auth, async (req, res) => {
+  await runSql('DELETE FROM payment_methods WHERE id=? AND user_id=?', req.params.id, req.userId);
+  res.json({ ok: true });
+});
+// ---------- PayPal : autorisation OAuth (Log in with PayPal) ----------
+function paypalCfg() {
+  if (!process.env.PAYPAL_CLIENT_ID || !process.env.PAYPAL_CLIENT_SECRET) return null;
+  const live = (process.env.PAYPAL_MODE || 'live') === 'live';
+  return {
+    id: process.env.PAYPAL_CLIENT_ID, secret: process.env.PAYPAL_CLIENT_SECRET,
+    api: live ? 'https://api-m.paypal.com' : 'https://api-m.sandbox.paypal.com',
+    www: live ? 'https://www.paypal.com' : 'https://www.sandbox.paypal.com',
+    redirect: (process.env.PAYPAL_REDIRECT || 'https://vidigagne-server.onrender.com/api/paypal/connect/callback'),
+  };
+}
+app.get('/api/paypal/connect/start', async (req, res) => {
+  const cfg = paypalCfg();
+  if (!cfg) return res.status(400).json({ error: 'PayPal non configuré' });
+  const token = String(req.query.token || '');
+  const row = token ? await get1('SELECT user_id FROM tokens WHERE token=?', token) : null;
+  if (!row) return res.status(401).json({ error: 'connecte-toi d’abord dans l’application' });
+  const state = Buffer.from(JSON.stringify({ uid: row.user_id, t: now() })).toString('base64url');
+  const url = cfg.www + '/signin/authorize?client_id=' + encodeURIComponent(cfg.id) +
+    '&response_type=code&scope=' + encodeURIComponent('openid email') +
+    '&redirect_uri=' + encodeURIComponent(cfg.redirect) + '&state=' + encodeURIComponent(state);
+  res.redirect(url);
+});
+app.get('/api/paypal/connect/callback', async (req, res) => {
+  try {
+    const cfg = paypalCfg();
+    if (!cfg) return res.status(400).type('html').send('<h1>PayPal non configuré</h1>');
+    let uid = null;
+    try { uid = JSON.parse(Buffer.from(String(req.query.state || ''), 'base64url').toString()).uid; } catch (e) {}
+    if (!uid || !req.query.code) return res.status(400).type('html').send('<h1>Autorisation refusée</h1>');
+    const basic = Buffer.from(cfg.id + ':' + cfg.secret).toString('base64');
+    const tr = await fetch(cfg.api + '/v1/oauth2/token', {
+      method: 'POST', headers: { 'Authorization': 'Basic ' + basic, 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: 'grant_type=authorization_code&code=' + encodeURIComponent(req.query.code) + '&redirect_uri=' + encodeURIComponent(cfg.redirect),
+    });
+    const tj = await tr.json();
+    if (!tj.access_token) return res.status(400).type('html').send('<h1>Échec de l’autorisation PayPal</h1>');
+    const ur = await fetch(cfg.api + '/v1/identity/oauth2/userinfo?schema=paypalv1.1', {
+      headers: { 'Authorization': 'Bearer ' + tj.access_token },
+    });
+    const u = await ur.json();
+    const email = u.email || '';
+    const payerId = u.payer_id || null;
+    if (!email) return res.status(400).type('html').send('<h1>E-mail PayPal introuvable</h1>');
+    const ex = await get1('SELECT id FROM payment_methods WHERE user_id=? AND type=? AND account=?', uid, 'paypal', email);
+    if (ex) await runSql('UPDATE payment_methods SET verified=1, paypal_payer_id=? WHERE id=?', payerId, ex.id);
+    else await runSql('INSERT INTO payment_methods(user_id,type,label,account,verified,paypal_payer_id,created_at) VALUES(?,?,?,?,?,?,?)',
+      uid, 'paypal', 'PayPal — Monde', email, 1, payerId, now());
+    res.type('html').send('<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head><body style="font-family:sans-serif;text-align:center;padding:40px"><h1>✅ PayPal connecté</h1><p>Ton compte PayPal <b>' + String(email).replace(/</g, '&lt;') + '</b> est autorisé pour tes retraits VidiGagne.</p><p>Tu peux fermer cette page et revenir dans l’application.</p></body></html>');
+  } catch (e) { res.status(500).type('html').send('<h1>Erreur PayPal</h1>'); }
+});
+// ---------- E-MAILS : envoi des reçus ----------
+let _mailer = null;
+function mailer() {
+  if (_mailer) return _mailer;
+  if (!process.env.SMTP_HOST || !process.env.SMTP_USER) return null;
+  try {
+    const nodemailer = require('nodemailer');
+    _mailer = nodemailer.createTransport({
+      host: process.env.SMTP_HOST, port: Number(process.env.SMTP_PORT || 587),
+      secure: Number(process.env.SMTP_PORT) === 465,
+      auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+    });
+    return _mailer;
+  } catch (e) { return null; }
+}
+function receiptHtml(r, user) {
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"></head><body style="font-family:sans-serif;max-width:520px;margin:0 auto;padding:20px">
+<div style="text-align:center;margin-bottom:20px"><div style="font-size:28px;font-weight:800">VidiGagne</div><div style="color:#666">Reçu de retrait</div></div>
+<div style="border:1px solid #ddd;border-radius:12px;padding:20px">
+<div style="font-size:13px;color:#888">N° DE REÇU</div><div style="font-weight:800;font-size:18px;margin-bottom:12px">${r.receipt_no}</div>
+<table style="width:100%;font-size:14px" cellpadding="6">
+<tr><td style="color:#666">Date</td><td style="text-align:right">${new Date(r.created_at).toLocaleString('fr')}</td></tr>
+<tr><td style="color:#666">Bénéficiaire</td><td style="text-align:right">@${user.username}</td></tr>
+<tr><td style="color:#666">Moyen</td><td style="text-align:right">${r.method}</td></tr>
+<tr><td style="color:#666">Compte</td><td style="text-align:right">${String(r.account).replace(/</g, '&lt;')}</td></tr>
+<tr><td style="color:#666">Montant</td><td style="text-align:right;font-weight:800">${r.coins} 🪙 (≈ $${r.usd})</td></tr>
+<tr><td style="color:#666">Statut</td><td style="text-align:right">${r.status === 'pending' ? '⏳ En attente de traitement' : r.status}</td></tr>
+</table></div>
+<p style="font-size:12px;color:#888;text-align:center">Une copie de ce reçu est conservée dans ton application VidiGagne (Gains → Reçus).</p>
+</body></html>`;
+}
+async function sendReceiptEmail(user, r) {
+  const m = mailer();
+  if (!m || !user.email) return 'skipped';
+  try {
+    await m.sendMail({
+      from: process.env.SMTP_FROM || process.env.SMTP_USER,
+      to: user.email,
+      subject: '🧾 Reçu de retrait VidiGagne — ' + r.receipt_no,
+      html: receiptHtml(r, user),
+    });
+    return 'sent';
+  } catch (e) { return 'failed'; }
+}
+// ---------- retraits v2 : moyen enregistré + reçu ----------
+app.post('/api/withdraw', auth, async (req, res) => {
+  try {
+    const { coins, method, account, method_id } = req.body || {};
+    const n = Math.floor(+coins);
+    if (!n || n < 1000) return res.status(400).json({ error: 'minimum 1000 pièces (2 $)' });
+    let pm = null;
+    if (method_id) {
+      pm = await get1('SELECT * FROM payment_methods WHERE id=? AND user_id=?', method_id, req.userId);
+      if (!pm) return res.status(400).json({ error: 'moyen de paiement introuvable' });
+    } else {
+      if (!['moncash', 'natcash', 'paypal'].includes(method)) return res.status(400).json({ error: 'méthode invalide' });
+      if (!String(account || '').trim()) return res.status(400).json({ error: 'compte requis' });
+      pm = { type: method, label: method, account: String(account).trim() };
+    }
+    const me = await get1('SELECT * FROM users WHERE id=?', req.userId);
+    if (!me || me.coins < n) return res.status(400).json({ error: 'pas assez de pièces' });
+    const usd = Math.floor(n / 500 * 100) / 100;
+    await runSql('UPDATE users SET coins=coins-? WHERE id=?', n, req.userId);
+    await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
+      req.userId, -n, 'retrait ' + pm.type, now());
+    const wid = await insertId(
+      'INSERT INTO withdrawals(user_id,coins,usd,method,account,status,created_at) VALUES(?,?,?,?,?,?,?)',
+      req.userId, n, usd, pm.type, pm.account, 'pending', now());
+    const rid = await insertId(
+      'INSERT INTO receipts(withdrawal_id,user_id,receipt_no,coins,usd,method,account,status,email_status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)',
+      wid, req.userId, 'TMP', n, usd, pm.label || pm.type, pm.account, 'pending', 'pending', now());
+    const receiptNo = 'VG-' + new Date().getFullYear() + '-' + String(rid).padStart(6, '0');
+    await runSql('UPDATE receipts SET receipt_no=? WHERE id=?', receiptNo, rid);
+    const r = await get1('SELECT * FROM receipts WHERE id=?', rid);
+    const emailStatus = await sendReceiptEmail(me, { ...r, receipt_no: receiptNo });
+    await runSql('UPDATE receipts SET email_status=? WHERE id=?', emailStatus, rid);
+    res.json({ ok: true, id: wid, usd, status: 'pending', receipt_no: receiptNo, email: emailStatus });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.get('/api/receipts', auth, async (req, res) => {
+  const rows = await allRows('SELECT * FROM receipts WHERE user_id=? ORDER BY created_at DESC LIMIT 100', req.userId);
+  res.json({ receipts: rows });
+});
+app.get('/api/receipts/:id', auth, async (req, res) => {
+  const r = await get1('SELECT * FROM receipts WHERE id=? AND user_id=?', req.params.id, req.userId);
+  if (!r) return res.status(404).json({ error: 'introuvable' });
+  res.json({ receipt: r });
 });
 // ---------- FONDS CRÉATEURS (différent de TikTok) ----------
 // Éligibilité : 1000 abonnés ET 50 000 vues ORGANIQUES issues des VIDÉOS
