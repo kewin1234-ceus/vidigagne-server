@@ -134,6 +134,41 @@ CREATE TABLE IF NOT EXISTS lives(
   started_at BIGINT NOT NULL,
   ended_at BIGINT,
   viewers INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS fund_deposits(
+  id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+  amount_usd REAL NOT NULL,
+  creators_share_usd REAL NOT NULL,
+  period TEXT NOT NULL DEFAULT '',
+  created_at BIGINT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS fund_earnings(
+  id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+  deposit_id INTEGER NOT NULL,
+  user_id INTEGER NOT NULL,
+  views BIGINT NOT NULL,
+  amount_usd REAL NOT NULL,
+  coins INTEGER NOT NULL,
+  created_at BIGINT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS id_verifications(
+  id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+  user_id INTEGER UNIQUE NOT NULL,
+  country TEXT NOT NULL,
+  doc_type TEXT NOT NULL,
+  doc_front TEXT NOT NULL,
+  doc_back TEXT,
+  status TEXT NOT NULL DEFAULT 'pending',
+  reviewed_at BIGINT,
+  created_at BIGINT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS video_views(
+  id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+  video_id INTEGER NOT NULL,
+  viewer_id INTEGER,
+  ip TEXT NOT NULL DEFAULT '',
+  ad_shown INTEGER NOT NULL DEFAULT 0,
+  created_at BIGINT NOT NULL
 );`;
   if (USE_PG) { await pool.query(schema); }
   else { lite.exec(schema); }
@@ -165,6 +200,7 @@ CREATE TABLE IF NOT EXISTS lives(
   };
   await mig('videos', 'sound', `TEXT NOT NULL DEFAULT ''`);
   await mig('videos', 'duration', `REAL NOT NULL DEFAULT 0`);
+  await mig('videos', 'ad_views', `INTEGER NOT NULL DEFAULT 0`);
   await mig('comments', 'likes', `INTEGER NOT NULL DEFAULT 0`);
   await mig('comments', 'pinned', `INTEGER NOT NULL DEFAULT 0`);
 }
@@ -342,6 +378,29 @@ const upload = multer({
     else cb(new Error('seules les vidéos sont acceptées'));
   },
 });
+// images : pièces d'identité (KYC)
+const uploadImg = multer({
+  storage: USE_CLOUDINARY ? multer.memoryStorage() : multer.diskStorage({ destination: UP }),
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10 Mo max
+  fileFilter: (req, file, cb) => {
+    if (/^image\//.test(file.mimetype)) cb(null, true);
+    else cb(new Error('seules les images sont acceptées'));
+  },
+});
+async function storeImage(file, folder) {
+  const ext = path.extname(file.originalname || '') || '.jpg';
+  if (USE_CLOUDINARY) {
+    const tmp = path.join(os.tmpdir(), 'vgimg' + Date.now() + '_' + crypto.randomBytes(6).toString('hex') + ext);
+    fs.writeFileSync(tmp, file.buffer);
+    try {
+      const up = await cloudinary.uploader.upload(tmp, { resource_type: 'image', folder: folder || 'vidigagne' });
+      return up.secure_url;
+    } finally { fs.unlink(tmp, () => {}); }
+  }
+  const fname = 'img' + Date.now() + '_' + crypto.randomBytes(6).toString('hex') + ext;
+  fs.renameSync(file.path, path.join(UP, fname));
+  return fname;
+}
 
 app.post('/api/videos', auth, upload.single('video'), async (req, res) => {
   try {
@@ -609,6 +668,136 @@ app.delete('/api/account', auth, async (req, res) => {
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
+// ---------- KYC : vérification d'identité (tout pays accepté) ----------
+const KYC_DOCS = ['passport', 'id_card', 'driver_license'];
+app.post('/api/kyc/submit', auth, uploadImg.fields([{ name: 'doc_front', maxCount: 1 }, { name: 'doc_back', maxCount: 1 }]), async (req, res) => {
+  try {
+    const country = String((req.body || {}).country || '').toUpperCase().slice(0, 2);
+    const docType = String((req.body || {}).doc_type || '');
+    if (!/^[A-Z]{2}$/.test(country)) return res.status(400).json({ error: 'pays invalide' });
+    if (!KYC_DOCS.includes(docType)) return res.status(400).json({ error: 'type de document invalide' });
+    if (!req.files || !req.files.doc_front) return res.status(400).json({ error: 'photo du document requise' });
+    const front = await storeImage(req.files.doc_front[0], 'vidigagne/kyc');
+    const back = req.files.doc_back ? await storeImage(req.files.doc_back[0], 'vidigagne/kyc') : null;
+    const ex = await get1('SELECT * FROM id_verifications WHERE user_id=?', req.userId);
+    if (ex) {
+      await runSql(`UPDATE id_verifications SET country=?, doc_type=?, doc_front=?, doc_back=?, status='pending', reviewed_at=NULL, created_at=? WHERE user_id=?`,
+        country, docType, front, back, now(), req.userId);
+    } else {
+      await runSql(`INSERT INTO id_verifications(user_id,country,doc_type,doc_front,doc_back,status,created_at) VALUES(?,?,?,?,?,'pending',?)`,
+        req.userId, country, docType, front, back, now());
+    }
+    res.json({ ok: true, status: 'pending' });
+  } catch (e) { res.status(500).json({ error: 'échec de l’envoi' }); }
+});
+app.get('/api/kyc/status', auth, async (req, res) => {
+  const r = await get1('SELECT status, country, doc_type, created_at FROM id_verifications WHERE user_id=?', req.userId);
+  res.json(r ? { status: r.status, country: r.country, doc_type: r.doc_type } : { status: 'none' });
+});
+function adminAuth(req, res, next) {
+  const t = req.headers['x-admin-token'] || req.query.token;
+  if (!process.env.ADMIN_TOKEN || t !== process.env.ADMIN_TOKEN) return res.status(403).json({ error: 'non autorisé' });
+  next();
+}
+app.get('/api/kyc/pending', adminAuth, async (req, res) => {
+  const rows = await allRows(
+    `SELECT k.*, u.username, u.name FROM id_verifications k JOIN users u ON u.id=k.user_id
+     WHERE k.status='pending' ORDER BY k.created_at ASC`);
+  res.json({ pending: rows.map(r => ({ ...r, doc_front: fileUrl(r.doc_front), doc_back: r.doc_back ? fileUrl(r.doc_back) : null })) });
+});
+app.post('/api/kyc/:id/review', adminAuth, async (req, res) => {
+  const approve = !!(req.body || {}).approve;
+  await runSql(`UPDATE id_verifications SET status=?, reviewed_at=? WHERE id=?`,
+    approve ? 'approved' : 'rejected', now(), req.params.id);
+  res.json({ ok: true, status: approve ? 'approved' : 'rejected' });
+});
+// ---------- page admin : revue des identités ----------
+app.get('/admin/kyc', (req, res) => {
+  const t = String(req.query.token || '');
+  if (!process.env.ADMIN_TOKEN || t !== process.env.ADMIN_TOKEN) return res.status(403).type('html').send('<h1>Accès refusé</h1>');
+  res.type('html').send(`<!DOCTYPE html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>VidiGagne — Vérifications d'identité</title>
+<style>body{font-family:sans-serif;max-width:900px;margin:0 auto;padding:20px;background:#f5f5f5}h1{font-size:22px}.card{background:#fff;border-radius:12px;padding:16px;margin-bottom:16px;box-shadow:0 1px 4px rgba(0,0,0,.1)}.card img{max-width:100%;max-height:300px;border-radius:8px;margin:6px 0}.row{display:flex;gap:10px;margin-top:10px}button{flex:1;padding:12px;border:none;border-radius:8px;font-weight:700;cursor:pointer;font-size:15px}.ok{background:#16a34a;color:#fff}.ko{background:#dc2626;color:#fff}.meta{color:#666;font-size:14px}</style></head><body>
+<h1>🔍 Vérifications d'identité en attente</h1><div id="list"><p>Chargement…</p></div>
+<script>const T=${JSON.stringify(t)};
+async function load(){const r=await fetch('/api/kyc/pending',{headers:{'x-admin-token':T}});const d=await r.json();
+const box=document.getElementById('list');
+if(!d.pending.length){box.innerHTML='<p>Aucune demande en attente ✅</p>';return}
+box.innerHTML=d.pending.map(p=>'<div class="card" id="k'+p.id+'"><div><b>@'+p.username+'</b> <span class="meta">'+p.name+' • '+p.country+' • '+p.doc_type+'</span></div>'
++'<div><img src="'+p.doc_front+'"></div>'+(p.doc_back?'<div><img src="'+p.doc_back+'"></div>':'')
++'<div class="row"><button class="ok" onclick="rev('+p.id+',true)">✅ Approuver</button><button class="ko" onclick="rev('+p.id+',false)">❌ Rejeter</button></div></div>').join('')}
+async function rev(id,ok){await fetch('/api/kyc/'+id+'/review',{method:'POST',headers:{'Content-Type':'application/json','x-admin-token':T},body:JSON.stringify({approve:ok})});
+document.getElementById('k'+id).remove();const box=document.getElementById('list');if(!box.children.length)box.innerHTML='<p>Aucune demande en attente ✅</p>'}
+load();</script></body></html>`);
+});
+// ---------- FONDS CRÉATEURS (différent de TikTok) ----------
+// Éligibilité : 1000 abonnés ET 50 000 vues ORGANIQUES issues des VIDÉOS
+// uniquement (anti-triche : 1 vue/spectateur/vidéo/24h, pas d'auto-vues,
+// plafond 100/jour) ET identité vérifiée (KYC approuvé, tout pays accepté).
+// Paiement : seules les vues MONÉTISÉES (avec publicité affichée) sont
+// payées, toujours en 50-50 des revenus publicitaires réels.
+async function fundEligibility(userId) {
+  const fol = await get1('SELECT COUNT(*) AS c FROM follows WHERE followed_id=?', userId);
+  const vw = await get1('SELECT COALESCE(SUM(views),0) AS s FROM videos WHERE user_id=?', userId);
+  const avw = await get1('SELECT COALESCE(SUM(ad_views),0) AS s FROM videos WHERE user_id=?', userId);
+  const kyc = await get1('SELECT status FROM id_verifications WHERE user_id=?', userId);
+  const followers = Number(fol.c), views = Number(vw.s);
+  const kycStatus = kyc ? kyc.status : 'none';
+  return {
+    eligible: followers >= 1000 && views >= 50000 && kycStatus === 'approved',
+    followers, views, ad_views: Number(avw.s), kyc: kycStatus,
+  };
+}
+app.get('/api/fund/status', auth, async (req, res) => {
+  try {
+    const e = await fundEligibility(req.userId);
+    const er = await get1('SELECT COALESCE(SUM(amount_usd),0) AS s, COALESCE(SUM(coins),0) AS c FROM fund_earnings WHERE user_id=?', req.userId);
+    res.json({
+      eligible: e.eligible,
+      followers: e.followers, followers_needed: 1000,
+      views: e.views, views_needed: 50000,
+      ad_views: e.ad_views, kyc: e.kyc,
+      total_earned_usd: Math.floor(Number(er.s) * 100) / 100,
+      total_earned_coins: Number(er.c),
+    });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// Dépôt des revenus publicitaires réels (admin uniquement).
+// 50 % reversés aux créateurs VÉRIFIÉS, au prorata de leurs VUES MONÉTISÉES.
+app.post('/api/fund/deposit', async (req, res) => {
+  try {
+    const token = req.headers['x-admin-token'];
+    if (!process.env.ADMIN_TOKEN || token !== process.env.ADMIN_TOKEN)
+      return res.status(403).json({ error: 'non autorisé' });
+    const amount = Number((req.body || {}).amount_usd);
+    if (!amount || amount <= 0) return res.status(400).json({ error: 'montant invalide' });
+    const period = String((req.body || {}).period || '').slice(0, 40);
+    const users = await allRows('SELECT id FROM users');
+    const elig = [];
+    for (const u of users) {
+      const e = await fundEligibility(u.id);
+      if (e.eligible && e.ad_views > 0) elig.push({ id: u.id, views: e.ad_views });
+    }
+    const totalViews = elig.reduce((a, e) => a + e.views, 0);
+    const share = Math.floor(amount * 0.5 * 100) / 100; // 50-50 : moitié créateurs
+    const depId = await insertId(
+      'INSERT INTO fund_deposits(amount_usd,creators_share_usd,period,created_at) VALUES(?,?,?,?)',
+      amount, share, period, now());
+    let distributed = 0;
+    for (const e of elig) {
+      const usd = totalViews > 0 ? Math.floor(share * e.views / totalViews * 100) / 100 : 0;
+      const coins = Math.round(usd * 500);
+      if (coins > 0) {
+        await runSql('UPDATE users SET coins=coins+? WHERE id=?', coins, e.id);
+        await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
+          e.id, coins, 'fonds créateurs' + (period ? ' (' + period + ')' : ''), now());
+        await runSql('INSERT INTO fund_earnings(deposit_id,user_id,views,amount_usd,coins,created_at) VALUES(?,?,?,?,?,?)',
+          depId, e.id, e.views, usd, coins, now());
+        distributed += usd;
+      }
+    }
+    res.json({ ok: true, deposit_id: depId, creators: elig.length, distributed_usd: Math.floor(distributed * 100) / 100 });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
 // ---------- signalisation WebRTC pour les LIVE ----------
 const liveRooms = {}; // liveId -> { broadcaster: ws|null, viewers: Map(ws -> peerId) }
 async function userIdFromToken(token) {
@@ -705,9 +894,42 @@ app.get('/api/feed', async (req, res) => {
 app.get('/api/videos/:id', async (req, res) => {
   const v = await get1('SELECT * FROM videos WHERE id=?', req.params.id);
   if (!v) return res.status(404).json({ error: 'vidéo introuvable' });
-  await runSql('UPDATE videos SET views=views+1 WHERE id=?', v.id);
-  v.views = Number(v.views) + 1;
   res.json({ video: await videoJSON(v, null) });
+});
+// ---------- vues : comptage anti-triche ----------
+// Règles : 1 vue comptée par spectateur et par vidéo toutes les 24 h,
+// les vues de l'auteur lui-même ne comptent pas,
+// plafond de 100 vues comptées par spectateur et par jour (tous vidéos).
+// ad_shown=1 quand une publicité a été affichée pendant la vue (vues monétisées).
+app.post('/api/videos/:id/view', async (req, res) => {
+  try {
+    const v = await get1('SELECT * FROM videos WHERE id=?', req.params.id);
+    if (!v) return res.status(404).json({ error: 'vidéo introuvable' });
+    let viewerId = null;
+    const h = req.headers.authorization || '';
+    const m = h.match(/^Bearer (.+)$/);
+    if (m) {
+      const row = await get1('SELECT user_id FROM tokens WHERE token=?', m[1]);
+      if (row) viewerId = row.user_id;
+    }
+    if (viewerId && Number(viewerId) === Number(v.user_id))
+      return res.json({ ok: true, counted: false, reason: 'self' });
+    const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim().slice(0, 45);
+    const dayAgo = now() - 86400000;
+    const dup = viewerId
+      ? await get1('SELECT 1 FROM video_views WHERE video_id=? AND viewer_id=? AND created_at>?', v.id, viewerId, dayAgo)
+      : await get1('SELECT 1 FROM video_views WHERE video_id=? AND viewer_id IS NULL AND ip=? AND created_at>?', v.id, ip, dayAgo);
+    if (dup) return res.json({ ok: true, counted: false, reason: 'duplicate' });
+    const cnt = viewerId
+      ? await get1('SELECT COUNT(*) AS c FROM video_views WHERE viewer_id=? AND created_at>?', viewerId, dayAgo)
+      : await get1('SELECT COUNT(*) AS c FROM video_views WHERE viewer_id IS NULL AND ip=? AND created_at>?', ip, dayAgo);
+    if (Number(cnt.c) >= 100) return res.json({ ok: true, counted: false, reason: 'rate-limit' });
+    const adShown = (req.body || {}).ad_shown ? 1 : 0;
+    await runSql('INSERT INTO video_views(video_id,viewer_id,ip,ad_shown,created_at) VALUES(?,?,?,?,?)',
+      v.id, viewerId, ip, adShown, now());
+    await runSql('UPDATE videos SET views=views+1' + (adShown ? ', ad_views=ad_views+1' : '') + ' WHERE id=?', v.id);
+    res.json({ ok: true, counted: true, ad_shown: !!adShown });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 
 // ---------- likes ----------
