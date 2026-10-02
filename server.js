@@ -224,6 +224,7 @@ CREATE TABLE IF NOT EXISTS receipts(
   await mig('videos', 'sound', `TEXT NOT NULL DEFAULT ''`);
   await mig('videos', 'duration', `REAL NOT NULL DEFAULT 0`);
   await mig('videos', 'ad_views', `INTEGER NOT NULL DEFAULT 0`);
+  await mig('id_verifications', 'expiry', `TEXT`);
   await mig('comments', 'likes', `INTEGER NOT NULL DEFAULT 0`);
   await mig('comments', 'pinned', `INTEGER NOT NULL DEFAULT 0`);
 }
@@ -673,24 +674,39 @@ app.delete('/api/account', auth, async (req, res) => {
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
-// ---------- KYC : vérification d'identité (tout pays accepté) ----------
-const KYC_DOCS = ['passport', 'id_card', 'driver_license'];
+// ---------- KYC : vérification d'identité ----------
+// Règles de documents acceptés :
+// - Afrique : PASSEPORT UNIQUEMENT
+// - Haïti, grands pays riches et reste du monde : passeport OU carte
+//   d'identité, toujours EN COURS DE VALIDITÉ (date d'expiration future).
+const KYC_AFRICA = new Set(['DZ','ZA','AO','BJ','BW','BF','BI','CM','CV','CF','TD','KM','CG','CD','CI','DJ','EG','GQ','ER','SZ','ET','GA','GM','GH','GN','GW','KE','LS','LR','LY','MG','MW','ML','MR','MU','MA','MZ','NA','NE','NG','RW','ST','SN','SC','SL','SO','SS','SD','TZ','TG','TN','UG','ZM','ZW']);
+function kycAllowedDocs(country) {
+  if (KYC_AFRICA.has(country)) return ['passport'];
+  return ['passport', 'id_card'];
+}
+const KYC_DOCS = ['passport', 'id_card'];
 app.post('/api/kyc/submit', auth, uploadImg.fields([{ name: 'doc_front', maxCount: 1 }, { name: 'doc_back', maxCount: 1 }]), async (req, res) => {
   try {
     const country = String((req.body || {}).country || '').toUpperCase().slice(0, 2);
     const docType = String((req.body || {}).doc_type || '');
+    const expiry = String((req.body || {}).expiry || '').slice(0, 7); // AAAA-MM
     if (!/^[A-Z]{2}$/.test(country)) return res.status(400).json({ error: 'pays invalide' });
-    if (!KYC_DOCS.includes(docType)) return res.status(400).json({ error: 'type de document invalide' });
+    if (!kycAllowedDocs(country).includes(docType))
+      return res.status(400).json({ error: 'document non accepté pour ce pays' });
+    if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(expiry)) return res.status(400).json({ error: 'date d’expiration invalide' });
+    const expDate = new Date(expiry + '-01T00:00:00Z');
+    expDate.setMonth(expDate.getMonth() + 1); // fin du mois
+    if (expDate <= new Date()) return res.status(400).json({ error: 'document expiré — en cours de validité exigé' });
     if (!req.files || !req.files.doc_front) return res.status(400).json({ error: 'photo du document requise' });
     const front = await storeImage(req.files.doc_front[0], 'vidigagne/kyc');
     const back = req.files.doc_back ? await storeImage(req.files.doc_back[0], 'vidigagne/kyc') : null;
     const ex = await get1('SELECT * FROM id_verifications WHERE user_id=?', req.userId);
     if (ex) {
-      await runSql(`UPDATE id_verifications SET country=?, doc_type=?, doc_front=?, doc_back=?, status='pending', reviewed_at=NULL, created_at=? WHERE user_id=?`,
-        country, docType, front, back, now(), req.userId);
+      await runSql(`UPDATE id_verifications SET country=?, doc_type=?, doc_front=?, doc_back=?, expiry=?, status='pending', reviewed_at=NULL, created_at=? WHERE user_id=?`,
+        country, docType, front, back, expiry, now(), req.userId);
     } else {
-      await runSql(`INSERT INTO id_verifications(user_id,country,doc_type,doc_front,doc_back,status,created_at) VALUES(?,?,?,?,?,'pending',?)`,
-        req.userId, country, docType, front, back, now());
+      await runSql(`INSERT INTO id_verifications(user_id,country,doc_type,doc_front,doc_back,expiry,status,created_at) VALUES(?,?,?,?,?,?,'pending',?)`,
+        req.userId, country, docType, front, back, expiry, now());
     }
     res.json({ ok: true, status: 'pending' });
   } catch (e) { res.status(500).json({ error: 'échec de l’envoi' }); }
@@ -698,6 +714,14 @@ app.post('/api/kyc/submit', auth, uploadImg.fields([{ name: 'doc_front', maxCoun
 app.get('/api/kyc/status', auth, async (req, res) => {
   const r = await get1('SELECT status, country, doc_type, created_at FROM id_verifications WHERE user_id=?', req.userId);
   res.json(r ? { status: r.status, country: r.country, doc_type: r.doc_type } : { status: 'none' });
+});
+// règles de documents par pays (pour adapter le formulaire dans l'app)
+app.get('/api/kyc/rules', async (req, res) => {
+  const country = String(req.query.country || '').toUpperCase().slice(0, 2);
+  const docs = kycAllowedDocs(country);
+  res.json({ country, docs, note: KYC_AFRICA.has(country)
+    ? 'Afrique : passeport uniquement, en cours de validité.'
+    : 'Passeport ou carte d’identité, en cours de validité.' });
 });
 function adminAuth(req, res, next) {
   const t = req.headers['x-admin-token'] || req.query.token;
@@ -727,7 +751,7 @@ app.get('/admin/kyc', (req, res) => {
 async function load(){const r=await fetch('/api/kyc/pending',{headers:{'x-admin-token':T}});const d=await r.json();
 const box=document.getElementById('list');
 if(!d.pending.length){box.innerHTML='<p>Aucune demande en attente ✅</p>';return}
-box.innerHTML=d.pending.map(p=>'<div class="card" id="k'+p.id+'"><div><b>@'+p.username+'</b> <span class="meta">'+p.name+' • '+p.country+' • '+p.doc_type+'</span></div>'
+box.innerHTML=d.pending.map(p=>'<div class="card" id="k'+p.id+'"><div><b>@'+p.username+'</b> <span class="meta">'+p.name+' • '+p.country+' • '+p.doc_type+' • expire : '+(p.expiry||'?')+'</span></div>'
 +'<div><img src="'+p.doc_front+'"></div>'+(p.doc_back?'<div><img src="'+p.doc_back+'"></div>':'')
 +'<div class="row"><button class="ok" onclick="rev('+p.id+',true)">✅ Approuver</button><button class="ko" onclick="rev('+p.id+',false)">❌ Rejeter</button></div></div>').join('')}
 async function rev(id,ok){await fetch('/api/kyc/'+id+'/review',{method:'POST',headers:{'Content-Type':'application/json','x-admin-token':T},body:JSON.stringify({approve:ok})});
