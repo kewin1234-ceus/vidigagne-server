@@ -288,7 +288,70 @@ CREATE TABLE IF NOT EXISTS watch_history(
   video_id INTEGER NOT NULL,
   watched_at BIGINT NOT NULL,
   PRIMARY KEY(user_id, video_id)
-);`;
+);
+CREATE TABLE IF NOT EXISTS story_views(
+  story_id INTEGER NOT NULL,
+  viewer_id INTEGER NOT NULL,
+  viewed_at BIGINT NOT NULL,
+  PRIMARY KEY(story_id, viewer_id)
+);
+CREATE TABLE IF NOT EXISTS live_chat(
+  id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+  live_id INTEGER NOT NULL,
+  user_id INTEGER NOT NULL,
+  text TEXT NOT NULL,
+  created_at BIGINT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS live_viewers(
+  live_id INTEGER NOT NULL,
+  user_id INTEGER NOT NULL,
+  updated_at BIGINT NOT NULL,
+  PRIMARY KEY(live_id, user_id)
+);
+CREATE TABLE IF NOT EXISTS live_signals(
+  id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+  live_id INTEGER NOT NULL,
+  to_user_id INTEGER,
+  from_user_id INTEGER NOT NULL,
+  kind TEXT NOT NULL,
+  payload TEXT NOT NULL DEFAULT '',
+  created_at BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS live_sig_idx ON live_signals(live_id, id);
+CREATE TABLE IF NOT EXISTS sounds(
+  id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+  user_id INTEGER NOT NULL,
+  title TEXT NOT NULL,
+  artist TEXT NOT NULL DEFAULT '',
+  audio_url TEXT NOT NULL,
+  use_count INTEGER NOT NULL DEFAULT 0,
+  created_at BIGINT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS sound_favs(
+  user_id INTEGER NOT NULL,
+  sound_id INTEGER NOT NULL,
+  created_at BIGINT NOT NULL,
+  PRIMARY KEY(user_id, sound_id)
+);
+CREATE TABLE IF NOT EXISTS tips(
+  id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+  video_id INTEGER NOT NULL,
+  from_user_id INTEGER NOT NULL,
+  to_user_id INTEGER NOT NULL,
+  coins INTEGER NOT NULL,
+  created_at BIGINT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS creator_subs(
+  id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+  creator_id INTEGER NOT NULL,
+  subscriber_id INTEGER NOT NULL,
+  price_coins INTEGER NOT NULL,
+  started_at BIGINT NOT NULL,
+  expires_at BIGINT NOT NULL,
+  active INTEGER NOT NULL DEFAULT 1,
+  created_at BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS csub_active_idx ON creator_subs(creator_id, subscriber_id, active);`;
   if (USE_PG) { await pool.query(schema); }
   else { lite.exec(schema); }
   // migrations : colonnes d'authentification sociale
@@ -296,6 +359,8 @@ CREATE TABLE IF NOT EXISTS watch_history(
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT`);
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS google_id TEXT`);
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS phone TEXT`);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS sub_enabled INTEGER DEFAULT 0`);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS sub_price INTEGER DEFAULT 0`);
     await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS users_email_uidx ON users(email)`);
     await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS users_google_uidx ON users(google_id)`);
     await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS users_phone_uidx ON users(phone)`);
@@ -305,6 +370,8 @@ CREATE TABLE IF NOT EXISTS watch_history(
     for (const c of ['email', 'google_id', 'phone']) {
       if (!cols.includes(c)) lite.exec(`ALTER TABLE users ADD COLUMN ${c} TEXT`);
     }
+    if (!cols.includes('sub_enabled')) lite.exec(`ALTER TABLE users ADD COLUMN sub_enabled INTEGER DEFAULT 0`);
+    if (!cols.includes('sub_price')) lite.exec(`ALTER TABLE users ADD COLUMN sub_price INTEGER DEFAULT 0`);
     lite.exec(`CREATE UNIQUE INDEX IF NOT EXISTS users_email_uidx ON users(email)`);
     lite.exec(`CREATE UNIQUE INDEX IF NOT EXISTS users_google_uidx ON users(google_id)`);
     lite.exec(`CREATE UNIQUE INDEX IF NOT EXISTS users_phone_uidx ON users(phone)`);
@@ -330,6 +397,28 @@ CREATE TABLE IF NOT EXISTS watch_history(
   // serveur v9 : modération MVP (vidéos masquées, comptes suspendus)
   await mig('videos', 'hidden', `INTEGER NOT NULL DEFAULT 0`);
   await mig('users', 'suspended', `INTEGER NOT NULL DEFAULT 0`);
+  // renommage desc -> description sur les anciennes bases (schéma v1)
+  try {
+    const hasDesc = USE_PG
+      ? (await pool.query(`SELECT 1 FROM information_schema.columns WHERE table_name='videos' AND column_name='desc'`)).rowCount > 0
+      : lite.prepare(`PRAGMA table_info(videos)`).all().some(c => c.name === 'desc');
+    const hasDescription = USE_PG
+      ? (await pool.query(`SELECT 1 FROM information_schema.columns WHERE table_name='videos' AND column_name='description'`)).rowCount > 0
+      : lite.prepare(`PRAGMA table_info(videos)`).all().some(c => c.name === 'description');
+    if (hasDesc && !hasDescription) {
+      if (USE_PG) await pool.query(`ALTER TABLE videos RENAME COLUMN desc TO description`);
+      else lite.exec(`ALTER TABLE videos RENAME COLUMN desc TO description`);
+    }
+  } catch (e) {}
+  // serveur v10 : stories durcies, live, sons, pourboires, abonnements payants
+  await mig('stories', 'privacy', `TEXT NOT NULL DEFAULT 'public'`);
+  await mig('stories', 'text', `TEXT NOT NULL DEFAULT ''`);
+  await mig('videos', 'visibility', `TEXT NOT NULL DEFAULT 'public'`);
+  await mig('lives', 'peak_viewers', `INTEGER NOT NULL DEFAULT 0`);
+  await mig('lives', 'duration_s', `INTEGER NOT NULL DEFAULT 0`);
+  await mig('lives', 'gifts_total', `INTEGER NOT NULL DEFAULT 0`);
+  await mig('lives', 'chat_total', `INTEGER NOT NULL DEFAULT 0`);
+  await mig('gifts', 'live_id', `INTEGER`);
 }
 
 // une ligne ou undefined
@@ -449,6 +538,31 @@ async function isBlocked(a, b) {
     a, b, b, a);
   return !!r;
 }
+// filtre SQL de visibilité des vidéos : 'public' pour tous, 'subscribers' pour les
+// abonnés payants (ou le propriétaire), 'private' pour le propriétaire seul.
+// alias = alias SQL de la table videos. Retourne {clause, params}.
+function visFilter(alias, meId) {
+  const a = alias || 'videos';
+  if (!meId) return { clause: ` AND (${a}.visibility IS NULL OR ${a}.visibility='public')`, params: [] };
+  return {
+    clause: ` AND (${a}.visibility IS NULL OR ${a}.visibility='public' OR ${a}.user_id=?` +
+      ` OR (${a}.visibility='subscribers' AND EXISTS (SELECT 1 FROM creator_subs cs WHERE cs.creator_id=${a}.user_id AND cs.subscriber_id=? AND cs.active=1 AND cs.expires_at>?)))`,
+    params: [meId, meId, now()],
+  };
+}
+// vrai si meId peut voir la vidéo v (objet ligne videos)
+async function canSeeVideo(v, meId) {
+  const vis = v.visibility || 'public';
+  if (vis === 'public') return true;
+  if (!meId) return false;
+  if (Number(v.user_id) === Number(meId)) return true;
+  if (vis === 'subscribers') {
+    const s = await get1('SELECT 1 FROM creator_subs WHERE creator_id=? AND subscriber_id=? AND active=1 AND expires_at>?',
+      v.user_id, meId, now());
+    return !!s;
+  }
+  return false; // private
+}
 // upsert historique de visionnage
 async function touchHistory(userId, videoId) {
   if (!userId || !videoId) return;
@@ -463,16 +577,23 @@ async function touchHistory(userId, videoId) {
   } catch (e) {}
 }
 function pubUser(u) {
-  return { id: u.id, username: u.username, name: u.name, avatar: u.avatar, bio: u.bio, verified: !!u.verified };
+  return { id: u.id, username: u.username, name: u.name, avatar: u.avatar, bio: u.bio, verified: !!u.verified,
+    sub_enabled: Number(u.sub_enabled) || 0, sub_price: Number(u.sub_price) || 0 };
 }
 async function videoJSON(v, meId) {
   const u = await get1('SELECT * FROM users WHERE id=?', v.user_id);
   const likes = (await get1('SELECT COUNT(*) AS c FROM likes WHERE video_id=?', v.id)).c;
   const cmts = (await get1('SELECT COUNT(*) AS c FROM comments WHERE video_id=?', v.id)).c;
   const liked = meId ? !!(await get1('SELECT 1 FROM likes WHERE user_id=? AND video_id=?', meId, v.id)) : false;
+  // abonné payant actif au créateur ? (sert au verrou 🔒 sur les vidéos réservées)
+  let subscribed = false;
+  if (meId && Number(v.user_id) !== Number(meId)) {
+    subscribed = !!(await get1('SELECT 1 FROM creator_subs WHERE creator_id=? AND subscriber_id=? AND active=1 AND expires_at>?',
+      v.user_id, meId, now()));
+  }
   return {
     id: v.id, desc: v.description, tags: v.tags, sound: v.sound || '', duration: Number(v.duration) || 0,
-    url: fileUrl(v.file),
+    url: fileUrl(v.file), visibility: v.visibility || 'public', subscribed,
     views: Number(v.views), likes: Number(likes), comments: Number(cmts), liked,
     created_at: Number(v.created_at),
     user: pubUser(u),
@@ -526,11 +647,17 @@ app.get('/api/auth/me', auth, async (req, res) => {
 });
 
 app.patch('/api/auth/me', auth, async (req, res) => {
-  const { name, avatar, bio } = req.body || {};
+  const { name, avatar, bio, sub_enabled, sub_price } = req.body || {};
   await runSql('UPDATE users SET name=COALESCE(?,name), avatar=COALESCE(?,avatar), bio=COALESCE(?,bio) WHERE id=?',
     name ? String(name).slice(0, 40) : null,
     avatar ? String(avatar).slice(0, 8) : null,
     bio ? String(bio).slice(0, 150) : null, req.userId);
+  // abonnement payant au créateur : activation + prix mensuel (pièces)
+  if (sub_enabled !== undefined || sub_price !== undefined) {
+    const se = sub_enabled ? 1 : 0;
+    const sp = Math.max(0, Math.min(100000, Math.floor(Number(sub_price) || 0)));
+    await runSql('UPDATE users SET sub_enabled=?, sub_price=? WHERE id=?', se, sp, req.userId);
+  }
   const u = await get1('SELECT * FROM users WHERE id=?', req.userId);
   res.json({ user: pubUser(u) });
 });
@@ -542,6 +669,15 @@ const upload = multer({
   fileFilter: (req, file, cb) => {
     if (/^video\//.test(file.mimetype)) cb(null, true);
     else cb(new Error('seules les vidéos sont acceptées'));
+  },
+});
+// médias stories : vidéo OU photo
+const uploadStory = multer({
+  storage: USE_CLOUDINARY ? multer.memoryStorage() : multer.diskStorage({ destination: UP }),
+  limits: { fileSize: 300 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    if (/^(video|image)\//.test(file.mimetype)) cb(null, true);
+    else cb(new Error('seules les vidéos et images sont acceptées'));
   },
 });
 // images : pièces d'identité (KYC)
@@ -578,10 +714,14 @@ app.post('/api/videos', auth, upload.single('video'), async (req, res) => {
     let scheduledAt = null;
     const schRaw = Number(b.scheduled_at);
     if (b.scheduled_at && schRaw > now()) scheduledAt = schRaw;
+    // visibilité : public | subscribers (abonnés payants) | private
+    let visibility = String(b.visibility || 'public');
+    if (visibility === 'subscribers_only') visibility = 'subscribers'; // valeur envoyée par l'app
+    if (!['public', 'subscribers', 'private'].includes(visibility)) visibility = 'public';
     const id = await insertId(
-      'INSERT INTO videos(user_id,file,description,tags,sound,duration,scheduled_at,created_at) VALUES(?,?,?,?,?,?,?,?)',
+      'INSERT INTO videos(user_id,file,description,tags,sound,duration,scheduled_at,visibility,created_at) VALUES(?,?,?,?,?,?,?,?,?)',
       req.userId, fname, descText, String(b.tags || '').slice(0, 300),
-      String(b.sound || '').slice(0, 120), Number(b.duration) || 0, scheduledAt, now());
+      String(b.sound || '').slice(0, 120), Number(b.duration) || 0, scheduledAt, visibility, now());
     // pièces : +10 par publication
     await runSql('UPDATE users SET coins=coins+10 WHERE id=?', req.userId);
     await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
@@ -593,26 +733,18 @@ app.post('/api/videos', auth, upload.single('video'), async (req, res) => {
 
 // ==================== PHASE 2 ====================
 // ---------- stories (24 h) ----------
-app.post('/api/stories', auth, upload.single('video'), async (req, res) => {
+app.post('/api/stories', auth, uploadStory.fields([{ name: 'video', maxCount: 1 }, { name: 'image', maxCount: 1 }]), async (req, res) => {
   try {
-    if (!req.file) return res.status(400).json({ error: 'aucune vidéo reçue' });
-    const fname = await storeVideo(req.file);
+    const file = (req.files && (req.files.video || req.files.image) || [])[0];
+    if (!file) return res.status(400).json({ error: 'aucune vidéo/image reçue' });
+    const fname = await storeVideo(file);
     const t = now();
-    const id = await insertId('INSERT INTO stories(user_id,file,created_at,expires_at) VALUES(?,?,?,?)',
-      req.userId, fname, t, t + 86400000);
+    const privacy = ['public', 'friends'].includes(String(req.body.privacy)) ? String(req.body.privacy) : 'public';
+    const text = String(req.body.text || '').slice(0, 200);
+    const id = await insertId('INSERT INTO stories(user_id,file,privacy,text,created_at,expires_at) VALUES(?,?,?,?,?,?)',
+      req.userId, fname, privacy, text, t, t + 86400000);
     res.json({ ok: true, id });
   } catch (e) { res.status(500).json({ error: 'échec du téléversement' }); }
-});
-app.get('/api/stories/feed', async (req, res) => {
-  const rows = await allRows(
-    'SELECT s.*, u.username, u.name, u.avatar FROM stories s JOIN users u ON u.id=s.user_id WHERE s.expires_at>? ORDER BY s.created_at DESC', now());
-  const groups = {};
-  rows.forEach(r => {
-    const g = groups[r.user_id] = groups[r.user_id] || {
-      user: { id: r.user_id, username: r.username, name: r.name, avatar: r.avatar }, items: [] };
-    g.items.push({ id: r.id, url: fileUrl(r.file), created_at: Number(r.created_at) });
-  });
-  res.json({ groups: Object.values(groups) });
 });
 // ---------- cadeaux ----------
 const GIFT_CATALOG = [
@@ -691,9 +823,11 @@ app.get('/api/trending/hashtags', async (req, res) => {
 });
 app.get('/api/hashtag/:tag', async (req, res) => {
   const tag = String(req.params.tag || '').toLowerCase();
+  const meId = await optUserId(req);
   const rows = await allRows('SELECT * FROM videos WHERE hidden=0 ORDER BY created_at DESC LIMIT 500');
   const out = [];
   for (const v of rows) {
+    if (!(await canSeeVideo(v, meId))) continue;
     if (extractTags((v.description || '') + ' ' + (v.tags || '')).includes(tag)) out.push(await videoJSON(v, 0));
   }
   res.json({ tag, videos: out.slice(0, 50) });
@@ -733,41 +867,53 @@ app.get('/api/withdraw', auth, async (req, res) => {
   const rows = await allRows('SELECT * FROM withdrawals WHERE user_id=? ORDER BY created_at DESC', req.userId);
   res.json({ withdrawals: rows });
 });
-// ---------- stats créateur ----------
+// ---------- stats créateur (étendues v10) ----------
 app.get('/api/creator/stats', auth, async (req, res) => {
   const vids = await allRows('SELECT * FROM videos WHERE user_id=?', req.userId);
   const views = vids.reduce((a, v) => a + Number(v.views || 0), 0);
   const lr = await get1('SELECT COUNT(*) AS c FROM likes l JOIN videos v ON v.id=l.video_id WHERE v.user_id=?', req.userId);
   const fr = await get1('SELECT COUNT(*) AS c FROM follows WHERE followed_id=?', req.userId);
   const me = await get1('SELECT coins FROM users WHERE id=?', req.userId);
+  const vidIds = vids.map(v => v.id);
+  // séries sur 7 jours (regroupement en JS : compatible SQLite + Postgres)
+  const dayStart = t => { const d = new Date(t); d.setHours(0, 0, 0, 0); return d.getTime(); };
+  const days = [];
+  for (let i = 6; i >= 0; i--) days.push(dayStart(now() - i * 86400000));
+  const bucket = rows => days.map(ds => rows.filter(r => Number(r.created_at) >= ds && Number(r.created_at) < ds + 86400000).length);
+  let views7 = [], likes7 = [], followers7 = [];
+  let watchTime = 0;
+  if (vidIds.length) {
+    const ph = vidIds.map(() => '?').join(',');
+    const vv = await allRows(`SELECT created_at, video_id FROM video_views WHERE video_id IN (${ph}) AND created_at>=?`, ...vidIds, days[0]);
+    views7 = bucket(vv);
+    // temps de visionnage estimé : vues comptées × durée de la vidéo
+    const durById = {};
+    vids.forEach(v => { durById[v.id] = Number(v.duration) || 0; });
+    watchTime = Math.round(vv.reduce((a, r) => a + (durById[r.video_id] || 0), 0));
+    const lk = await allRows(`SELECT l.created_at FROM likes l WHERE l.video_id IN (${ph}) AND l.created_at>=?`, ...vidIds, days[0]);
+    likes7 = bucket(lk);
+  } else { views7 = days.map(() => 0); likes7 = days.map(() => 0); }
+  const nf = await allRows('SELECT created_at FROM follows WHERE followed_id=? AND created_at>=?', req.userId, days[0]);
+  followers7 = bucket(nf);
+  const tipsR = await get1('SELECT COALESCE(SUM(coins),0) AS s FROM tips WHERE to_user_id=?', req.userId);
+  const giftsR = await get1('SELECT COALESCE(SUM(cost),0) AS s FROM gifts WHERE to_id=?', req.userId);
   res.json({
     videos: vids.length, views, likes: Number(lr.c), followers: Number(fr.c), coins: me.coins,
+    watch_time_total: watchTime, watch_time: watchTime,
+    avg_duration: views ? Math.round(watchTime / views) : 0,
+    views_7d: views7, last7d: views7, likes_7d: likes7, new_followers_7d: followers7, new_followers7d: followers7,
+    tips_total: Number(tipsR.s) || 0, tips: Number(tipsR.s) || 0,
+    gifts_total: Number(giftsR.s) || 0, gifts: Number(giftsR.s) || 0,
     top: vids.sort((a, b) => b.views - a.views).slice(0, 5)
       .map(v => ({ id: v.id, desc: v.description, views: Number(v.views) })),
   });
 });
-// ---------- live : liste / démarrer / terminer ----------
-app.get('/api/live', async (req, res) => {
-  const rows = await allRows(
-    'SELECT l.*, u.username, u.name, u.avatar FROM lives l JOIN users u ON u.id=l.user_id WHERE l.ended_at IS NULL ORDER BY l.started_at DESC');
-  res.json({ lives: rows });
-});
+// ---------- live : démarrer (la liste et la fin sont en version v10 ci-dessous) ----------
 app.post('/api/live/start', auth, async (req, res) => {
   const title = String((req.body || {}).title || '').slice(0, 80);
   const id = await insertId('INSERT INTO lives(user_id,title,started_at,viewers) VALUES(?,?,?,0)',
     req.userId, title, now());
   res.json({ ok: true, id });
-});
-app.post('/api/live/:id/end', auth, async (req, res) => {
-  await runSql('UPDATE lives SET ended_at=? WHERE id=? AND user_id=?', now(), req.params.id, req.userId);
-  const room = liveRooms[req.params.id];
-  if (room) {
-    const msg = JSON.stringify({ t: 'ended' });
-    if (room.broadcaster && room.broadcaster.readyState === 1) room.broadcaster.send(msg);
-    room.viewers.forEach((pid, w) => { if (w.readyState === 1) w.send(msg); });
-    delete liveRooms[req.params.id];
-  }
-  res.json({ ok: true });
 });
 // ---------- compte : export et suppression (droits RGPD) ----------
 app.get('/api/account/export', auth, async (req, res) => {
@@ -1233,6 +1379,8 @@ app.get('/api/feed', async (req, res) => {
       params.push(meId);
       sql += blockFilter('v');
       params.push(meId, meId);
+      const vf = visFilter('v', meId);
+      sql += vf.clause; params.push(...vf.params);
       sql += ' ORDER BY v.created_at DESC LIMIT 50';
       rows = await allRows(sql, ...params);
     } else {
@@ -1244,6 +1392,8 @@ app.get('/api/feed', async (req, res) => {
         sql += blockFilter('videos');
         params.push(meId, meId);
       }
+      const vf = visFilter('videos', meId);
+      sql += vf.clause; params.push(...vf.params);
       sql += ' ORDER BY created_at DESC LIMIT 50';
       rows = await allRows(sql, ...params);
     }
@@ -1269,14 +1419,16 @@ app.get('/api/videos/mine', auth, async (req, res) => {
 app.get('/api/videos/:id', async (req, res) => {
   const v = await get1('SELECT * FROM videos WHERE id=?', req.params.id);
   if (!v) return res.status(404).json({ error: 'vidéo introuvable' });
+  const h = req.headers.authorization || '';
+  const m = h.match(/^Bearer (.+)$/);
+  let meId = null;
+  if (m) { const t = await get1('SELECT user_id FROM tokens WHERE token=?', m[1]); if (t) meId = t.user_id; }
   // vidéo programmée ou masquée par la modération : seul le propriétaire peut la voir
   if ((v.scheduled_at && Number(v.scheduled_at) > now()) || Number(v.hidden)) {
-    const h = req.headers.authorization || '';
-    const m = h.match(/^Bearer (.+)$/);
-    let meId = null;
-    if (m) { const t = await get1('SELECT user_id FROM tokens WHERE token=?', m[1]); if (t) meId = t.user_id; }
     if (!meId || Number(meId) !== Number(v.user_id)) return res.status(404).json({ error: 'vidéo introuvable' });
   }
+  // visibilité : public | subscribers | private
+  if (!(await canSeeVideo(v, meId))) return res.status(404).json({ error: 'vidéo introuvable' });
   res.json({ video: await videoJSON(v, null) });
 });
 // ---------- vues : comptage anti-triche ----------
@@ -1795,11 +1947,12 @@ app.get('/api/users/:username/reposts', async (req, res) => {
   try {
     const u = await get1('SELECT * FROM users WHERE username=?', String(req.params.username).toLowerCase());
     if (!u) return res.status(404).json({ error: 'utilisateur introuvable' });
+    const meId = await optUserId(req);
     const rows = await allRows('SELECT video_id FROM reposts WHERE user_id=? ORDER BY created_at DESC LIMIT 50', u.id);
     const videos = [];
     for (const r of rows) {
       const v = await get1('SELECT * FROM videos WHERE id=? AND hidden=0', r.video_id);
-      if (v) videos.push(await videoJSON(v, null));
+      if (v && await canSeeVideo(v, meId)) videos.push(await videoJSON(v, null));
     }
     res.json({ videos });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
@@ -1925,7 +2078,9 @@ app.get('/api/users/:username', async (req, res) => {
     const likes = Number((await get1(
       'SELECT COUNT(*) AS c FROM likes l JOIN videos v ON v.id=l.video_id WHERE v.user_id=?', u.id)).c);
     const videos = [];
-    for (const v of vids) videos.push(await videoJSON(v, null));
+    for (const v of vids) {
+      if (await canSeeVideo(v, meId)) videos.push(await videoJSON(v, null));
+    }
     res.json({ user: pubUser(u), followers, following, total_likes: likes, videos });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
@@ -1942,10 +2097,12 @@ app.get('/api/wallet', auth, async (req, res) => {
 app.get('/api/search', async (req, res) => {
   try {
     const q = '%' + String(req.query.q || '').toLowerCase() + '%';
+    const meId = await optUserId(req);
     const users = await allRows(
       'SELECT id,username,name,avatar FROM users WHERE username LIKE ? OR name LIKE ? LIMIT 20', q, q);
+    const vf = visFilter('videos', meId);
     const vids = await allRows(
-      'SELECT * FROM videos WHERE (LOWER(description) LIKE ? OR LOWER(tags) LIKE ?) AND (scheduled_at IS NULL OR scheduled_at <= ?) AND hidden=0 ORDER BY created_at DESC LIMIT 20', q, q, now());
+      'SELECT * FROM videos WHERE (LOWER(description) LIKE ? OR LOWER(tags) LIKE ?) AND (scheduled_at IS NULL OR scheduled_at <= ?) AND hidden=0' + vf.clause + ' ORDER BY created_at DESC LIMIT 20', q, q, now(), ...vf.params);
     const videos = [];
     for (const v of vids) videos.push(await videoJSON(v, null));
     res.json({ users, videos });
@@ -2185,6 +2342,382 @@ app.get('/api/health', (req, res) => res.json({
   fbKey: process.env.FIREBASE_API_KEY || null,
 }));
 
+// ==================== SERVEUR v10 ====================
+// ---------- stories durcies : vues, confidentialité, suppression ----------
+// amitié mutuelle (follow dans les deux sens)
+async function isMutual(a, b) {
+  if (!a || !b || Number(a) === Number(b)) return false;
+  const r1 = await get1('SELECT 1 FROM follows WHERE follower_id=? AND followed_id=?', a, b);
+  if (!r1) return false;
+  const r2 = await get1('SELECT 1 FROM follows WHERE follower_id=? AND followed_id=?', b, a);
+  return !!r2;
+}
+app.post('/api/stories/:id/view', auth, async (req, res) => {
+  try {
+    const s = await get1('SELECT * FROM stories WHERE id=?', req.params.id);
+    if (!s || Number(s.expires_at) <= now()) return res.status(404).json({ error: 'story introuvable' });
+    if (Number(req.userId) !== Number(s.user_id))
+      await insertIgnore('INSERT OR IGNORE INTO story_views(story_id,viewer_id,viewed_at) VALUES(?,?,?)',
+        s.id, req.userId, now());
+    const c = await get1('SELECT COUNT(*) AS c FROM story_views WHERE story_id=?', s.id);
+    res.json({ ok: true, views: Number(c.c) });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.get('/api/stories/:id/views', auth, async (req, res) => {
+  try {
+    const s = await get1('SELECT * FROM stories WHERE id=?', req.params.id);
+    if (!s) return res.status(404).json({ error: 'story introuvable' });
+    if (Number(s.user_id) !== Number(req.userId)) return res.status(403).json({ error: 'réservé au propriétaire' });
+    const rows = await allRows(
+      'SELECT sv.viewed_at, u.id, u.username, u.name, u.avatar, u.verified FROM story_views sv JOIN users u ON u.id=sv.viewer_id WHERE sv.story_id=? ORDER BY sv.viewed_at DESC', s.id);
+    res.json({ views: rows.map(r => ({ user: pubUser(r), viewed_at: Number(r.viewed_at) })) });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.delete('/api/stories/:id', auth, async (req, res) => {
+  try {
+    const s = await get1('SELECT * FROM stories WHERE id=?', req.params.id);
+    if (!s) return res.status(404).json({ error: 'story introuvable' });
+    if (Number(s.user_id) !== Number(req.userId)) return res.status(403).json({ error: 'non autorisé' });
+    await runSql('DELETE FROM story_views WHERE story_id=?', s.id);
+    await runSql('DELETE FROM stories WHERE id=?', s.id);
+    if (!USE_CLOUDINARY && s.file && !/^https?:\/\//.test(s.file)) {
+      try { fs.unlinkSync(path.join(UP, s.file)); } catch (e) {}
+    }
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.patch('/api/stories/:id', auth, async (req, res) => {
+  try {
+    const s = await get1('SELECT * FROM stories WHERE id=?', req.params.id);
+    if (!s) return res.status(404).json({ error: 'story introuvable' });
+    if (Number(s.user_id) !== Number(req.userId)) return res.status(403).json({ error: 'non autorisé' });
+    const p = String((req.body || {}).privacy || '');
+    if (!['public', 'friends'].includes(p)) return res.status(400).json({ error: 'privacy invalide' });
+    await runSql('UPDATE stories SET privacy=? WHERE id=?', p, s.id);
+    res.json({ ok: true, privacy: p });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// remplace le feed stories : exclut expirées + respecte privacy (amis = follow mutuel)
+app.get('/api/stories/feed', async (req, res) => {
+  const rows = await allRows(
+    'SELECT s.*, u.username, u.name, u.avatar FROM stories s JOIN users u ON u.id=s.user_id WHERE s.expires_at>? ORDER BY s.created_at DESC', now());
+  const meId = await optUserId(req);
+  const groups = {};
+  for (const r of rows) {
+    if ((r.privacy || 'public') === 'friends' && Number(r.user_id) !== Number(meId)) {
+      if (!meId || !(await isMutual(meId, r.user_id))) continue;
+    }
+    const g = groups[r.user_id] = groups[r.user_id] || {
+      user: { id: r.user_id, username: r.username, name: r.name, avatar: r.avatar }, items: [] };
+    const vc = await get1('SELECT COUNT(*) AS c FROM story_views WHERE story_id=?', r.id);
+    g.items.push({ id: r.id, url: fileUrl(r.file), privacy: r.privacy || 'public', text: r.text || '',
+      views: Number(vc.c), created_at: Number(r.created_at) });
+  }
+  res.json({ groups: Object.values(groups) });
+});
+
+// ---------- live : chat, viewers, signalisation WebRTC, cadeaux, stats ----------
+async function liveById(id) { return get1('SELECT * FROM lives WHERE id=?', id); }
+async function liveViewersCount(liveId) {
+  const r = await get1('SELECT COUNT(*) AS c FROM live_viewers WHERE live_id=? AND updated_at>?', liveId, now() - 35000);
+  return Number(r.c);
+}
+function liveJSON(l, row, viewersCount) {
+  return {
+    id: l.id, user_id: l.user_id, title: l.title || '', started_at: Number(l.started_at),
+    ended_at: l.ended_at ? Number(l.ended_at) : null,
+    username: row ? row.username : undefined, name: row ? row.name : undefined, avatar: row ? row.avatar : undefined,
+    viewers_count: viewersCount || 0,
+    peak_viewers: Number(l.peak_viewers) || 0, duration_s: Number(l.duration_s) || 0,
+    gifts_total: Number(l.gifts_total) || 0, chat_total: Number(l.chat_total) || 0,
+  };
+}
+app.get('/api/live', async (req, res) => {
+  const rows = await allRows(
+    'SELECT l.*, u.username, u.name, u.avatar FROM lives l JOIN users u ON u.id=l.user_id WHERE l.ended_at IS NULL ORDER BY l.started_at DESC');
+  const lives = [];
+  for (const r of rows) lives.push(liveJSON(r, r, await liveViewersCount(r.id)));
+  res.json({ lives });
+});
+app.get('/api/live/:id', async (req, res) => {
+  const l = await liveById(req.params.id);
+  if (!l) return res.status(404).json({ error: 'live introuvable' });
+  const row = await get1('SELECT username,name,avatar FROM users WHERE id=?', l.user_id);
+  res.json({ live: liveJSON(l, row, await liveViewersCount(l.id)) });
+});
+app.post('/api/live/:id/chat', auth, async (req, res) => {
+  try {
+    const l = await liveById(req.params.id);
+    if (!l) return res.status(404).json({ error: 'live introuvable' });
+    if (l.ended_at) return res.status(403).json({ error: 'live terminé' });
+    const raw = String((req.body || {}).text || '').trim();
+    if (!raw) return res.status(400).json({ error: 'message vide' });
+    if (raw.length > 280) return res.status(400).json({ error: 'message trop long (280 caractères max)' });
+    const text = raw;
+    const id = await insertId('INSERT INTO live_chat(live_id,user_id,text,created_at) VALUES(?,?,?,?)',
+      l.id, req.userId, text, now());
+    const u = await get1('SELECT username,name,avatar FROM users WHERE id=?', req.userId);
+    res.json({ ok: true, id, msg: { id, user: pubUser({ ...u, id: req.userId }), text, created_at: now() } });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.get('/api/live/:id/chat', async (req, res) => {
+  const l = await liveById(req.params.id);
+  if (!l) return res.status(404).json({ error: 'live introuvable' });
+  const since = Number(req.query.since) || 0;
+  const rows = await allRows(
+    'SELECT c.id, c.text, c.created_at, u.id AS uid, u.username, u.name, u.avatar, u.verified FROM live_chat c JOIN users u ON u.id=c.user_id WHERE c.live_id=? AND c.id>? ORDER BY c.id ASC LIMIT 50',
+    l.id, since);
+  res.json({ messages: rows.map(r => ({ id: r.id, text: r.text, created_at: Number(r.created_at),
+    user: pubUser({ id: r.uid, username: r.username, name: r.name, avatar: r.avatar, verified: r.verified }) })) });
+});
+app.post('/api/live/:id/heartbeat', auth, async (req, res) => {
+  const l = await liveById(req.params.id);
+  if (!l) return res.status(404).json({ error: 'live introuvable' });
+  if (l.ended_at) return res.status(403).json({ error: 'live terminé' });
+  if (USE_PG) {
+    await runSql('INSERT INTO live_viewers(live_id,user_id,updated_at) VALUES(?,?,?) ON CONFLICT(live_id,user_id) DO UPDATE SET updated_at=EXCLUDED.updated_at',
+      l.id, req.userId, now());
+  } else {
+    await runSql('INSERT OR REPLACE INTO live_viewers(live_id,user_id,updated_at) VALUES(?,?,?)', l.id, req.userId, now());
+  }
+  res.json({ ok: true, viewers_count: await liveViewersCount(l.id) });
+});
+// signalisation WebRTC par polling (pas de dépendance ws côté client HTTP)
+app.post('/api/live/:id/signal', auth, async (req, res) => {
+  try {
+    const l = await liveById(req.params.id);
+    if (!l) return res.status(404).json({ error: 'live introuvable' });
+    if (l.ended_at) return res.status(403).json({ error: 'live terminé' });
+    const b = req.body || {};
+    const kind = String(b.kind || '');
+    if (!['offer', 'answer', 'candidate'].includes(kind)) return res.status(400).json({ error: 'kind invalide' });
+    const payload = String(b.payload || '').slice(0, 20000);
+    if (!payload) return res.status(400).json({ error: 'payload requis' });
+    // par défaut un viewer signale au diffuseur ; le diffuseur précise to=viewer
+    const to = b.to ? +b.to : l.user_id;
+    const id = await insertId('INSERT INTO live_signals(live_id,to_user_id,from_user_id,kind,payload,created_at) VALUES(?,?,?,?,?,?)',
+      l.id, to, req.userId, kind, payload, now());
+    // nettoyage : signaux de plus de 10 min
+    await runSql('DELETE FROM live_signals WHERE created_at<?', now() - 600000).catch(() => {});
+    res.json({ ok: true, id });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.get('/api/live/:id/signal', auth, async (req, res) => {
+  try {
+    const l = await liveById(req.params.id);
+    if (!l) return res.status(404).json({ error: 'live introuvable' });
+    const since = Number(req.query.since) || 0;
+    await runSql('DELETE FROM live_signals WHERE created_at<?', now() - 600000).catch(() => {});
+    let rows;
+    if (req.query.for_broadcaster === '1') {
+      // le diffuseur récupère les signaux que les viewers lui adressent
+      if (Number(l.user_id) !== Number(req.userId)) return res.status(403).json({ error: 'réservé au diffuseur' });
+      rows = await allRows('SELECT * FROM live_signals WHERE live_id=? AND id>? AND to_user_id=? AND from_user_id<>? ORDER BY id ASC LIMIT 50',
+        l.id, since, l.user_id, l.user_id);
+    } else {
+      // un viewer récupère les signaux du diffuseur (offre/réponse/candidats, pour lui ou diffusés)
+      rows = await allRows("SELECT * FROM live_signals WHERE live_id=? AND id>? AND from_user_id=? AND (to_user_id IS NULL OR to_user_id=?) AND kind IN ('offer','answer','candidate') ORDER BY id ASC LIMIT 50",
+        l.id, since, l.user_id, req.userId);
+    }
+    res.json({ signals: rows.map(s => ({ id: s.id, kind: s.kind, from: s.from_user_id, payload: s.payload })) });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// cadeaux pendant un live
+app.post('/api/live/:id/gift', auth, async (req, res) => {
+  try {
+    const l = await liveById(req.params.id);
+    if (!l) return res.status(404).json({ error: 'live introuvable' });
+    if (l.ended_at) return res.status(403).json({ error: 'live terminé' });
+    const g = GIFT_CATALOG.find(x => x.id === String((req.body || {}).gift_id || ''));
+    if (!g) return res.status(400).json({ error: 'cadeau inconnu' });
+    const me = await get1('SELECT * FROM users WHERE id=?', req.userId);
+    if (!me || me.coins < g.cost) return res.status(400).json({ error: 'pas assez de pièces' });
+    if (Number(l.user_id) === Number(req.userId)) return res.status(400).json({ error: 'impossible' });
+    await runSql('UPDATE users SET coins=coins-? WHERE id=?', g.cost, req.userId);
+    await runSql('UPDATE users SET coins=coins+? WHERE id=?', g.cost, l.user_id);
+    await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
+      req.userId, -g.cost, 'cadeau live ' + g.id, now());
+    await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
+      l.user_id, g.cost, 'cadeau live reçu ' + g.id, now());
+    await runSql('INSERT INTO gifts(from_id,to_id,video_id,live_id,gift,cost,created_at) VALUES(?,?,?,?,?,?,?)',
+      req.userId, l.user_id, null, l.id, g.id, g.cost, now());
+    await notify(l.user_id, 'gift', req.userId, null, g.id);
+    res.json({ ok: true, coins: me.coins - g.cost });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// fin de live : enregistre les stats
+app.post('/api/live/:id/end', auth, async (req, res) => {
+  const l = await liveById(req.params.id);
+  if (!l) return res.status(404).json({ error: 'live introuvable' });
+  if (Number(l.user_id) !== Number(req.userId)) return res.status(403).json({ error: 'non autorisé' });
+  const t = now();
+  const durationS = Math.max(0, Math.round((t - Number(l.started_at)) / 1000));
+  const hbCount = await liveViewersCount(l.id);
+  const peak = Math.max(Number(l.peak_viewers) || 0, Number(l.viewers) || 0, hbCount);
+  const gr = await get1('SELECT COALESCE(SUM(cost),0) AS s FROM gifts WHERE live_id=?', l.id);
+  const cr = await get1('SELECT COUNT(*) AS c FROM live_chat WHERE live_id=?', l.id);
+  await runSql('UPDATE lives SET ended_at=?, duration_s=?, peak_viewers=?, gifts_total=?, chat_total=? WHERE id=?',
+    t, durationS, peak, Number(gr.s) || 0, Number(cr.c) || 0, l.id);
+  const room = liveRooms[req.params.id];
+  if (room) {
+    const msg = JSON.stringify({ t: 'ended' });
+    if (room.broadcaster && room.broadcaster.readyState === 1) room.broadcaster.send(msg);
+    room.viewers.forEach((pid, w) => { if (w.readyState === 1) w.send(msg); });
+    delete liveRooms[req.params.id];
+  }
+  res.json({ ok: true, stats: { duration_s: durationS, peak_viewers: peak,
+    gifts_total: Number(gr.s) || 0, chat_total: Number(cr.c) || 0 } });
+});
+
+// ---------- sons : bibliothèque ----------
+// upload audio (20 Mo max)
+const uploadAudio = multer({
+  storage: USE_CLOUDINARY ? multer.memoryStorage() : multer.diskStorage({ destination: UP }),
+  limits: { fileSize: 20 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    if (/^audio\//.test(file.mimetype)) cb(null, true);
+    else cb(new Error('seul l\'audio est accepté'));
+  },
+});
+async function storeAudio(file) {
+  const ext = path.extname(file.originalname || '') || '.mp3';
+  if (USE_CLOUDINARY) {
+    const tmp = path.join(os.tmpdir(), 'vgau' + Date.now() + '_' + crypto.randomBytes(6).toString('hex') + ext);
+    fs.writeFileSync(tmp, file.buffer);
+    try {
+      const up = await cloudinary.uploader.upload(tmp, { resource_type: 'video', folder: 'vidigagne/sounds' });
+      return up.secure_url;
+    } finally { fs.unlink(tmp, () => {}); }
+  }
+  const fname = 'a' + Date.now() + '_' + crypto.randomBytes(6).toString('hex') + ext;
+  fs.renameSync(file.path, path.join(UP, fname));
+  return fname;
+}
+function soundJSON(s, meId, isFav, favCount) {
+  return { id: s.id, title: s.title, artist: s.artist || '', url: fileUrl(s.audio_url),
+    use_count: Number(s.use_count) || 0, fav_count: favCount == null ? undefined : Number(favCount),
+    is_fav: !!isFav, user_id: s.user_id, created_at: Number(s.created_at) };
+}
+app.post('/api/sounds', auth, uploadAudio.single('audio'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'aucun audio reçu' });
+    const title = String((req.body || {}).title || '').trim().slice(0, 80);
+    if (!title) return res.status(400).json({ error: 'titre requis' });
+    const artist = String((req.body || {}).artist || '').trim().slice(0, 80);
+    const url = await storeAudio(req.file);
+    const id = await insertId('INSERT INTO sounds(user_id,title,artist,audio_url,created_at) VALUES(?,?,?,?,?)',
+      req.userId, title, artist, url, now());
+    const s = await get1('SELECT * FROM sounds WHERE id=?', id);
+    res.json({ sound: soundJSON(s) });
+  } catch (e) { res.status(500).json({ error: 'échec du téléversement' }); }
+});
+app.get('/api/sounds/trending', async (req, res) => {
+  const rows = await allRows('SELECT * FROM sounds ORDER BY use_count DESC, created_at DESC LIMIT 20');
+  res.json({ sounds: rows.map(s => soundJSON(s)) });
+});
+app.get('/api/sounds/search', async (req, res) => {
+  const q = '%' + String(req.query.q || '').toLowerCase() + '%';
+  const rows = await allRows('SELECT * FROM sounds WHERE LOWER(title) LIKE ? OR LOWER(artist) LIKE ? ORDER BY use_count DESC LIMIT 20', q, q);
+  res.json({ sounds: rows.map(s => soundJSON(s)) });
+});
+app.get('/api/sounds/favs/mine', auth, async (req, res) => {
+  const rows = await allRows('SELECT s.* FROM sound_favs f JOIN sounds s ON s.id=f.sound_id WHERE f.user_id=? ORDER BY f.created_at DESC LIMIT 50', req.userId);
+  res.json({ sounds: rows.map(s => soundJSON(s, req.userId, true)) });
+});
+app.get('/api/sounds/:id', async (req, res) => {
+  const s = await get1('SELECT * FROM sounds WHERE id=?', req.params.id);
+  if (!s) return res.status(404).json({ error: 'son introuvable' });
+  const meId = await optUserId(req);
+  const fav = meId ? await get1('SELECT 1 FROM sound_favs WHERE user_id=? AND sound_id=?', meId, s.id) : null;
+  const fc = await get1('SELECT COUNT(*) AS c FROM sound_favs WHERE sound_id=?', s.id);
+  // vidéos utilisant ce son (le champ videos.sound contient le titre du son)
+  const vids = await allRows("SELECT * FROM videos WHERE LOWER(sound)=LOWER(?) AND hidden=0 AND (scheduled_at IS NULL OR scheduled_at<=?) ORDER BY created_at DESC LIMIT 20", s.title, now());
+  const videos = [];
+  for (const v of vids) { if (await canSeeVideo(v, meId)) videos.push(await videoJSON(v, meId)); }
+  res.json({ sound: soundJSON(s, meId, !!fav, Number(fc.c)), videos });
+});
+app.post('/api/sounds/:id/use', auth, async (req, res) => {
+  const s = await get1('SELECT * FROM sounds WHERE id=?', req.params.id);
+  if (!s) return res.status(404).json({ error: 'son introuvable' });
+  await runSql('UPDATE sounds SET use_count=use_count+1 WHERE id=?', s.id);
+  const u = await get1('SELECT * FROM sounds WHERE id=?', s.id);
+  res.json({ sound: soundJSON(u) });
+});
+app.post('/api/sounds/:id/fav', auth, async (req, res) => {
+  const s = await get1('SELECT * FROM sounds WHERE id=?', req.params.id);
+  if (!s) return res.status(404).json({ error: 'son introuvable' });
+  await insertIgnore('INSERT OR IGNORE INTO sound_favs(user_id,sound_id,created_at) VALUES(?,?,?)', req.userId, s.id, now());
+  res.json({ ok: true });
+});
+app.delete('/api/sounds/:id/fav', auth, async (req, res) => {
+  await runSql('DELETE FROM sound_favs WHERE user_id=? AND sound_id=?', req.userId, req.params.id);
+  res.json({ ok: true });
+});
+
+// ---------- pourboires sur une vidéo ----------
+app.post('/api/videos/:id/tip', auth, async (req, res) => {
+  try {
+    const v = await get1('SELECT * FROM videos WHERE id=?', req.params.id);
+    if (!v) return res.status(404).json({ error: 'vidéo introuvable' });
+    if (Number(v.user_id) === Number(req.userId)) return res.status(400).json({ error: 'impossible' });
+    const n = Math.floor(Number((req.body || {}).coins));
+    if (!n || n < 1 || n > 10000) return res.status(400).json({ error: 'montant invalide (1 à 10000 pièces)' });
+    const me = await get1('SELECT * FROM users WHERE id=?', req.userId);
+    if (!me || me.coins < n) return res.status(400).json({ error: 'pas assez de pièces' });
+    await runSql('UPDATE users SET coins=coins-? WHERE id=?', n, req.userId);
+    await runSql('UPDATE users SET coins=coins+? WHERE id=?', n, v.user_id);
+    await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
+      req.userId, -n, 'pourboire vidéo #' + v.id, now());
+    await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
+      v.user_id, n, 'pourboire reçu vidéo #' + v.id, now());
+    await runSql('INSERT INTO tips(video_id,from_user_id,to_user_id,coins,created_at) VALUES(?,?,?,?,?)',
+      v.id, req.userId, v.user_id, n, now());
+    await notify(v.user_id, 'tip', req.userId, v.id, String(n));
+    res.json({ ok: true, coins: me.coins - n });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+
+// ---------- abonnements payants aux créateurs ----------
+app.post('/api/users/:username/subscribe', auth, async (req, res) => {
+  try {
+    const u = await get1('SELECT * FROM users WHERE username=?', String(req.params.username).toLowerCase());
+    if (!u) return res.status(404).json({ error: 'utilisateur introuvable' });
+    if (Number(u.id) === Number(req.userId)) return res.status(400).json({ error: 'impossible' });
+    const price = Math.floor(Number((req.body || {}).price));
+    if (!price || price < 10 || price > 100000) return res.status(400).json({ error: 'prix invalide (10 à 100000 pièces)' });
+    const me = await get1('SELECT * FROM users WHERE id=?', req.userId);
+    if (!me || me.coins < price) return res.status(400).json({ error: 'pas assez de pièces' });
+    await runSql('UPDATE users SET coins=coins-? WHERE id=?', price, req.userId);
+    await runSql('UPDATE users SET coins=coins+? WHERE id=?', price, u.id);
+    await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
+      req.userId, -price, 'abonnement @' + u.username, now());
+    await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
+      u.id, price, 'abonnement reçu', now());
+    const t = now(), exp = t + 30 * 86400000;
+    const cur = await get1('SELECT * FROM creator_subs WHERE creator_id=? AND subscriber_id=? AND active=1 AND expires_at>?', u.id, req.userId, t);
+    if (cur) {
+      await runSql('UPDATE creator_subs SET expires_at=?, price_coins=? WHERE id=?', Number(cur.expires_at) + 30 * 86400000, price, cur.id);
+    } else {
+      await insertId('INSERT INTO creator_subs(creator_id,subscriber_id,price_coins,started_at,expires_at,active,created_at) VALUES(?,?,?,?,?,1,?)',
+        u.id, req.userId, price, t, exp, t);
+    }
+    const sub = await get1('SELECT * FROM creator_subs WHERE creator_id=? AND subscriber_id=? AND active=1 ORDER BY expires_at DESC', u.id, req.userId);
+    await notify(u.id, 'subscribe', req.userId, null, '');
+    res.json({ ok: true, expires_at: Number(sub.expires_at) });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.get('/api/users/:username/subscription', auth, async (req, res) => {
+  const u = await get1('SELECT * FROM users WHERE username=?', String(req.params.username).toLowerCase());
+  if (!u) return res.status(404).json({ error: 'utilisateur introuvable' });
+  const s = await get1('SELECT * FROM creator_subs WHERE creator_id=? AND subscriber_id=? AND active=1 AND expires_at>? ORDER BY expires_at DESC',
+    u.id, req.userId, now());
+  res.json({ subscription: s ? { active: true, expires_at: Number(s.expires_at), price_coins: Number(s.price_coins) } : { active: false } });
+});
+// désactive les abonnements expirés (toutes les 24 h)
+async function expireSubs() {
+  try { await runSql('UPDATE creator_subs SET active=0 WHERE active=1 AND expires_at<=?', now()); } catch (e) {}
+}
+
 // ---------- publication programmée : publie les vidéos dont l'heure est passée ----------
 async function publishDue() {
   try {
@@ -2195,6 +2728,8 @@ async function publishDue() {
 initDb().then(() => {
   publishDue();
   setInterval(publishDue, 60000); // vérifie les publications dues toutes les 60 s
+  expireSubs();
+  setInterval(expireSubs, 86400000); // désactive les abonnements expirés toutes les 24 h
   const server = app.listen(PORT, () => console.log(
     `VidiGagne Server v2 sur http://localhost:${PORT} (db=${USE_PG ? 'postgres' : 'sqlite'}, storage=${USE_CLOUDINARY ? 'cloudinary' : 'local'})`));
   setupLiveWs(server);
