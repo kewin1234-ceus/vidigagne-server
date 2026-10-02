@@ -588,7 +588,21 @@ CREATE TABLE IF NOT EXISTS family_settings(
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS storage_bytes BIGINT DEFAULT 0`); // v1.54 : quota stockage
     await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS audio_url TEXT DEFAULT ''`); // v1.57 : messages vocaux
     await pool.query(`ALTER TABLE group_messages ADD COLUMN IF NOT EXISTS audio_url TEXT DEFAULT ''`);
-    await pool.query(`ALTER TABLE videos ADD COLUMN IF NOT EXISTS phash TEXT DEFAULT ''`); // v1.60 : badges vérifiés demandables
+    await pool.query(`ALTER TABLE videos ADD COLUMN IF NOT EXISTS phash TEXT DEFAULT ''`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS calls(
+      id SERIAL PRIMARY KEY, caller_id INTEGER NOT NULL, callee_id INTEGER NOT NULL,
+      ctype TEXT NOT NULL DEFAULT 'video', status TEXT NOT NULL DEFAULT 'ringing',
+      created_at BIGINT NOT NULL, ended_at BIGINT)`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS call_signals(
+      id SERIAL PRIMARY KEY, call_id INTEGER NOT NULL, to_user_id INTEGER NOT NULL,
+      from_user_id INTEGER NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL,
+      created_at BIGINT NOT NULL)`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS pk_battles(
+      id SERIAL PRIMARY KEY, live_a_id INTEGER NOT NULL, live_b_id INTEGER NOT NULL,
+      user_a_id INTEGER NOT NULL, user_b_id INTEGER NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending', score_a INTEGER NOT NULL DEFAULT 0,
+      score_b INTEGER NOT NULL DEFAULT 0, winner_id INTEGER,
+      created_at BIGINT NOT NULL, starts_at BIGINT, ends_at BIGINT)`); // v1.60 : badges vérifiés demandables
 app.post('/api/verification/request', auth, async (req, res) => {
   try {
     const u = await get1('SELECT verified FROM users WHERE id=?', req.userId);
@@ -636,6 +650,186 @@ app.post('/api/admin/verification/:id', async (req, res) => {
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
+// v1.61 : battles PK entre deux lives
+const PK_DURATION_MS = 5 * 60 * 1000;
+async function activePkForLive(liveId) {
+  const b = await get1(`SELECT * FROM pk_battles WHERE status IN ('pending','active')
+    AND (live_a_id=? OR live_b_id=?) ORDER BY id DESC LIMIT 1`, liveId, liveId);
+  if (!b) return null;
+  if (b.status === 'active' && b.ends_at && now() > Number(b.ends_at)) {
+    const winner = Number(b.score_a) >= Number(b.score_b) ? b.user_a_id : b.user_b_id;
+    await runSql('UPDATE pk_battles SET status=?, winner_id=? WHERE id=?', 'ended', winner, b.id);
+    b.status = 'ended'; b.winner_id = winner;
+  }
+  return b;
+}
+async function pkPublic(b) {
+  if (!b) return null;
+  const ua = await get1('SELECT id,username,avatar FROM users WHERE id=?', b.user_a_id);
+  const ub = await get1('SELECT id,username,avatar FROM users WHERE id=?', b.user_b_id);
+  return { id: b.id, status: b.status, score_a: b.score_a, score_b: b.score_b,
+    ends_at: b.ends_at ? Number(b.ends_at) : null, winner_id: b.winner_id || null,
+    user_a: ua, user_b: ub, live_a_id: b.live_a_id, live_b_id: b.live_b_id };
+}
+app.post('/api/live/:id/pk/invite', auth, async (req, res) => {
+  try {
+    const l = await liveById(req.params.id);
+    if (!l || l.ended_at) return res.status(404).json({ error: 'live introuvable' });
+    if (Number(l.user_id) !== Number(req.userId)) return res.status(403).json({ error: 'réservé au diffuseur' });
+    if (await activePkForLive(l.id)) return res.status(400).json({ error: 'un battle est déjà en cours' });
+    const targetName = String((req.body || {}).username || '').trim().replace(/^@/, '');
+    if (!targetName) return res.status(400).json({ error: 'pseudo requis' });
+    const tu = await get1('SELECT id,username FROM users WHERE LOWER(username)=LOWER(?)', targetName);
+    if (!tu) return res.status(404).json({ error: 'utilisateur introuvable' });
+    if (Number(tu.id) === Number(req.userId)) return res.status(400).json({ error: 'impossible de se défier soi-même' });
+    const tl = await get1('SELECT * FROM lives WHERE user_id=? AND ended_at IS NULL ORDER BY id DESC LIMIT 1', tu.id);
+    if (!tl) return res.status(400).json({ error: '@' + tu.username + " n'est pas en live" });
+    if (await activePkForLive(tl.id)) return res.status(400).json({ error: 'cet utilisateur est déjà en battle' });
+    const id = await insertId(`INSERT INTO pk_battles(live_a_id,live_b_id,user_a_id,user_b_id,status,created_at)
+      VALUES(?,?,?,?,?,?)`, l.id, tl.id, req.userId, tu.id, 'pending', now());
+    await notify(tu.id, 'system', req.userId, null, '⚔️ Défi PK reçu ! Accepte-le depuis ton live.');
+    res.json({ ok: true, battle_id: id });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.post('/api/pk/:battleId/respond', auth, async (req, res) => {
+  try {
+    const b = await get1('SELECT * FROM pk_battles WHERE id=?', req.params.battleId);
+    if (!b || b.status !== 'pending') return res.status(404).json({ error: 'défi introuvable' });
+    if (Number(b.user_b_id) !== Number(req.userId)) return res.status(403).json({ error: 'non autorisé' });
+    if (String((req.body || {}).action) === 'accept') {
+      const ends = now() + PK_DURATION_MS;
+      await runSql(`UPDATE pk_battles SET status='active', starts_at=?, ends_at=? WHERE id=?`, now(), ends, b.id);
+      await notify(b.user_a_id, 'system', req.userId, null, '⚔️ Défi PK accepté ! Que le meilleur gagne !');
+      res.json({ ok: true, ends_at: ends });
+    } else {
+      await runSql(`UPDATE pk_battles SET status='rejected' WHERE id=?`, b.id);
+      await notify(b.user_a_id, 'system', req.userId, null, 'Ton défi PK a été refusé.');
+      res.json({ ok: true });
+    }
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.get('/api/live/:id/pk', async (req, res) => {
+  try {
+    const l = await liveById(req.params.id);
+    if (!l) return res.status(404).json({ error: 'live introuvable' });
+    res.json({ battle: await pkPublic(await activePkForLive(l.id)) });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.get('/api/pk/pending', auth, async (req, res) => {
+  try {
+    const rows = await allRows(`SELECT * FROM pk_battles WHERE user_b_id=? AND status='pending' ORDER BY id DESC LIMIT 10`, req.userId);
+    const out = [];
+    for (const b of rows) out.push(await pkPublic(b));
+    res.json({ pending: out });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.post('/api/pk/:battleId/end', auth, async (req, res) => {
+  try {
+    const b = await get1('SELECT * FROM pk_battles WHERE id=?', req.params.battleId);
+    if (!b || b.status !== 'active') return res.status(404).json({ error: 'battle introuvable' });
+    if (Number(b.user_a_id) !== Number(req.userId) && Number(b.user_b_id) !== Number(req.userId))
+      return res.status(403).json({ error: 'non autorisé' });
+    const winner = Number(b.score_a) >= Number(b.score_b) ? b.user_a_id : b.user_b_id;
+    await runSql(`UPDATE pk_battles SET status='ended', winner_id=? WHERE id=?`, winner, b.id);
+    res.json({ ok: true, winner_id: winner });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// v1.61 : appels audio/vidéo 1-à-1
+app.post('/api/calls/start', auth, async (req, res) => {
+  try {
+    const targetName = String((req.body || {}).username || '').trim().replace(/^@/, '');
+    const ctype = String((req.body || {}).ctype || 'video') === 'audio' ? 'audio' : 'video';
+    if (!targetName) return res.status(400).json({ error: 'pseudo requis' });
+    const tu = await get1('SELECT id,username FROM users WHERE LOWER(username)=LOWER(?)', targetName);
+    if (!tu) return res.status(404).json({ error: 'utilisateur introuvable' });
+    if (Number(tu.id) === Number(req.userId)) return res.status(400).json({ error: 'impossible de s’appeler soi-même' });
+    const busy = await get1(`SELECT id FROM calls WHERE status IN ('ringing','active')
+      AND (caller_id=? OR callee_id=? OR caller_id=? OR callee_id=?) LIMIT 1`,
+      req.userId, req.userId, tu.id, tu.id);
+    if (busy) return res.status(400).json({ error: 'ligne occupée' });
+    const me = await get1('SELECT username FROM users WHERE id=?', req.userId);
+    const id = await insertId(`INSERT INTO calls(caller_id,callee_id,ctype,status,created_at)
+      VALUES(?,?,?,?,?)`, req.userId, tu.id, ctype, 'ringing', now());
+    // notifie instantanément via le WebSocket push (type=call)
+    try {
+      const ws = pushSockets.get(Number(tu.id));
+      if (ws && ws.readyState === 1)
+        ws.send(JSON.stringify({ t: 'push', type: 'call', call_id: id, ctype,
+          actor: me ? me.username : '', text: 'Appel entrant' }));
+    } catch (_) {}
+    await notify(tu.id, 'call', req.userId, null, '📞 Appel ' + (ctype === 'audio' ? 'audio' : 'vidéo') + ' entrant');
+    res.json({ ok: true, call_id: id });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.post('/api/calls/:id/respond', auth, async (req, res) => {
+  try {
+    const c = await get1('SELECT * FROM calls WHERE id=?', req.params.id);
+    if (!c || c.status !== 'ringing') return res.status(404).json({ error: 'appel introuvable' });
+    if (Number(c.callee_id) !== Number(req.userId)) return res.status(403).json({ error: 'non autorisé' });
+    const action = String((req.body || {}).action);
+    if (action === 'accept') {
+      await runSql(`UPDATE calls SET status='active' WHERE id=?`, c.id);
+      try {
+        const ws = pushSockets.get(Number(c.caller_id));
+        if (ws && ws.readyState === 1)
+          ws.send(JSON.stringify({ t: 'call_accepted', call_id: c.id }));
+      } catch (_) {}
+      res.json({ ok: true });
+    } else {
+      await runSql(`UPDATE calls SET status='rejected', ended_at=? WHERE id=?`, now(), c.id);
+      res.json({ ok: true });
+    }
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.post('/api/calls/:id/end', auth, async (req, res) => {
+  try {
+    const c = await get1('SELECT * FROM calls WHERE id=?', req.params.id);
+    if (!c) return res.status(404).json({ error: 'appel introuvable' });
+    if (Number(c.caller_id) !== Number(req.userId) && Number(c.callee_id) !== Number(req.userId))
+      return res.status(403).json({ error: 'non autorisé' });
+    await runSql(`UPDATE calls SET status='ended', ended_at=? WHERE id=? AND status IN ('ringing','active')`, now(), c.id);
+    try {
+      const other = Number(c.caller_id) === Number(req.userId) ? c.callee_id : c.caller_id;
+      const ws = pushSockets.get(Number(other));
+      if (ws && ws.readyState === 1)
+        ws.send(JSON.stringify({ t: 'call_ended', call_id: c.id }));
+    } catch (_) {}
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.get('/api/calls/:id', auth, async (req, res) => {
+  try {
+    const c = await get1('SELECT * FROM calls WHERE id=?', req.params.id);
+    if (!c) return res.status(404).json({ error: 'appel introuvable' });
+    if (Number(c.caller_id) !== Number(req.userId) && Number(c.callee_id) !== Number(req.userId))
+      return res.status(403).json({ error: 'non autorisé' });
+    res.json({ call: c });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.post('/api/calls/:id/signal', auth, async (req, res) => {
+  try {
+    const c = await get1('SELECT * FROM calls WHERE id=?', req.params.id);
+    if (!c || c.status === 'ended') return res.status(404).json({ error: 'appel introuvable' });
+    const b = req.body || {};
+    const kind = String(b.kind || '');
+    if (!['offer', 'answer', 'candidate'].includes(kind)) return res.status(400).json({ error: 'kind invalide' });
+    const to = Number(c.caller_id) === Number(req.userId) ? c.callee_id : c.caller_id;
+    await runSql(`INSERT INTO call_signals(call_id,to_user_id,from_user_id,kind,payload,created_at)
+      VALUES(?,?,?,?,?,?)`, c.id, to, req.userId, kind, String(b.payload || '').slice(0, 20000), now());
+    await runSql('DELETE FROM call_signals WHERE created_at<?', now() - 600000).catch(() => {});
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.get('/api/calls/:id/signal', auth, async (req, res) => {
+  try {
+    const c = await get1('SELECT * FROM calls WHERE id=?', req.params.id);
+    if (!c) return res.status(404).json({ error: 'appel introuvable' });
+    const since = Number(req.query.since) || 0;
+    const rows = await allRows(`SELECT * FROM call_signals WHERE call_id=? AND id>? AND to_user_id=?
+      ORDER BY id ASC LIMIT 50`, c.id, since, req.userId);
+    res.json({ signals: rows.map(s => ({ id: s.id, kind: s.kind, from: s.from_user_id, payload: s.payload })) });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
 // v1.58 : recherche par image
     await pool.query(`CREATE TABLE IF NOT EXISTS verification_requests(
       id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL UNIQUE, status TEXT NOT NULL DEFAULT 'pending',
@@ -661,6 +855,20 @@ app.post('/api/admin/verification/:id', async (req, res) => {
     lite.exec(`CREATE TABLE IF NOT EXISTS verification_requests(
       id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL UNIQUE, status TEXT NOT NULL DEFAULT 'pending',
       reason TEXT NOT NULL DEFAULT '', created_at BIGINT NOT NULL, reviewed_at BIGINT)`);
+    lite.exec(`CREATE TABLE IF NOT EXISTS pk_battles(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, live_a_id INTEGER NOT NULL, live_b_id INTEGER NOT NULL,
+      user_a_id INTEGER NOT NULL, user_b_id INTEGER NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending', score_a INTEGER NOT NULL DEFAULT 0,
+      score_b INTEGER NOT NULL DEFAULT 0, winner_id INTEGER,
+      created_at BIGINT NOT NULL, starts_at BIGINT, ends_at BIGINT)`);
+    lite.exec(`CREATE TABLE IF NOT EXISTS calls(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, caller_id INTEGER NOT NULL, callee_id INTEGER NOT NULL,
+      ctype TEXT NOT NULL DEFAULT 'video', status TEXT NOT NULL DEFAULT 'ringing',
+      created_at BIGINT NOT NULL, ended_at BIGINT)`);
+    lite.exec(`CREATE TABLE IF NOT EXISTS call_signals(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, call_id INTEGER NOT NULL, to_user_id INTEGER NOT NULL,
+      from_user_id INTEGER NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL,
+      created_at BIGINT NOT NULL)`);
     { const vc = lite.prepare(`PRAGMA table_info(videos)`).all().map(c => c.name);
       if (!vc.includes('phash')) lite.exec(`ALTER TABLE videos ADD COLUMN phash TEXT DEFAULT ''`); }
     for (const c of ['first_name', 'last_name', 'birthdate']) {
@@ -3696,6 +3904,13 @@ app.post('/api/live/:id/gift', auth, async (req, res) => {
     if (!l) return res.status(404).json({ error: 'live introuvable' });
     if (l.ended_at) return res.status(403).json({ error: 'live terminé' });
     const g = GIFT_CATALOG.find(x => x.id === String((req.body || {}).gift_id || ''));
+    try {
+      const _pkb = await activePkForLive(l.id);
+      if (_pkb && _pkb.status === 'active') {
+        const col = Number(_pkb.user_a_id) === Number(l.user_id) ? 'score_a' : 'score_b';
+        await runSql('UPDATE pk_battles SET ' + col + '=' + col + '+? WHERE id=?', g.coins || 1, _pkb.id);
+      }
+    } catch (_) {}
     if (!g) return res.status(400).json({ error: 'cadeau inconnu' });
     const me = await get1('SELECT * FROM users WHERE id=?', req.userId);
     if (!me) return res.status(400).json({ error: 'compte introuvable' });
