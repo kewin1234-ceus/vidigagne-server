@@ -192,6 +192,45 @@ CREATE TABLE IF NOT EXISTS receipts(
   status TEXT NOT NULL DEFAULT 'pending',
   email_status TEXT NOT NULL DEFAULT 'pending',
   created_at BIGINT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS conversations(
+  id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+  user1_id INTEGER NOT NULL,
+  user2_id INTEGER NOT NULL,
+  created_at BIGINT NOT NULL,
+  updated_at BIGINT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS conv_pair_uidx ON conversations(user1_id, user2_id);
+CREATE TABLE IF NOT EXISTS messages(
+  id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+  conversation_id INTEGER NOT NULL,
+  sender_id INTEGER NOT NULL,
+  text TEXT NOT NULL,
+  created_at BIGINT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS conversation_reads(
+  conversation_id INTEGER NOT NULL,
+  user_id INTEGER NOT NULL,
+  last_read_at BIGINT NOT NULL DEFAULT 0,
+  PRIMARY KEY(conversation_id, user_id)
+);
+CREATE TABLE IF NOT EXISTS polls(
+  id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+  video_id INTEGER UNIQUE NOT NULL,
+  question TEXT NOT NULL,
+  created_at BIGINT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS poll_options(
+  id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+  poll_id INTEGER NOT NULL,
+  text TEXT NOT NULL,
+  votes INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS poll_votes(
+  poll_id INTEGER NOT NULL,
+  user_id INTEGER NOT NULL,
+  option_id INTEGER NOT NULL,
+  PRIMARY KEY(poll_id, user_id)
 );`;
   if (USE_PG) { await pool.query(schema); }
   else { lite.exec(schema); }
@@ -227,6 +266,10 @@ CREATE TABLE IF NOT EXISTS receipts(
   await mig('id_verifications', 'expiry', `TEXT`);
   await mig('comments', 'likes', `INTEGER NOT NULL DEFAULT 0`);
   await mig('comments', 'pinned', `INTEGER NOT NULL DEFAULT 0`);
+  // serveur v8 : publication programmée, badge vérifié, commentaires vidéo
+  await mig('videos', 'scheduled_at', `BIGINT`);
+  await mig('users', 'verified', `INTEGER NOT NULL DEFAULT 0`);
+  await mig('comments', 'video_url', `TEXT`);
 }
 
 // une ligne ou undefined
@@ -321,7 +364,7 @@ async function auth(req, res, next) {
   next();
 }
 function pubUser(u) {
-  return { id: u.id, username: u.username, name: u.name, avatar: u.avatar, bio: u.bio };
+  return { id: u.id, username: u.username, name: u.name, avatar: u.avatar, bio: u.bio, verified: !!u.verified };
 }
 async function videoJSON(v, meId) {
   const u = await get1('SELECT * FROM users WHERE id=?', v.user_id);
@@ -432,10 +475,14 @@ app.post('/api/videos', auth, upload.single('video'), async (req, res) => {
     const fname = await storeVideo(req.file);
     const b = req.body || {};
     const descText = String(b.description || b.desc || '').slice(0, 500);
+    // publication programmée : scheduled_at (ms) doit être dans le futur, sinon publication immédiate
+    let scheduledAt = null;
+    const schRaw = Number(b.scheduled_at);
+    if (b.scheduled_at && schRaw > now()) scheduledAt = schRaw;
     const id = await insertId(
-      'INSERT INTO videos(user_id,file,description,tags,sound,duration,created_at) VALUES(?,?,?,?,?,?,?)',
+      'INSERT INTO videos(user_id,file,description,tags,sound,duration,scheduled_at,created_at) VALUES(?,?,?,?,?,?,?,?)',
       req.userId, fname, descText, String(b.tags || '').slice(0, 300),
-      String(b.sound || '').slice(0, 120), Number(b.duration) || 0, now());
+      String(b.sound || '').slice(0, 120), Number(b.duration) || 0, scheduledAt, now());
     // pièces : +10 par publication
     await runSql('UPDATE users SET coins=coins+10 WHERE id=?', req.userId);
     await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
@@ -1075,12 +1122,15 @@ app.get('/api/feed', async (req, res) => {
     if (m) { const t = await get1('SELECT user_id FROM tokens WHERE token=?', m[1]); if (t) meId = t.user_id; }
     const mode = req.query.mode === 'following' && meId ? 'following' : 'foryou';
     let rows;
+    // les vidéos programmées (scheduled_at futur) sont exclues du feed public
     if (mode === 'following') {
       rows = await allRows(
         `SELECT v.* FROM videos v JOIN follows f ON f.followed_id=v.user_id
-         WHERE f.follower_id=? ORDER BY v.created_at DESC LIMIT 50`, meId);
+         WHERE f.follower_id=? AND (v.scheduled_at IS NULL OR v.scheduled_at <= ?)
+         ORDER BY v.created_at DESC LIMIT 50`, meId, now());
     } else {
-      rows = await allRows('SELECT * FROM videos ORDER BY created_at DESC LIMIT 50');
+      rows = await allRows(
+        'SELECT * FROM videos WHERE (scheduled_at IS NULL OR scheduled_at <= ?) ORDER BY created_at DESC LIMIT 50', now());
     }
     const videos = [];
     for (const v of rows) videos.push(await videoJSON(v, meId));
@@ -1088,9 +1138,30 @@ app.get('/api/feed', async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 
+// mes vidéos, y compris celles programmées (avec leur scheduled_at)
+app.get('/api/videos/mine', auth, async (req, res) => {
+  try {
+    const rows = await allRows('SELECT * FROM videos WHERE user_id=? ORDER BY created_at DESC', req.userId);
+    const videos = [];
+    for (const v of rows) {
+      const j = await videoJSON(v, req.userId);
+      j.scheduled_at = v.scheduled_at ? Number(v.scheduled_at) : null;
+      videos.push(j);
+    }
+    res.json({ videos });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
 app.get('/api/videos/:id', async (req, res) => {
   const v = await get1('SELECT * FROM videos WHERE id=?', req.params.id);
   if (!v) return res.status(404).json({ error: 'vidéo introuvable' });
+  // vidéo programmée : seul le propriétaire peut la voir avant l'heure de publication
+  if (v.scheduled_at && Number(v.scheduled_at) > now()) {
+    const h = req.headers.authorization || '';
+    const m = h.match(/^Bearer (.+)$/);
+    let meId = null;
+    if (m) { const t = await get1('SELECT user_id FROM tokens WHERE token=?', m[1]); if (t) meId = t.user_id; }
+    if (!meId || Number(meId) !== Number(v.user_id)) return res.status(404).json({ error: 'vidéo introuvable' });
+  }
   res.json({ video: await videoJSON(v, null) });
 });
 // ---------- vues : comptage anti-triche ----------
@@ -1166,20 +1237,218 @@ app.get('/api/videos/:id/comments', async (req, res) => {
   res.json({ comments: rows });
 });
 
-app.post('/api/videos/:id/comments', auth, async (req, res) => {
+app.post('/api/videos/:id/comments', auth, upload.single('video'), async (req, res) => {
   try {
     const text = String((req.body || {}).text || '').trim().slice(0, 500);
     if (!text) return res.status(400).json({ error: 'commentaire vide' });
     const v = await get1('SELECT 1 FROM videos WHERE id=?', req.params.id);
     if (!v) return res.status(404).json({ error: 'vidéo introuvable' });
+    // réponse vidéo optionnelle (même stockage que l'upload de vidéo)
+    let videoUrl = null;
+    if (req.file) videoUrl = fileUrl(await storeVideo(req.file));
     const replyTo = (req.body || {}).reply_to || null;
     const id = await insertId(
-      'INSERT INTO comments(video_id,user_id,text,reply_to,created_at) VALUES(?,?,?,?,?)',
-      req.params.id, req.userId, text, replyTo, now());
+      'INSERT INTO comments(video_id,user_id,text,reply_to,video_url,created_at) VALUES(?,?,?,?,?,?)',
+      req.params.id, req.userId, text, replyTo, videoUrl, now());
     const c = await get1(
       `SELECT c.*, u.username, u.name, u.avatar FROM comments c
        JOIN users u ON u.id=c.user_id WHERE c.id=?`, id);
     res.json({ comment: c });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+
+// ==================== SERVEUR v8 ====================
+// ---------- messages privés ----------
+async function convOf(convId, userId) {
+  const c = await get1('SELECT * FROM conversations WHERE id=?', convId);
+  if (!c) return null;
+  if (Number(c.user1_id) !== Number(userId) && Number(c.user2_id) !== Number(userId)) return null;
+  return c;
+}
+// trouve ou crée la conversation avec un utilisateur
+app.post('/api/conversations', auth, async (req, res) => {
+  try {
+    const username = String((req.body || {}).username || '').toLowerCase().trim();
+    if (!username) return res.status(400).json({ error: 'pseudo requis' });
+    const other = await get1('SELECT * FROM users WHERE username=?', username);
+    if (!other) return res.status(404).json({ error: 'utilisateur introuvable' });
+    if (Number(other.id) === Number(req.userId))
+      return res.status(400).json({ error: 'impossible de se parler à soi-même' });
+    const a = Math.min(Number(req.userId), Number(other.id));
+    const b = Math.max(Number(req.userId), Number(other.id));
+    let conv = await get1('SELECT * FROM conversations WHERE user1_id=? AND user2_id=?', a, b);
+    if (!conv) {
+      const id = await insertId(
+        'INSERT INTO conversations(user1_id,user2_id,created_at,updated_at) VALUES(?,?,?,?)',
+        a, b, now(), now());
+      conv = await get1('SELECT * FROM conversations WHERE id=?', id);
+    }
+    res.json({ id: conv.id });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// liste de mes conversations
+app.get('/api/conversations', auth, async (req, res) => {
+  try {
+    const rows = await allRows(
+      'SELECT * FROM conversations WHERE user1_id=? OR user2_id=? ORDER BY updated_at DESC',
+      req.userId, req.userId);
+    const out = [];
+    for (const c of rows) {
+      const otherId = Number(c.user1_id) === Number(req.userId) ? c.user2_id : c.user1_id;
+      const ou = await get1('SELECT * FROM users WHERE id=?', otherId);
+      const last = await get1('SELECT * FROM messages WHERE conversation_id=? ORDER BY id DESC LIMIT 1', c.id);
+      const read = await get1('SELECT last_read_at FROM conversation_reads WHERE conversation_id=? AND user_id=?',
+        c.id, req.userId);
+      const since = read ? Number(read.last_read_at) : 0;
+      const unread = Number((await get1(
+        'SELECT COUNT(*) AS c FROM messages WHERE conversation_id=? AND sender_id!=? AND created_at>?',
+        c.id, req.userId, since)).c);
+      out.push({
+        id: c.id,
+        other: ou ? pubUser(ou) : null,
+        last_text: last ? last.text : null,
+        last_at: last ? Number(last.created_at) : Number(c.updated_at),
+        unread: unread,
+      });
+    }
+    res.json({ conversations: out });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// messages d'une conversation (50 derniers, ou avant ?before=)
+app.get('/api/conversations/:id/messages', auth, async (req, res) => {
+  try {
+    const c = await convOf(req.params.id, req.userId);
+    if (!c) return res.status(404).json({ error: 'conversation introuvable' });
+    const before = Number(req.query.before) || 0;
+    const rows = before > 0
+      ? await allRows('SELECT * FROM messages WHERE conversation_id=? AND id<? ORDER BY id DESC LIMIT 50', c.id, before)
+      : await allRows('SELECT * FROM messages WHERE conversation_id=? ORDER BY id DESC LIMIT 50', c.id);
+    rows.reverse(); // ordre chronologique
+    res.json({ messages: rows.map(function (m) {
+      return { id: m.id, sender_id: m.sender_id, text: m.text, created_at: Number(m.created_at) };
+    }) });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// envoyer un message
+app.post('/api/conversations/:id/messages', auth, async (req, res) => {
+  try {
+    const c = await convOf(req.params.id, req.userId);
+    if (!c) return res.status(404).json({ error: 'conversation introuvable' });
+    const text = String((req.body || {}).text || '').trim().slice(0, 2000);
+    if (!text) return res.status(400).json({ error: 'message vide' });
+    const t = now();
+    const id = await insertId(
+      'INSERT INTO messages(conversation_id,sender_id,text,created_at) VALUES(?,?,?,?)',
+      c.id, req.userId, text, t);
+    await runSql('UPDATE conversations SET updated_at=? WHERE id=?', t, c.id);
+    // l'expéditeur a lu son propre message
+    await insertIgnore('INSERT OR IGNORE INTO conversation_reads(conversation_id,user_id,last_read_at) VALUES(?,?,?)',
+      c.id, req.userId, t);
+    await runSql('UPDATE conversation_reads SET last_read_at=? WHERE conversation_id=? AND user_id=?',
+      t, c.id, req.userId);
+    const m = await get1('SELECT * FROM messages WHERE id=?', id);
+    res.json({ message: { id: m.id, sender_id: m.sender_id, text: m.text, created_at: Number(m.created_at) } });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// marquer une conversation comme lue
+app.post('/api/conversations/:id/read', auth, async (req, res) => {
+  try {
+    const c = await convOf(req.params.id, req.userId);
+    if (!c) return res.status(404).json({ error: 'conversation introuvable' });
+    const t = now();
+    await insertIgnore('INSERT OR IGNORE INTO conversation_reads(conversation_id,user_id,last_read_at) VALUES(?,?,?)',
+      c.id, req.userId, t);
+    await runSql('UPDATE conversation_reads SET last_read_at=? WHERE conversation_id=? AND user_id=?',
+      t, c.id, req.userId);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+
+// ---------- sondages sur les vidéos ----------
+async function pollJSON(pollId, meId) {
+  const p = await get1('SELECT * FROM polls WHERE id=?', pollId);
+  if (!p) return null;
+  const options = await allRows('SELECT id,text,votes FROM poll_options WHERE poll_id=? ORDER BY id ASC', pollId);
+  const mine = meId
+    ? await get1('SELECT option_id FROM poll_votes WHERE poll_id=? AND user_id=?', pollId, meId)
+    : null;
+  return {
+    id: p.id, video_id: p.video_id, question: p.question,
+    options: options.map(function (o) { return { id: o.id, text: o.text, votes: Number(o.votes) }; }),
+    my_vote: mine ? mine.option_id : null,
+  };
+}
+// créer un sondage (propriétaire de la vidéo uniquement)
+app.post('/api/videos/:id/poll', auth, async (req, res) => {
+  try {
+    const v = await get1('SELECT * FROM videos WHERE id=?', req.params.id);
+    if (!v) return res.status(404).json({ error: 'vidéo introuvable' });
+    if (Number(v.user_id) !== Number(req.userId))
+      return res.status(403).json({ error: 'seul le propriétaire peut créer un sondage' });
+    const question = String((req.body || {}).question || '').trim().slice(0, 200);
+    const opts = ((req.body || {}).options || [])
+      .map(function (o) { return String(o).trim().slice(0, 80); })
+      .filter(function (o) { return o; });
+    if (!question) return res.status(400).json({ error: 'question requise' });
+    if (opts.length < 2 || opts.length > 4)
+      return res.status(400).json({ error: '2 à 4 options requises' });
+    const ex = await get1('SELECT id FROM polls WHERE video_id=?', v.id);
+    if (ex) return res.status(409).json({ error: 'un sondage existe déjà sur cette vidéo' });
+    const pid = await insertId('INSERT INTO polls(video_id,question,created_at) VALUES(?,?,?)',
+      v.id, question, now());
+    for (const t of opts) await runSql('INSERT INTO poll_options(poll_id,text,votes) VALUES(?,?,0)', pid, t);
+    res.json({ poll: await pollJSON(pid, req.userId) });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// lire le sondage d'une vidéo
+app.get('/api/videos/:id/poll', async (req, res) => {
+  try {
+    const p = await get1('SELECT * FROM polls WHERE video_id=?', req.params.id);
+    if (!p) return res.status(404).json({ error: 'aucun sondage' });
+    const h = req.headers.authorization || '';
+    const m = h.match(/^Bearer (.+)$/);
+    let meId = null;
+    if (m) { const t = await get1('SELECT user_id FROM tokens WHERE token=?', m[1]); if (t) meId = t.user_id; }
+    res.json({ poll: await pollJSON(p.id, meId) });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// voter (1 vote par utilisateur, modifiable)
+app.post('/api/polls/:id/vote', auth, async (req, res) => {
+  try {
+    const p = await get1('SELECT * FROM polls WHERE id=?', req.params.id);
+    if (!p) return res.status(404).json({ error: 'sondage introuvable' });
+    const optId = Number((req.body || {}).option_id);
+    const opt = await get1('SELECT id FROM poll_options WHERE id=? AND poll_id=?', optId, p.id);
+    if (!opt) return res.status(400).json({ error: 'option invalide' });
+    const old = await get1('SELECT option_id FROM poll_votes WHERE poll_id=? AND user_id=?', p.id, req.userId);
+    if (old && Number(old.option_id) === optId)
+      return res.json({ poll: await pollJSON(p.id, req.userId) }); // déjà voté ici
+    if (old) {
+      // changement d'avis : on retire l'ancien vote
+      await runSql('UPDATE poll_options SET votes=votes-1 WHERE id=?', old.option_id);
+      await runSql('UPDATE poll_votes SET option_id=? WHERE poll_id=? AND user_id=?', optId, p.id, req.userId);
+    } else {
+      await insertIgnore('INSERT OR IGNORE INTO poll_votes(poll_id,user_id,option_id) VALUES(?,?,?)',
+        p.id, req.userId, optId);
+    }
+    await runSql('UPDATE poll_options SET votes=votes+1 WHERE id=?', optId);
+    res.json({ poll: await pollJSON(p.id, req.userId) });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+
+// ---------- badge vérifié (admin) ----------
+// protégé comme /api/fund/deposit : en-tête x-admin-token = ADMIN_TOKEN
+app.post('/api/admin/users/:id/verify', async (req, res) => {
+  try {
+    const token = req.headers['x-admin-token'];
+    if (!process.env.ADMIN_TOKEN || token !== process.env.ADMIN_TOKEN)
+      return res.status(403).json({ error: 'non autorisé' });
+    const u = await get1('SELECT * FROM users WHERE id=?', req.params.id);
+    if (!u) return res.status(404).json({ error: 'utilisateur introuvable' });
+    const v = (req.body || {}).verified ? 1 : 0;
+    await runSql('UPDATE users SET verified=? WHERE id=?', v, u.id);
+    const upd = await get1('SELECT * FROM users WHERE id=?', u.id);
+    res.json({ user: pubUser(upd) });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 
@@ -1203,7 +1472,8 @@ app.get('/api/users/:username', async (req, res) => {
   try {
     const u = await get1('SELECT * FROM users WHERE username=?', String(req.params.username).toLowerCase());
     if (!u) return res.status(404).json({ error: 'utilisateur introuvable' });
-    const vids = await allRows('SELECT * FROM videos WHERE user_id=? ORDER BY created_at DESC', u.id);
+    const vids = await allRows(
+      'SELECT * FROM videos WHERE user_id=? AND (scheduled_at IS NULL OR scheduled_at <= ?) ORDER BY created_at DESC', u.id, now());
     const followers = Number((await get1('SELECT COUNT(*) AS c FROM follows WHERE followed_id=?', u.id)).c);
     const following = Number((await get1('SELECT COUNT(*) AS c FROM follows WHERE follower_id=?', u.id)).c);
     const likes = Number((await get1(
@@ -1229,7 +1499,7 @@ app.get('/api/search', async (req, res) => {
     const users = await allRows(
       'SELECT id,username,name,avatar FROM users WHERE username LIKE ? OR name LIKE ? LIMIT 20', q, q);
     const vids = await allRows(
-      'SELECT * FROM videos WHERE LOWER(description) LIKE ? OR LOWER(tags) LIKE ? ORDER BY created_at DESC LIMIT 20', q, q);
+      'SELECT * FROM videos WHERE (LOWER(description) LIKE ? OR LOWER(tags) LIKE ?) AND (scheduled_at IS NULL OR scheduled_at <= ?) ORDER BY created_at DESC LIMIT 20', q, q, now());
     const videos = [];
     for (const v of vids) videos.push(await videoJSON(v, null));
     res.json({ users, videos });
@@ -1469,7 +1739,16 @@ app.get('/api/health', (req, res) => res.json({
   fbKey: process.env.FIREBASE_API_KEY || null,
 }));
 
+// ---------- publication programmée : publie les vidéos dont l'heure est passée ----------
+async function publishDue() {
+  try {
+    await runSql('UPDATE videos SET scheduled_at=NULL WHERE scheduled_at IS NOT NULL AND scheduled_at <= ?', now());
+  } catch (e) {}
+}
+
 initDb().then(() => {
+  publishDue();
+  setInterval(publishDue, 60000); // vérifie les publications dues toutes les 60 s
   const server = app.listen(PORT, () => console.log(
     `VidiGagne Server v2 sur http://localhost:${PORT} (db=${USE_PG ? 'postgres' : 'sqlite'}, storage=${USE_CLOUDINARY ? 'cloudinary' : 'local'})`));
   setupLiveWs(server);
