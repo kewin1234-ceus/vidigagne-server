@@ -2611,6 +2611,24 @@ app.get('/api/notifications', auth, async (req, res) => {
     res.json({ notifications: out });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
+// v1.56 : notifications non lues pour le poller natif (push serveur, pas seulement local)
+app.get('/api/notifications/unread', auth, async (req, res) => {
+  try {
+    const since = Number(req.query.since) || 0;
+    const rows = await allRows(
+      'SELECT * FROM notifications WHERE user_id=? AND is_read=0 AND id>? ORDER BY id ASC LIMIT 10',
+      req.userId, since);
+    const out = [];
+    for (const n of rows) {
+      const actor = n.actor_id ? await get1('SELECT username FROM users WHERE id=?', n.actor_id) : null;
+      out.push({ id: Number(n.id), type: n.type, text: n.text || '',
+        created_at: Number(n.created_at),
+        actor: actor ? { username: actor.username } : null });
+    }
+    res.json({ notifications: out });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+
 app.post('/api/notifications/read', auth, async (req, res) => {
   try {
     const id = Number((req.body || {}).id) || 0;
