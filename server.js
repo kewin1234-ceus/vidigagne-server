@@ -588,7 +588,58 @@ CREATE TABLE IF NOT EXISTS family_settings(
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS storage_bytes BIGINT DEFAULT 0`); // v1.54 : quota stockage
     await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS audio_url TEXT DEFAULT ''`); // v1.57 : messages vocaux
     await pool.query(`ALTER TABLE group_messages ADD COLUMN IF NOT EXISTS audio_url TEXT DEFAULT ''`);
-    await pool.query(`ALTER TABLE videos ADD COLUMN IF NOT EXISTS phash TEXT DEFAULT ''`); // v1.58 : recherche par image
+    await pool.query(`ALTER TABLE videos ADD COLUMN IF NOT EXISTS phash TEXT DEFAULT ''`); // v1.60 : badges vérifiés demandables
+app.post('/api/verification/request', auth, async (req, res) => {
+  try {
+    const u = await get1('SELECT verified FROM users WHERE id=?', req.userId);
+    if (u && u.verified) return res.status(400).json({ error: 'compte déjà vérifié' });
+    const reason = String((req.body || {}).reason || '').trim().slice(0, 500);
+    if (reason.length < 20) return res.status(400).json({ error: 'explique en 20 caractères minimum pourquoi tu mérites le badge' });
+    await runSql(`INSERT INTO verification_requests(user_id, status, reason, created_at)
+      VALUES(?, 'pending', ?, ?)
+      ON CONFLICT(user_id) DO UPDATE SET status='pending', reason=excluded.reason, created_at=excluded.created_at, reviewed_at=NULL`,
+      req.userId, reason, now());
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.get('/api/verification/status', auth, async (req, res) => {
+  try {
+    const u = await get1('SELECT verified FROM users WHERE id=?', req.userId);
+    const r = await get1('SELECT status FROM verification_requests WHERE user_id=?', req.userId);
+    res.json({ verified: !!(u && u.verified), status: r ? r.status : 'none' });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.get('/api/admin/verification', async (req, res) => {
+  const t = req.headers['x-admin-token'];
+  if (!process.env.ADMIN_TOKEN || t !== process.env.ADMIN_TOKEN) return res.status(403).json({ error: 'non autorisé' });
+  try {
+    const rows = await allRows(`SELECT vr.*, u.username FROM verification_requests vr
+      JOIN users u ON u.id=vr.user_id WHERE vr.status='pending' ORDER BY vr.created_at ASC LIMIT 100`);
+    res.json({ requests: rows });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.post('/api/admin/verification/:id', async (req, res) => {
+  const t = req.headers['x-admin-token'];
+  if (!process.env.ADMIN_TOKEN || t !== process.env.ADMIN_TOKEN) return res.status(403).json({ error: 'non autorisé' });
+  try {
+    const approve = String((req.body || {}).action) === 'approve';
+    const r = await get1('SELECT * FROM verification_requests WHERE id=?', req.params.id);
+    if (!r) return res.status(404).json({ error: 'introuvable' });
+    await runSql(`UPDATE verification_requests SET status=?, reviewed_at=? WHERE id=?`,
+      approve ? 'approved' : 'rejected', now(), r.id);
+    if (approve) {
+      await runSql('UPDATE users SET verified=1 WHERE id=?', r.user_id);
+      await notify(r.user_id, 'system', null, null, '✔️ Ton compte est maintenant vérifié !');
+    } else {
+      await notify(r.user_id, 'system', null, null, 'Ta demande de badge vérifié a été refusée.');
+    }
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// v1.58 : recherche par image
+    await pool.query(`CREATE TABLE IF NOT EXISTS verification_requests(
+      id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL UNIQUE, status TEXT NOT NULL DEFAULT 'pending',
+      reason TEXT NOT NULL DEFAULT '', created_at BIGINT NOT NULL, reviewed_at BIGINT)`);
     await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS users_email_uidx ON users(email)`);
     await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS users_google_uidx ON users(google_id)`);
     await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS users_phone_uidx ON users(phone)`);
@@ -607,6 +658,9 @@ CREATE TABLE IF NOT EXISTS family_settings(
       if (!mc.includes('audio_url')) lite.exec(`ALTER TABLE ${t} ADD COLUMN audio_url TEXT DEFAULT ''`);
     }
     // v1.58 : recherche par image (hash perceptuel)
+    lite.exec(`CREATE TABLE IF NOT EXISTS verification_requests(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL UNIQUE, status TEXT NOT NULL DEFAULT 'pending',
+      reason TEXT NOT NULL DEFAULT '', created_at BIGINT NOT NULL, reviewed_at BIGINT)`);
     { const vc = lite.prepare(`PRAGMA table_info(videos)`).all().map(c => c.name);
       if (!vc.includes('phash')) lite.exec(`ALTER TABLE videos ADD COLUMN phash TEXT DEFAULT ''`); }
     for (const c of ['first_name', 'last_name', 'birthdate']) {
@@ -941,12 +995,44 @@ async function optUserId(req) {
   } catch (e) { return null; }
 }
 // notifie un utilisateur (jamais soi-même)
+// v1.60 : sockets push instantané (userId -> ws)
+const pushSockets = new Map();
 async function notify(userId, type, actorId, videoId, text) {
   try {
     if (!userId || Number(userId) === Number(actorId)) return;
-    await runSql('INSERT INTO notifications(user_id,type,actor_id,video_id,text,is_read,created_at) VALUES(?,?,?,?,?,0,?)',
+    const id = await insertId('INSERT INTO notifications(user_id,type,actor_id,video_id,text,is_read,created_at) VALUES(?,?,?,?,?,0,?)',
       userId, type, actorId || null, videoId || null, String(text || '').slice(0, 200), now());
+    // push instantané si le destinataire est connecté en WebSocket
+    try {
+      const ws = pushSockets.get(Number(userId));
+      if (ws && ws.readyState === 1) {
+        let actorName = '';
+        if (actorId) { const a = await get1('SELECT username FROM users WHERE id=?', actorId); if (a) actorName = a.username; }
+        ws.send(JSON.stringify({ t: 'push', id, type, text: String(text || '').slice(0, 200), actor: actorName }));
+      }
+    } catch (_) {}
   } catch (e) {}
+}
+function setupPushWs(server) {
+  const { WebSocketServer } = require('ws');
+  const wss = new WebSocketServer({ server, path: '/api/push/ws' });
+  wss.on('connection', (ws) => {
+    let uid = null;
+    const hb = setInterval(() => { try { if (ws.readyState === 1) ws.ping(); } catch (_) {} }, 240000);
+    ws.on('message', async (buf) => {
+      let m; try { m = JSON.parse(buf.toString()); } catch (e) { return; }
+      if (m.t === 'auth' && m.token) {
+        const id = await userIdFromToken(m.token);
+        if (!id) { try { ws.close(); } catch (_) {} return; }
+        uid = Number(id);
+        pushSockets.set(uid, ws);
+        try { ws.send(JSON.stringify({ t: 'ready' })); } catch (_) {}
+      }
+      if (m.t === 'ping' && ws.readyState === 1) { try { ws.send(JSON.stringify({ t: 'pong' })); } catch (_) {} }
+    });
+    ws.on('close', () => { clearInterval(hb); if (uid && pushSockets.get(uid) === ws) pushSockets.delete(uid); });
+    ws.on('error', () => {});
+  });
 }
 // vrai si a a bloqué b, ou b a bloqué a
 async function isBlocked(a, b) {
@@ -4808,5 +4894,5 @@ initDb().then(() => {
   setInterval(expireSubs, 86400000); // désactive les abonnements expirés toutes les 24 h
   const server = app.listen(PORT, () => console.log(
     `VidiGagne Server v2 sur http://localhost:${PORT} (db=${USE_PG ? 'postgres' : 'sqlite'}, storage=${USE_CLOUDINARY ? 'cloudinary' : 'local'})`));
-  setupLiveWs(server);
+  setupLiveWs(server); setupPushWs(server);
 }).catch(e => { console.error('Échec init DB:', e.message); process.exit(1); });
