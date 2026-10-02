@@ -587,6 +587,56 @@ CREATE TABLE IF NOT EXISTS family_settings(
   // serveur v9 : modération MVP (vidéos masquées, comptes suspendus)
   await mig('videos', 'hidden', `INTEGER NOT NULL DEFAULT 0`);
   await mig('users', 'suspended', `INTEGER NOT NULL DEFAULT 0`);
+  // serveur v13 : replay LIVE, TTS, commentaires audio, Q&A, collections partagées
+  await mig('videos', 'is_replay', `INTEGER NOT NULL DEFAULT 0`);
+  await mig('videos', 'live_id', `TEXT`);
+  await mig('videos', 'tts_text', `TEXT`);
+  await mig('videos', 'tts_voice', `TEXT`);
+  await mig('videos', 'tts_rate', `REAL NOT NULL DEFAULT 1`);
+  await mig('comments', 'audio_url', `TEXT`);
+  await mig('qa_questions', 'asker_id', `INTEGER`);
+  // Tables Q&A
+  if (USE_PG) {
+    await pool.query(`CREATE TABLE IF NOT EXISTS qa_questions(
+      id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL, asker_id INTEGER,
+      question TEXT NOT NULL, answer TEXT,
+      created_at BIGINT NOT NULL, answered_at BIGINT
+    )`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS shared_collections(
+      id SERIAL PRIMARY KEY, owner_id INTEGER NOT NULL,
+      name TEXT NOT NULL, code TEXT UNIQUE NOT NULL,
+      created_at BIGINT NOT NULL
+    )`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS shared_collection_members(
+      collection_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+      joined_at BIGINT NOT NULL, PRIMARY KEY(collection_id, user_id)
+    )`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS shared_collection_videos(
+      collection_id INTEGER NOT NULL, video_id INTEGER NOT NULL,
+      added_by INTEGER NOT NULL, added_at BIGINT NOT NULL,
+      PRIMARY KEY(collection_id, video_id)
+    )`);
+  } else {
+    lite.exec(`CREATE TABLE IF NOT EXISTS qa_questions(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, asker_id INTEGER,
+      question TEXT NOT NULL, answer TEXT,
+      created_at BIGINT NOT NULL, answered_at BIGINT
+    )`);
+    lite.exec(`CREATE TABLE IF NOT EXISTS shared_collections(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, owner_id INTEGER NOT NULL,
+      name TEXT NOT NULL, code TEXT UNIQUE NOT NULL,
+      created_at BIGINT NOT NULL
+    )`);
+    lite.exec(`CREATE TABLE IF NOT EXISTS shared_collection_members(
+      collection_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+      joined_at BIGINT NOT NULL, PRIMARY KEY(collection_id, user_id)
+    )`);
+    lite.exec(`CREATE TABLE IF NOT EXISTS shared_collection_videos(
+      collection_id INTEGER NOT NULL, video_id INTEGER NOT NULL,
+      added_by INTEGER NOT NULL, added_at BIGINT NOT NULL,
+      PRIMARY KEY(collection_id, video_id)
+    )`);
+  }
   // renommage desc -> description sur les anciennes bases (schéma v1)
   try {
     const hasDesc = USE_PG
@@ -625,6 +675,12 @@ CREATE TABLE IF NOT EXISTS family_settings(
     if (USE_PG) await pool.query('CREATE INDEX IF NOT EXISTS watch_events_user_video_idx ON watch_events(user_id,video_id)');
     else lite.exec('CREATE INDEX IF NOT EXISTS watch_events_user_video_idx ON watch_events(user_id,video_id)');
   } catch (e) {}
+  // serveur v13 : replays de lives, voix de synthèse TTS, "pourquoi cette vidéo"
+  await mig('videos', 'is_replay', `INTEGER NOT NULL DEFAULT 0`);
+  await mig('videos', 'live_id', `INTEGER`);
+  await mig('videos', 'tts_text', `TEXT NOT NULL DEFAULT ''`);
+  await mig('videos', 'tts_voice', `TEXT NOT NULL DEFAULT ''`);
+  await mig('videos', 'tts_rate', `REAL NOT NULL DEFAULT 1`);
   // catégories de boutique par défaut
   try {
     const n = await get1('SELECT COUNT(*) AS c FROM categories');
@@ -824,6 +880,11 @@ async function videoJSON(v, meId) {
     url: fileUrl(v.file), visibility: v.visibility || 'public', subscribed,
     media_type: v.media_type || 'video', photos, captions,
     series_id: seriesId, series_locked: seriesLocked,
+    // v13 : replay de live + voix de synthèse + explication "pourquoi cette vidéo"
+    is_replay: Number(v.is_replay) || 0,
+    live_id: v.live_id ? Number(v.live_id) : null,
+    tts: { text: v.tts_text || '', voice: v.tts_voice || '', rate: Number(v.tts_rate) || 1 },
+    why: Array.isArray(v._why) ? v._why : null,
     views: Number(v.views), likes: Number(likes), comments: Number(cmts), liked,
     created_at: Number(v.created_at),
     user: pubUser(u),
@@ -973,10 +1034,19 @@ app.post('/api/videos', auth, upload.single('video'), async (req, res) => {
     if (visibility === 'subscribers_only') visibility = 'subscribers'; // valeur envoyée par l'app
     if (!['public', 'subscribers', 'private'].includes(visibility)) visibility = 'public';
     const captions = b.captions ? cleanCaptions(b.captions) : '[]';
+    // v13 : replay de live + voix de synthèse TTS
+    const isReplay = b.is_replay ? 1 : 0;
+    const liveId = b.live_id ? Number(b.live_id) : null;
+    const ttsText = String(b.tts_text || '').slice(0, 500);
+    const ttsVoice = String(b.tts_voice || '').slice(0, 120);
+    let ttsRate = Number(b.tts_rate) || 1;
+    if (ttsRate < 0.5) ttsRate = 0.5;
+    if (ttsRate > 2) ttsRate = 2;
     const id = await insertId(
-      'INSERT INTO videos(user_id,file,description,tags,sound,duration,scheduled_at,visibility,captions,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)',
+      'INSERT INTO videos(user_id,file,description,tags,sound,duration,scheduled_at,visibility,captions,is_replay,live_id,tts_text,tts_voice,tts_rate,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
       req.userId, fname, descText, String(b.tags || '').slice(0, 300),
-      String(b.sound || '').slice(0, 120), Number(b.duration) || 0, scheduledAt, visibility, captions, now());
+      String(b.sound || '').slice(0, 120), Number(b.duration) || 0, scheduledAt, visibility, captions,
+      isReplay, liveId, ttsText, ttsVoice, ttsRate, now());
     // pièces : +10 par publication
     await runSql('UPDATE users SET coins=coins+10 WHERE id=?', req.userId);
     await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
@@ -1687,12 +1757,16 @@ async function scoreForYou(candidates, meId) {
   const scored = candidates.map(v => {
     const vtags = tagsOf(v);
     // affinité tags : complétion moyenne de mes événements sur des vidéos partageant ≥1 tag
+    // (v13 : on collecte aussi les tags partagés pour expliquer "pourquoi cette vidéo")
     let tSum = 0, tN = 0;
+    const sharedTags = {};
     if (vtags.length) {
       for (const vid of Object.keys(evByVideo)) {
         if (Number(vid) === Number(v.id)) continue;
-        if (evTags[vid].some(t => vtags.includes(t))) {
+        const common = evTags[vid].filter(t => vtags.includes(t));
+        if (common.length) {
           for (const e of evByVideo[vid]) { tSum += Number(e.completed) || 0; tN++; }
+          for (const t of common) sharedTags[t] = (sharedTags[t] || 0) + 1;
         }
       }
     }
@@ -1700,11 +1774,25 @@ async function scoreForYou(candidates, meId) {
     const likeRate = (likeCount[v.id] || 0) / ((Number(v.views) || 0) + 1);
     const hours = Math.max(0, (tnow - Number(v.created_at)) / 3600000);
     const recency = 1 / (1 + hours / 24);
-    const score = 0.35 * (affCreator[v.user_id] || 0)
+    const affC = affCreator[v.user_id] || 0;
+    const seen = seenFull.has(Number(v.id));
+    const score = 0.35 * affC
       + 0.25 * affTags
       + 0.25 * likeRate
       + 0.15 * recency
-      - 0.9 * (seenFull.has(Number(v.id)) ? 1 : 0);
+      - 0.9 * (seen ? 1 : 0);
+    // v13 : explication "pourquoi cette vidéo ?" (façon TikTok)
+    const why = [];
+    if (affC > 0.5) why.push('Tu regardes souvent ce créateur');
+    if (affTags > 0.5) {
+      const top = Object.keys(sharedTags).sort((a, b) => sharedTags[b] - sharedTags[a]).slice(0, 3);
+      why.push('Tags que tu aimes : ' + top.map(t => '#' + t).join(' '));
+    }
+    if (likeRate > 0.08) why.push('Populaire auprès des spectateurs');
+    if (recency > 0.7) why.push('Publiée récemment');
+    if (seen) why.push('Déjà vue en entier');
+    if (!why.length) why.push('Sélectionnée pour toi');
+    v._why = why.slice(0, 3);
     return { v, score };
   });
   scored.sort((a, b) => b.score - a.score);
@@ -1885,10 +1973,12 @@ app.get('/api/videos/:id/comments', async (req, res) => {
   res.json({ comments: filtered });
 });
 
-app.post('/api/videos/:id/comments', auth, upload.single('video'), async (req, res) => {
+app.post('/api/videos/:id/comments', auth, upload.fields([{name:'video',maxCount:1},{name:'audio',maxCount:1}]), async (req, res) => {
   try {
     const text = String((req.body || {}).text || '').trim().slice(0, 500);
-    if (!text) return res.status(400).json({ error: 'commentaire vide' });
+    const hasAudio=req.files&&req.files.audio&&req.files.audio[0];
+    const hasVideo=req.files&&req.files.video&&req.files.video[0];
+    if (!text&&!hasAudio&&!hasVideo) return res.status(400).json({ error: 'commentaire vide' });
     const v = await get1('SELECT * FROM videos WHERE id=?', req.params.id);
     if (!v) return res.status(404).json({ error: 'vidéo introuvable' });
     // v12 : filtres de commentaires du propriétaire (insensible à la casse)
@@ -1898,11 +1988,14 @@ app.post('/api/videos/:id/comments', auth, upload.single('video'), async (req, r
       return res.status(400).json({ error: 'comment_blocked' });
     // réponse vidéo optionnelle (même stockage que l'upload de vidéo)
     let videoUrl = null;
-    if (req.file) videoUrl = fileUrl(await storeVideo(req.file));
+    if (hasVideo) videoUrl = fileUrl(await storeVideo(req.files.video[0]));
+    // v13 : commentaire vocal (audio)
+    let audioUrl = null;
+    if (hasAudio) audioUrl = fileUrl(await storeVideo(req.files.audio[0]));
     const replyTo = (req.body || {}).reply_to || null;
     const id = await insertId(
-      'INSERT INTO comments(video_id,user_id,text,reply_to,video_url,created_at) VALUES(?,?,?,?,?,?)',
-      req.params.id, req.userId, text, replyTo, videoUrl, now());
+      'INSERT INTO comments(video_id,user_id,text,reply_to,video_url,audio_url,created_at) VALUES(?,?,?,?,?,?,?)',
+      req.params.id, req.userId, text, replyTo, videoUrl, audioUrl, now());
     // modération auto V3 : scan du texte (sans IA externe)
     const badC = scanBanned(text);
     if (badC) {
@@ -2473,6 +2566,96 @@ app.get('/api/users/:username', async (req, res) => {
       if (await canSeeVideo(v, meId)) videos.push(await videoJSON(v, null));
     }
     res.json({ user: pubUser(u), followers, following, total_likes: likes, videos });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+
+// ---------- v13 : Q&A sur le profil ----------
+app.get('/api/users/:username/qa', async (req, res) => {
+  try {
+    const u = await get1('SELECT id FROM users WHERE username=?', String(req.params.username).toLowerCase());
+    if (!u) return res.status(404).json({ error: 'utilisateur introuvable' });
+    const qs = await allRows(
+      `SELECT q.*, u.username AS asker_name FROM qa_questions q
+       LEFT JOIN users u ON u.id=q.asker_id
+       WHERE q.user_id=? ORDER BY q.created_at DESC`, u.id);
+    res.json({ questions: qs });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.post('/api/users/:username/qa', auth, async (req, res) => {
+  try {
+    const u = await get1('SELECT id FROM users WHERE username=?', String(req.params.username).toLowerCase());
+    if (!u) return res.status(404).json({ error: 'utilisateur introuvable' });
+    const q = String((req.body || {}).question || '').trim().slice(0, 300);
+    if (!q) return res.status(400).json({ error: 'question vide' });
+    const id = await insertId(
+      'INSERT INTO qa_questions(user_id,asker_id,question,created_at) VALUES(?,?,?,?)',
+      u.id, req.userId, q, now());
+    res.json({ id });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.post('/api/qa/:id/answer', auth, async (req, res) => {
+  try {
+    const q = await get1('SELECT * FROM qa_questions WHERE id=?', req.params.id);
+    if (!q) return res.status(404).json({ error: 'question introuvable' });
+    if (Number(q.user_id) !== Number(req.userId)) return res.status(403).json({ error: 'non autorisé' });
+    const a = String((req.body || {}).answer || '').trim().slice(0, 1000);
+    await runSql('UPDATE qa_questions SET answer=?, answered_at=? WHERE id=?', a, now(), req.params.id);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+
+// ---------- v13 : collections partagées ----------
+app.post('/api/collections/shared', auth, async (req, res) => {
+  try {
+    const name = String((req.body || {}).name || '').trim().slice(0, 100) || 'Collection partagée';
+    const videoIds = (req.body || {}).video_ids || [];
+    const code = 'VG-COLL-' + Math.random().toString(36).slice(2, 8).toUpperCase();
+    const cid = await insertId(
+      'INSERT INTO shared_collections(owner_id,name,code,created_at) VALUES(?,?,?,?)',
+      req.userId, name, code, now());
+    await runSql('INSERT INTO shared_collection_members(collection_id,user_id,joined_at) VALUES(?,?,?)',
+      cid, req.userId, now());
+    for (const vid of videoIds.slice(0, 100)) {
+      try {
+        await runSql('INSERT INTO shared_collection_videos(collection_id,video_id,added_by,added_at) VALUES(?,?,?,?)',
+          cid, vid, req.userId, now());
+      } catch (e) {}
+    }
+    res.json({ id: cid, code });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.post('/api/collections/shared/join', auth, async (req, res) => {
+  try {
+    const code = String((req.body || {}).code || '').trim().toUpperCase();
+    const c = await get1('SELECT * FROM shared_collections WHERE code=?', code);
+    if (!c) return res.status(404).json({ error: 'code invalide' });
+    try {
+      await runSql('INSERT INTO shared_collection_members(collection_id,user_id,joined_at) VALUES(?,?,?)',
+        c.id, req.userId, now());
+    } catch (e) {}
+    const vids = await allRows(
+      `SELECT v.* FROM shared_collection_videos scv
+       JOIN videos v ON v.id=scv.video_id
+       WHERE scv.collection_id=? ORDER BY scv.added_at DESC`, c.id);
+    res.json({ collection: c, videos: vids });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.get('/api/collections/shared/:code', auth, async (req, res) => {
+  try {
+    const c = await get1('SELECT * FROM shared_collections WHERE code=?',
+      String(req.params.code).toUpperCase());
+    if (!c) return res.status(404).json({ error: 'collection introuvable' });
+    const member = await get1(
+      'SELECT 1 FROM shared_collection_members WHERE collection_id=? AND user_id=?',
+      c.id, req.userId);
+    if (!member && Number(c.owner_id) !== Number(req.userId))
+      return res.status(403).json({ error: 'non membre' });
+    const vids = await allRows(
+      `SELECT v.*, u.username FROM shared_collection_videos scv
+       JOIN videos v ON v.id=scv.video_id
+       JOIN users u ON u.id=v.user_id
+       WHERE scv.collection_id=? ORDER BY scv.added_at DESC`, c.id);
+    res.json({ collection: c, videos: vids });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 
