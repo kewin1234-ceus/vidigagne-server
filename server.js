@@ -588,6 +588,7 @@ CREATE TABLE IF NOT EXISTS family_settings(
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS storage_bytes BIGINT DEFAULT 0`); // v1.54 : quota stockage
     await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS audio_url TEXT DEFAULT ''`); // v1.57 : messages vocaux
     await pool.query(`ALTER TABLE group_messages ADD COLUMN IF NOT EXISTS audio_url TEXT DEFAULT ''`);
+    await pool.query(`ALTER TABLE videos ADD COLUMN IF NOT EXISTS phash TEXT DEFAULT ''`); // v1.58 : recherche par image
     await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS users_email_uidx ON users(email)`);
     await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS users_google_uidx ON users(google_id)`);
     await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS users_phone_uidx ON users(phone)`);
@@ -605,6 +606,9 @@ CREATE TABLE IF NOT EXISTS family_settings(
       const mc = lite.prepare(`PRAGMA table_info(${t})`).all().map(c => c.name);
       if (!mc.includes('audio_url')) lite.exec(`ALTER TABLE ${t} ADD COLUMN audio_url TEXT DEFAULT ''`);
     }
+    // v1.58 : recherche par image (hash perceptuel)
+    { const vc = lite.prepare(`PRAGMA table_info(videos)`).all().map(c => c.name);
+      if (!vc.includes('phash')) lite.exec(`ALTER TABLE videos ADD COLUMN phash TEXT DEFAULT ''`); }
     for (const c of ['first_name', 'last_name', 'birthdate']) {
       if (!cols.includes(c)) lite.exec(`ALTER TABLE users ADD COLUMN ${c} TEXT DEFAULT ''`);
     }
@@ -1294,6 +1298,19 @@ app.post('/api/videos', auth, upload.single('video'), async (req, res) => {
       await flagForReview('video', id, 'mot interdit : ' + badW);
     }
     const v = await get1('SELECT * FROM videos WHERE id=?', id);
+    // v1.58 : hash perceptuel en arrière-plan (recherche par image) — ne bloque pas la réponse
+    try {
+      if (!/^https?:\/\//.test(fname)) {
+        const fpath = path.join(UP, fname);
+        const { execFile } = require('child_process');
+        execFile('python3', [__dirname + '/phash.py', fpath], { timeout: 90000 }, async (err, stdout) => {
+          try {
+            const h = String(stdout || '').trim();
+            if (/^[0-9a-f]{16}$/.test(h)) await runSql('UPDATE videos SET phash=? WHERE id=?', h, id);
+          } catch (_) {}
+        });
+      }
+    } catch (_) {}
     res.json({ video: await videoJSON(v, req.userId), pending_review: !!badW });
   } catch (e) { res.status(500).json({ error: 'échec du téléversement' }); }
 });
@@ -3126,6 +3143,38 @@ app.get('/api/wallet', auth, async (req, res) => {
 });
 
 // ---------- recherche ----------
+// v1.58 : recherche par image — hash perceptuel (aHash), distance de Hamming <= 12
+app.post('/api/search/image', auth, uploadImg.single('image'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'aucune image' });
+    const { execFile } = require('child_process');
+    const fpath = req.file.path || (() => { const t = require('os').tmpdir() + '/vgq' + Date.now() + '.jpg';
+      require('fs').writeFileSync(t, req.file.buffer); return t; })();
+    const qhash = await new Promise((resolve) => {
+      execFile('python3', [__dirname + '/phash.py', fpath], { timeout: 60000 }, (err, stdout) => {
+        resolve(String(stdout || '').trim());
+      });
+    });
+    try { if (req.file.path !== fpath) require('fs').unlink(fpath, () => {}); } catch (_) {}
+    if (!/^[0-9a-f]{16}$/.test(qhash)) return res.status(400).json({ error: 'image illisible' });
+    const q = BigInt('0x' + qhash);
+    const rows = await allRows("SELECT id, phash FROM videos WHERE phash != '' AND hidden=0 LIMIT 5000");
+    const scored = [];
+    for (const r of rows) {
+      try {
+        const d = (BigInt('0x' + r.phash) ^ q).toString(2).split('1').length - 1;
+        if (d <= 12) scored.push({ id: r.id, d });
+      } catch (_) {}
+    }
+    scored.sort((a, b) => a.d - b.d);
+    const videos = [];
+    for (const s of scored.slice(0, 20)) {
+      const v = await get1('SELECT * FROM videos WHERE id=?', s.id);
+      if (v) videos.push(await videoJSON(v, req.userId));
+    }
+    res.json({ videos, hash: qhash });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
 app.get('/api/search', async (req, res) => {
   try {
     const q = '%' + String(req.query.q || '').toLowerCase() + '%';
