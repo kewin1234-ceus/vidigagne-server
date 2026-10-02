@@ -4167,6 +4167,13 @@ async function publishDue() {
 app.get('/app-ads.txt', (req, res) => {
   res.type('text/plain').send('google.com, pub-5708506559717909, DIRECT, f08c47fec0942fa0\n');
 });
+// Documents juridiques hébergés (exigés par Google Play)
+const _legal = (f) => (req, res) => {
+  try { res.type('html').send(fs.readFileSync(path.join(__dirname, 'legal', f), 'utf8')); }
+  catch (e) { res.status(404).send('Document indisponible'); }
+};
+app.get('/privacy', _legal('privacy.html'));
+app.get('/terms', _legal('terms.html'));
 function clientIp(req){
   const f = req.headers['x-forwarded-for'] || '';
   return (f.split(',')[0] || req.ip || '').trim();
