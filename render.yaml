@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: vidigagne-server
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    disk:
+      name: vidigagne-data
+      mountPath: /app/data
+      sizeGB: 1
