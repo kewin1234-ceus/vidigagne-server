@@ -10,7 +10,10 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "cloudinary": "^2.7.0",
     "express": "^5.2.1",
-    "multer": "^2.4.0"
+    "jsonwebtoken": "^9.0.2",
+    "multer": "^2.4.0",
+    "pg": "^8.13.1"
   }
 }

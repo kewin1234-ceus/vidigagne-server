@@ -3,7 +3,5 @@ services:
     name: vidigagne-server
     runtime: docker
     dockerfilePath: ./Dockerfile
-    disk:
-      name: vidigagne-data
-      mountPath: /app/data
-      sizeGB: 1
+    # Pas de disque persistant (plan gratuit) : la persistance est assurée par
+    # DATABASE_URL (Postgres, ex. Neon) et Cloudinary pour les vidéos.
