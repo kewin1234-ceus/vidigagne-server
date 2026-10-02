@@ -585,6 +585,7 @@ CREATE TABLE IF NOT EXISTS family_settings(
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS birthdate TEXT DEFAULT ''`);
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS ref_code TEXT`);
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by INTEGER`);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS storage_bytes BIGINT DEFAULT 0`); // v1.54 : quota stockage
     await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS users_email_uidx ON users(email)`);
     await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS users_google_uidx ON users(google_id)`);
     await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS users_phone_uidx ON users(phone)`);
@@ -596,6 +597,7 @@ CREATE TABLE IF NOT EXISTS family_settings(
     }
     if (!cols.includes('sub_enabled')) lite.exec(`ALTER TABLE users ADD COLUMN sub_enabled INTEGER DEFAULT 0`);
     if (!cols.includes('sub_price')) lite.exec(`ALTER TABLE users ADD COLUMN sub_price INTEGER DEFAULT 0`);
+    if (!cols.includes('storage_bytes')) lite.exec(`ALTER TABLE users ADD COLUMN storage_bytes INTEGER DEFAULT 0`); // v1.54 : quota stockage
     for (const c of ['first_name', 'last_name', 'birthdate']) {
       if (!cols.includes(c)) lite.exec(`ALTER TABLE users ADD COLUMN ${c} TEXT DEFAULT ''`);
     }
@@ -807,8 +809,49 @@ if (USE_CLOUDINARY) {
   });
 }
 
+// v1.54 : validation des magic bytes — le Content-Type multipart est déclaratif (contrôlé par l'attaquant),
+// on vérifie le CONTENU réel du fichier. Retourne 'video' | 'audio' | 'image' | null.
+function detectMediaKind(buf) {
+  if (!buf || buf.length < 12) return null;
+  const head = buf.slice(0, 4096).toString('latin1');
+  // SVG = rejeté explicitement (JavaScript embarquable)
+  if (/^\s*<\?xml/i.test(head) || /^\s*<svg/i.test(head)) return 'svg';
+  // images
+  if (buf[0] === 0xFF && buf[1] === 0xD8 && buf[2] === 0xFF) return 'image'; // JPEG
+  if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4E && buf[3] === 0x47) return 'image'; // PNG
+  if (head.startsWith('GIF87a') || head.startsWith('GIF89a')) return 'image'; // GIF
+  if (head.startsWith('RIFF') && head.slice(8, 12) === 'WEBP') return 'image'; // WebP
+  // vidéo : MP4/MOV/M4V (ftyp), WebM/MKV (EBML), AVI (RIFF+AVI )
+  if (head.slice(4, 8) === 'ftyp') return buf.slice(4, 12).toString('latin1').includes('M4A') ? 'audio' : 'video';
+  if (buf[0] === 0x1A && buf[1] === 0x45 && buf[2] === 0xDF && buf[3] === 0xA3) return 'video'; // WebM/MKV
+  if (head.startsWith('RIFF') && head.slice(8, 12) === 'AVI ') return 'video';
+  if (head.startsWith('\x00\x00\x00\x18ftyp3g') || head.includes('moov')) return 'video';
+  // audio : MP3, WAV, OGG, AAC
+  if (head.startsWith('ID3') || (buf[0] === 0xFF && (buf[1] & 0xE0) === 0xE0)) return 'audio'; // MP3
+  if (head.startsWith('RIFF') && head.slice(8, 12) === 'WAVE') return 'audio'; // WAV
+  if (head.startsWith('OggS')) return 'audio'; // OGG
+  if (head.startsWith('fLaC')) return 'audio'; // FLAC
+  return null;
+}
+function mediaBytes(file) {
+  if (file.buffer) return file.buffer;
+  try { const fd = fs.openSync(file.path, 'r'); const b = Buffer.alloc(8192);
+    const n = fs.readSync(fd, b, 0, 8192, 0); fs.closeSync(fd); return b.slice(0, n); } catch (e) { return null; }
+}
+const MEDIA_EXT = { video: '.mp4', audio: '.mp3', image: '.jpg' };
+// v1.54 : quota de stockage 2 Go / utilisateur (anti saturation disque / facture Cloudinary)
+const STORAGE_QUOTA = 2 * 1024 * 1024 * 1024;
+async function checkQuota(userId, addBytes) {
+  const u = await get1('SELECT storage_bytes FROM users WHERE id=?', userId);
+  const used = Number(u && u.storage_bytes) || 0;
+  if (used + addBytes > STORAGE_QUOTA) return false;
+  await runSql('UPDATE users SET storage_bytes=storage_bytes+? WHERE id=?', addBytes, userId);
+  return true;
+}
 async function storeVideo(file) {
-  const ext = path.extname(file.originalname || '') || '.mp4';
+  const kind = detectMediaKind(mediaBytes(file));
+  if (kind !== 'video' && kind !== 'audio') throw new Error('fichier vidéo/audio invalide (contenu non reconnu)');
+  const ext = MEDIA_EXT[kind]; // extension forcée selon le contenu réel, pas le nom d'origine
   if (USE_CLOUDINARY) {
     const tmp = path.join(os.tmpdir(), 'vg' + Date.now() + '_' + crypto.randomBytes(6).toString('hex') + ext);
     fs.writeFileSync(tmp, file.buffer);
@@ -836,6 +879,9 @@ app.use((req, res, next) => {
   res.setHeader('X-Frame-Options', 'DENY');
   res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
   res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+  // v1.54 : CSP — bloque l'exécution de scripts injectés sur les pages HTML servies
+  // (privacy/terms/admin) et les fichiers statiques /uploads
+  res.setHeader('Content-Security-Policy', "default-src 'self'; img-src 'self' data: https:; media-src 'self' https:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; frame-ancestors 'none'");
   if (req.secure || req.headers['x-forwarded-proto'] === 'https')
     res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
   next();
@@ -937,9 +983,15 @@ async function touchHistory(userId, videoId) {
   } catch (e) {}
 }
 function pubUser(u) {
+  // v1.54 : JAMAIS de données personnelles ici (prénom/nom/naissance = privées, voir privUser)
   return { id: u.id, username: u.username, name: u.name, avatar: u.avatar, bio: u.bio, verified: !!u.verified,
-    first_name: u.first_name || '', last_name: u.last_name || '', birthdate: u.birthdate || '',
     sub_enabled: Number(u.sub_enabled) || 0, sub_price: Number(u.sub_price) || 0, ref_code: u.ref_code || '' };
+}
+// Données personnelles : uniquement pour le propriétaire du compte (/api/auth/me)
+function privUser(u) {
+  const p = pubUser(u);
+  p.first_name = u.first_name || ''; p.last_name = u.last_name || ''; p.birthdate = u.birthdate || '';
+  return p;
 }
 async function videoJSON(v, meId) {
   const u = await get1('SELECT * FROM users WHERE id=?', v.user_id);
@@ -981,7 +1033,7 @@ async function videoJSON(v, meId) {
     why: Array.isArray(v._why) ? v._why : null,
     views: Number(v.views), likes: Number(likes), comments: Number(cmts), liked,
     created_at: Number(v.created_at),
-    user: pubUser(u),
+    user: privUser(u),
   };
 }
 // parse les mots-clés de filtre de commentaires (v12)
@@ -1008,10 +1060,11 @@ app.post('/api/auth/register', async (req, res) => {
     last_name = String(last_name || '').trim().slice(0, 40);
     birthdate = /^\d{4}-\d{2}-\d{2}$/.test(birthdate || '') ? birthdate : '';
     const exists = await get1('SELECT 1 FROM users WHERE username=?', username);
-    if (exists) return res.status(409).json({ error: 'ce pseudo est déjà pris' }); // unicité serveur
+    if (exists) return res.status(409).json({ error: 'ce pseudo est déjà pris' }); // unicité serveur (les pseudos sont publics par design, comme TikTok)
     if (email) {
       const eExists = await get1('SELECT 1 FROM users WHERE email=?', email);
-      if (eExists) return res.status(409).json({ error: 'cet e-mail est déjà utilisé' });
+      // v1.54 : message générique pour l'e-mail (anti-énumération de comptes)
+      if (eExists) return res.status(409).json({ error: 'inscription impossible avec ces informations' });
     }
     const salt = crypto.randomBytes(16).toString('hex');
     const id = await insertId(
@@ -1027,25 +1080,38 @@ app.post('/api/auth/register', async (req, res) => {
     const token = crypto.randomBytes(32).toString('hex');
     await runSql('INSERT INTO tokens(token,user_id,created_at) VALUES(?,?,?)', token, id, now());
     const u = await get1('SELECT * FROM users WHERE id=?', id);
-    res.json({ token, user: pubUser(u), coins: u.coins });
+    res.json({ token, user: privUser(u), coins: u.coins });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 
+// v1.54 : rate-limit anti brute-force (5 essais / 15 min par IP+identifiant)
+const _loginAttempts = new Map();
+function loginRateLimited(ip, ident) {
+  const k = ip + '|' + ident, t = Date.now();
+  let a = _loginAttempts.get(k) || [];
+  a = a.filter(x => t - x < 15 * 60 * 1000);
+  if (a.length >= 5) return true;
+  a.push(t); _loginAttempts.set(k, a);
+  if (_loginAttempts.size > 5000) _loginAttempts.clear();
+  return false;
+}
 app.post('/api/auth/login', async (req, res) => {
   try {
     const ident = ((req.body || {}).username || (req.body || {}).identifier || (req.body || {}).email || '').toLowerCase().trim();
+    if (loginRateLimited(clientIp(req), ident))
+      return res.status(429).json({ error: 'trop de tentatives, réessaie dans 15 minutes' });
     const u = await get1('SELECT * FROM users WHERE username=? OR email=?', ident, ident);
     if (!u || hashPass(req.body.password || '', u.pass_salt) !== u.pass_hash)
       return res.status(401).json({ error: 'pseudo ou mot de passe incorrect' });
     const token = crypto.randomBytes(32).toString('hex');
     await runSql('INSERT INTO tokens(token,user_id,created_at) VALUES(?,?,?)', token, u.id, now());
-    res.json({ token, user: pubUser(u), coins: u.coins });
+    res.json({ token, user: privUser(u), coins: u.coins });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 
 app.get('/api/auth/me', auth, async (req, res) => {
   const u = await get1('SELECT * FROM users WHERE id=?', req.userId);
-  res.json({ user: pubUser(u), coins: u.coins });
+  res.json({ user: privUser(u), coins: u.coins });
 });
 
 // déconnexion : supprime le token courant côté serveur
@@ -1072,7 +1138,7 @@ app.patch('/api/auth/me', auth, async (req, res) => {
     await runSql('UPDATE users SET sub_enabled=?, sub_price=? WHERE id=?', se, sp, req.userId);
   }
   const u = await get1('SELECT * FROM users WHERE id=?', req.userId);
-  res.json({ user: pubUser(u) });
+  res.json({ user: privUser(u) });
 });
 
 // ---------- vidéos ----------
@@ -1112,7 +1178,10 @@ const uploadImg = multer({
   },
 });
 async function storeImage(file, folder) {
-  const ext = path.extname(file.originalname || '') || '.jpg';
+  const kind = detectMediaKind(mediaBytes(file));
+  if (kind === 'svg') throw new Error('les images SVG sont refusées (risque de script)');
+  if (kind !== 'image') throw new Error('fichier image invalide (contenu non reconnu)');
+  const ext = MEDIA_EXT.image; // extension forcée selon le contenu réel
   if (USE_CLOUDINARY) {
     const tmp = path.join(os.tmpdir(), 'vgimg' + Date.now() + '_' + crypto.randomBytes(6).toString('hex') + ext);
     fs.writeFileSync(tmp, file.buffer);
@@ -1146,6 +1215,9 @@ function cleanCaptions(raw) {
 app.post('/api/videos', auth, upload.single('video'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'aucune vidéo reçue' });
+    // v1.54 : quota de stockage (2 Go / utilisateur)
+    if (!(await checkQuota(req.userId, req.file.size || 0)))
+      return res.status(413).json({ error: 'quota de stockage atteint (2 Go)' });
     const fname = await storeVideo(req.file);
     const b = req.body || {};
     const descText = String(b.description || b.desc || '').slice(0, 500);
@@ -1222,6 +1294,8 @@ app.post('/api/stories', auth, uploadStory.fields([{ name: 'video', maxCount: 1 
   try {
     const file = (req.files && (req.files.video || req.files.image) || [])[0];
     if (!file) return res.status(400).json({ error: 'aucune vidéo/image reçue' });
+    if (!(await checkQuota(req.userId, file.size || 0)))
+      return res.status(413).json({ error: 'quota de stockage atteint (2 Go)' });
     const fname = await storeVideo(file);
     const t = now();
     const privacy = ['public', 'friends'].includes(String(req.body.privacy)) ? String(req.body.privacy) : 'public';
@@ -1546,13 +1620,15 @@ app.post('/api/kyc/:id/review', adminAuth, async (req, res) => {
   res.json({ ok: true, status: approve ? 'approved' : 'rejected' });
 });
 // ---------- page admin : revue des identités ----------
+// v1.54 : le token admin n'est PLUS accepté en query string (finit dans les logs/historiques).
+// La page affiche un champ de saisie : le token transite uniquement en en-tête HTTPS.
 app.get('/admin/kyc', (req, res) => {
-  const t = String(req.query.token || '');
-  if (!process.env.ADMIN_TOKEN || t !== process.env.ADMIN_TOKEN) return res.status(403).type('html').send('<h1>Accès refusé</h1>');
   res.type('html').send(`<!DOCTYPE html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>VidiGagne — Vérifications d'identité</title>
-<style>body{font-family:sans-serif;max-width:900px;margin:0 auto;padding:20px;background:#f5f5f5}h1{font-size:22px}.card{background:#fff;border-radius:12px;padding:16px;margin-bottom:16px;box-shadow:0 1px 4px rgba(0,0,0,.1)}.card img{max-width:100%;max-height:300px;border-radius:8px;margin:6px 0}.row{display:flex;gap:10px;margin-top:10px}button{flex:1;padding:12px;border:none;border-radius:8px;font-weight:700;cursor:pointer;font-size:15px}.ok{background:#16a34a;color:#fff}.ko{background:#dc2626;color:#fff}.meta{color:#666;font-size:14px}</style></head><body>
-<h1>🔍 Vérifications d'identité en attente</h1><div id="list"><p>Chargement…</p></div>
-<script>const T=${JSON.stringify(t)};
+<style>body{font-family:sans-serif;max-width:900px;margin:0 auto;padding:20px;background:#f5f5f5}h1{font-size:22px}.card{background:#fff;border-radius:12px;padding:16px;margin-bottom:16px;box-shadow:0 1px 4px rgba(0,0,0,.1)}.card img{max-width:100%;max-height:300px;border-radius:8px;margin:6px 0}.row{display:flex;gap:10px;margin-top:10px}button{flex:1;padding:12px;border:none;border-radius:8px;font-weight:700;cursor:pointer;font-size:15px}.ok{background:#16a34a;color:#fff}.ko{background:#dc2626;color:#fff}.meta{color:#666;font-size:14px}#gate{max-width:420px;margin:80px auto;text-align:center;background:#fff;padding:32px;border-radius:16px;box-shadow:0 2px 12px rgba(0,0,0,.12)}#gate input{width:100%;padding:12px;border:1px solid #ddd;border-radius:8px;font-size:15px;box-sizing:border-box;margin:12px 0}#gate button{background:#111;color:#fff}</style></head><body>
+<div id="gate"><h1>🔐 Accès admin</h1><p style="color:#666">Colle ton token admin pour voir les vérifications d'identité.</p><input id="tk" type="password" placeholder="Token admin" autocomplete="off"><button onclick="go()">Accéder</button><p id="err" style="color:#c00"></p></div>
+<div id="main" style="display:none"><h1>🔍 Vérifications d'identité en attente</h1><div id="list"><p>Chargement…</p></div></div>
+<script>let T='';
+async function go(){T=document.getElementById('tk').value.trim();const r=await fetch('/api/kyc/pending',{headers:{'x-admin-token':T}});if(!r.ok){document.getElementById('err').textContent='Token invalide';return}document.getElementById('gate').style.display='none';document.getElementById('main').style.display='';load()}
 async function load(){const r=await fetch('/api/kyc/pending',{headers:{'x-admin-token':T}});const d=await r.json();
 const box=document.getElementById('list');
 if(!d.pending.length){box.innerHTML='<p>Aucune demande en attente ✅</p>';return}
@@ -1603,13 +1679,49 @@ function paypalCfg() {
     redirect: (process.env.PAYPAL_REDIRECT || 'https://vidigagne-server.onrender.com/api/paypal/connect/callback'),
   };
 }
+// v1.54 : state OAuth signé (HMAC) — empêche de forger un state pour lier un PayPal au compte d'un autre
+const _stateSecret = crypto.randomBytes(32);
+function signState(uid) {
+  const payload = Buffer.from(JSON.stringify({ uid, t: now() })).toString('base64url');
+  const sig = crypto.createHmac('sha256', _stateSecret).update(payload).digest('base64url');
+  return payload + '.' + sig;
+}
+function verifyState(s) {
+  try {
+    const [payload, sig] = String(s || '').split('.');
+    if (!payload || !sig) return null;
+    const expect = crypto.createHmac('sha256', _stateSecret).update(payload).digest('base64url');
+    if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expect))) return null;
+    const d = JSON.parse(Buffer.from(payload, 'base64url').toString());
+    if (!d.uid || now() - d.t > 15 * 60 * 1000) return null; // 15 min max
+    return d.uid;
+  } catch (e) { return null; }
+}
+// v1.54 : code à usage unique pour le flow PayPal (le vrai token d'auth ne transite PLUS en URL)
+const _ppCodes = new Map(); // code -> {uid, exp}
+app.post('/api/paypal/connect/prepare', auth, async (req, res) => {
+  const code = crypto.randomBytes(16).toString('hex');
+  _ppCodes.set(code, { uid: req.userId, exp: now() + 5 * 60 * 1000 });
+  if (_ppCodes.size > 1000) for (const [k, v] of _ppCodes) if (v.exp < now()) _ppCodes.delete(k);
+  res.json({ code });
+});
 app.get('/api/paypal/connect/start', async (req, res) => {
   const cfg = paypalCfg();
   if (!cfg) return res.status(400).json({ error: 'PayPal non configuré' });
-  const token = String(req.query.token || '');
-  const row = token ? await get1('SELECT user_id FROM tokens WHERE token=?', token) : null;
-  if (!row) return res.status(401).json({ error: 'connecte-toi d’abord dans l’application' });
-  const state = Buffer.from(JSON.stringify({ uid: row.user_id, t: now() })).toString('base64url');
+  // code à usage unique (nouveau flow) ou token legacy (compatibilité)
+  let uid = null;
+  const code = String(req.query.code || '');
+  if (code) {
+    const c = _ppCodes.get(code);
+    if (c && c.exp > now()) { uid = c.uid; }
+    _ppCodes.delete(code);
+  } else {
+    const token = String(req.query.token || '');
+    const row = token ? await get1('SELECT user_id FROM tokens WHERE token=?', token) : null;
+    if (row) uid = row.user_id;
+  }
+  if (!uid) return res.status(401).json({ error: 'connecte-toi d’abord dans l’application' });
+  const state = signState(uid);
   const url = cfg.www + '/signin/authorize?client_id=' + encodeURIComponent(cfg.id) +
     '&response_type=code&scope=' + encodeURIComponent('openid email') +
     '&redirect_uri=' + encodeURIComponent(cfg.redirect) + '&state=' + encodeURIComponent(state);
@@ -1619,8 +1731,7 @@ app.get('/api/paypal/connect/callback', async (req, res) => {
   try {
     const cfg = paypalCfg();
     if (!cfg) return res.status(400).type('html').send('<h1>PayPal non configuré</h1>');
-    let uid = null;
-    try { uid = JSON.parse(Buffer.from(String(req.query.state || ''), 'base64url').toString()).uid; } catch (e) {}
+    const uid = verifyState(req.query.state);
     if (!uid || !req.query.code) return res.status(400).type('html').send('<h1>Autorisation refusée</h1>');
     const basic = Buffer.from(cfg.id + ':' + cfg.secret).toString('base64');
     const tr = await fetch(cfg.api + '/v1/oauth2/token', {
@@ -1850,6 +1961,9 @@ function setupLiveWs(server) {
       if (m.t === 'start') {
         const uid = await userIdFromToken(m.token);
         if (!uid) { ws.close(); return; }
+        // v1.54 : seul le PROPRIÉTAIRE du live peut devenir broadcaster (anti-détournement)
+        const l = await liveById(liveId);
+        if (!l || Number(l.user_id) !== Number(uid)) { ws.close(); return; }
         const room = liveRooms[liveId] = liveRooms[liveId] || { broadcaster: null, viewers: new Map() };
         room.broadcaster = ws; role = 'broadcaster';
         return;
@@ -3016,7 +3130,7 @@ app.get('/api/auth/google/poll', async (req, res) => {
     if (!row) return res.json({ done: false });
     await runSql('DELETE FROM oauth_sessions WHERE session=?', s); // usage unique
     const u = await get1('SELECT * FROM users WHERE id=?', row.user_id);
-    res.json({ done: true, token: row.token, user: pubUser(u), coins: u.coins });
+    res.json({ done: true, token: row.token, user: privUser(u), coins: u.coins });
   } catch (e) { res.json({ done: false }); }
 });
 
@@ -3066,7 +3180,7 @@ app.post('/api/auth/phone', async (req, res) => {
     }
     const token = crypto.randomBytes(32).toString('hex');
     await runSql('INSERT INTO tokens(token,user_id,created_at) VALUES(?,?,?)', token, u.id, now());
-    res.json({ token, user: pubUser(u), coins: u.coins });
+    res.json({ token, user: privUser(u), coins: u.coins });
   } catch (e) { res.status(401).json({ error: 'vérification téléphone échouée' }); }
 });
 
@@ -4357,13 +4471,20 @@ app.post('/api/family/code', auth, async (req, res) => {
   try {
     // un seul code actif par parent + purge des expirés
     await runSql('DELETE FROM family_codes WHERE parent_id=? OR created_at<?', req.userId, now() - 15 * 60 * 1000);
-    const code = String(Math.floor(100000 + Math.random() * 900000));
+    // v1.54 : code crypto-aléatoire (Math.random() = devinable)
+    const code = String(100000 + crypto.randomInt(900000)).padStart(6, '0');
     await runSql('INSERT INTO family_codes(code,parent_id,created_at) VALUES(?,?,?)', code, req.userId, now());
     res.json({ code, expires_in: 900 });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 app.post('/api/family/pair', auth, async (req, res) => {
   try {
+    // v1.54 : rate-limit anti devinette de code (10 essais / 15 min par IP)
+    const k = 'fpair|' + clientIp(req), t = now();
+    let a = _loginAttempts.get(k) || [];
+    a = a.filter(x => t - x < 15 * 60 * 1000);
+    if (a.length >= 10) return res.status(429).json({ error: 'trop de tentatives, réessaie plus tard' });
+    a.push(t); _loginAttempts.set(k, a);
     const code = String((req.body || {}).code || '').trim();
     const fc = await get1('SELECT * FROM family_codes WHERE code=?', code);
     if (!fc) return res.status(400).json({ error: 'code invalide' });
