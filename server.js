@@ -275,6 +275,7 @@ CREATE TABLE IF NOT EXISTS notifications(
   actor_id INTEGER,
   video_id INTEGER,
   text TEXT NOT NULL DEFAULT '',
+  title TEXT NOT NULL DEFAULT '',
   is_read INTEGER NOT NULL DEFAULT 0,
   created_at BIGINT NOT NULL
 );
@@ -358,6 +359,25 @@ CREATE TABLE IF NOT EXISTS live_summaries(
   exchanged_usd REAL NOT NULL DEFAULT 0,
   created_at BIGINT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS notif_campaigns(
+  id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+  type TEXT NOT NULL DEFAULT '',
+  title TEXT NOT NULL DEFAULT '',
+  body TEXT NOT NULL DEFAULT '',
+  day TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'scheduled',
+  created_at BIGINT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS notif_queue(
+  id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+  campaign_id INTEGER NOT NULL,
+  user_id INTEGER NOT NULL,
+  scheduled_at BIGINT NOT NULL,
+  sent_at BIGINT DEFAULT NULL,
+  created_at BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_nq_due ON notif_queue(scheduled_at, sent_at);
 CREATE TABLE IF NOT EXISTS live_viewers(
   live_id INTEGER NOT NULL,
   user_id INTEGER NOT NULL,
@@ -707,6 +727,9 @@ CREATE TABLE IF NOT EXISTS family_settings(
     await pool.query(`ALTER TABLE videos ADD COLUMN IF NOT EXISTS target_countries TEXT DEFAULT ''`);
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS country TEXT DEFAULT ''`);
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS fcm_token TEXT DEFAULT ''`);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS campaign_notifs INTEGER DEFAULT 1`);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS tz TEXT DEFAULT 'America/Port-au-Prince'`);
+    await pool.query(`ALTER TABLE notifications ADD COLUMN IF NOT EXISTS title TEXT DEFAULT ''`);
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS bio TEXT DEFAULT ''`);
     await pool.query(`ALTER TABLE verification_requests ADD COLUMN IF NOT EXISTS reviewed_by TEXT DEFAULT ''`);
     await pool.query(`ALTER TABLE verification_requests ADD COLUMN IF NOT EXISTS review_reason TEXT DEFAULT ''`);
@@ -1342,6 +1365,11 @@ app.get('/api/search/insights', async (req, res) => {
     if (!cols.includes('sub_enabled')) lite.exec(`ALTER TABLE users ADD COLUMN sub_enabled INTEGER DEFAULT 0`);
     if (!cols.includes('sub_price')) lite.exec(`ALTER TABLE users ADD COLUMN sub_price INTEGER DEFAULT 0`);
     if (!cols.includes('storage_bytes')) lite.exec(`ALTER TABLE users ADD COLUMN storage_bytes INTEGER DEFAULT 0`); // v1.54 : quota stockage
+    if (!cols.includes('fcm_token')) lite.exec(`ALTER TABLE users ADD COLUMN fcm_token TEXT DEFAULT ''`);
+    if (!cols.includes('campaign_notifs')) lite.exec(`ALTER TABLE users ADD COLUMN campaign_notifs INTEGER DEFAULT 1`);
+    if (!cols.includes('tz')) lite.exec(`ALTER TABLE users ADD COLUMN tz TEXT DEFAULT 'America/Port-au-Prince'`);
+    const ncols = lite.prepare(`PRAGMA table_info(notifications)`).all().map(c => c.name);
+    if (!ncols.includes('title')) lite.exec(`ALTER TABLE notifications ADD COLUMN title TEXT DEFAULT ''`);
     // v1.57 : messages vocaux
     for (const t of ['messages', 'group_messages']) {
       const mc = lite.prepare(`PRAGMA table_info(${t})`).all().map(c => c.name);
@@ -3104,6 +3132,7 @@ function mailer() {
       host: process.env.SMTP_HOST, port: Number(process.env.SMTP_PORT || 587),
       secure: Number(process.env.SMTP_PORT) === 465,
       auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+      connectionTimeout: 15000, greetingTimeout: 15000, socketTimeout: 20000,
     });
     return _mailer;
   } catch (e) { return null; }
@@ -4216,7 +4245,7 @@ app.get('/api/notifications/unread', auth, async (req, res) => {
     const out = [];
     for (const n of rows) {
       const actor = n.actor_id ? await get1('SELECT username FROM users WHERE id=?', n.actor_id) : null;
-      out.push({ id: Number(n.id), type: n.type, text: n.text || '',
+      out.push({ id: Number(n.id), type: n.type, title: n.title || '', text: n.text || '',
         created_at: Number(n.created_at),
         actor: actor ? { username: actor.username } : null });
     }
@@ -4479,6 +4508,133 @@ async function sendFcmPush(userId, title, body, data) {
     return { sent: true };
   } catch (e) { return { sent: false, reason: e.message.slice(0, 100) }; }
 }
+
+// ---------- notifications motivationnelles (campagnes quotidiennes par vagues) ----------
+const CAMPAIGN_MSGS = {
+  go_live: [
+    { t: '\uD83D\uDD34 Passe en live !', b: 'Lance ton live maintenant et gagne des pi\u00E8ces avec tes fans \uD83C\uDF81' },
+    { t: '\uD83C\uDF81 Tes fans t\u2019attendent', b: 'Passe en live et re\u00E7ois des cadeaux en pi\u00E8ces !' },
+    { t: '\uD83D\uDCB0 Les lives rapportent gros', b: '\u00C0 toi de jouer : d\u00E9marre ton live et encaisse !' },
+    { t: '\uD83D\uDD34 C\u2019est le moment !', b: 'Un live maintenant = plus de succ\u00E8s sur VidiGagne \uD83D\uDE80' },
+  ],
+  invite: [
+    { t: '\uD83D\uDC68\u200D\uD83D\uDC69\u200D\uD83D\uDC67 Invite tes proches !', b: 'Famille et amis sur VidiGagne = +50 pi\u00E8ces par ami \uD83C\uDF89' },
+    { t: '\uD83C\uDF89 Plus d\u2019amis, plus de pi\u00E8ces', b: 'Invite tes amis et gagne +50 pi\u00E8ces chacun !' },
+    { t: '\uD83D\uDCB8 Tes amis = ton argent', b: 'Partage ton code parrainage et gagne +50 pi\u00E8ces par ami' },
+  ]
+};
+function userLocalHour(tz) {
+  try {
+    const h = new Intl.DateTimeFormat('en-US', { timeZone: tz || 'America/Port-au-Prince', hour: 'numeric', hour12: false }).format(new Date());
+    return parseInt(h, 10) % 24;
+  } catch (_) { return 12; }
+}
+function nextMorning8(tz) {
+  // prochain 8h00 heure locale de l'utilisateur (approx via offset)
+  try {
+    const nowMs = Date.now();
+    for (let addH = 1; addH <= 30; addH++) {
+      const h = new Intl.DateTimeFormat('en-US', { timeZone: tz || 'America/Port-au-Prince', hour: 'numeric', hour12: false }).format(new Date(nowMs + addH * 3600000));
+      if (parseInt(h, 10) % 24 === 8) return nowMs + addH * 3600000;
+    }
+  } catch (_) {}
+  return Date.now() + 8 * 3600000;
+}
+async function scheduleDailyCampaigns() {
+  try {
+    const day = new Date().toISOString().slice(0, 10);
+    const existing = await get1('SELECT id FROM notif_campaigns WHERE day=? LIMIT 1', day);
+    if (existing) return { ok: true, skipped: true };
+    const users = await allRows("SELECT id FROM users WHERE fcm_token IS NOT NULL AND fcm_token != '' AND (campaign_notifs IS NULL OR campaign_notifs=1)");
+    if (!users.length) return { ok: true, users: 0 };
+    // mélange aléatoire
+    for (let i = users.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); const t = users[i]; users[i] = users[j]; users[j] = t; }
+    const nowMs = Date.now();
+    const SPREAD_H = 6, SLOTS = SPREAD_H * 6; // 6h étalées, 1 vague / 10 min
+    const perSlot = Math.max(1, Math.ceil(users.length / SLOTS));
+    let qi = 0;
+    for (const type of ['go_live', 'invite']) {
+      const pool = CAMPAIGN_MSGS[type];
+      const m = pool[Math.floor(Math.random() * pool.length)];
+      const cid = await insertId('INSERT INTO notif_campaigns(type,title,body,day,status,created_at) VALUES(?,?,?,?,?,?)',
+        type, m.t, m.b, day, 'sending', nowMs);
+      let slot = 0, inSlot = 0;
+      for (const u of users) {
+        const sched = nowMs + slot * 600000 + Math.floor(Math.random() * 600000);
+        await runSql('INSERT INTO notif_queue(campaign_id,user_id,scheduled_at,sent_at,created_at) VALUES(?,?,?,?,?)',
+          cid, u.id, sched, null, nowMs);
+        if (++inSlot >= perSlot) { inSlot = 0; slot++; }
+        qi++;
+      }
+    }
+    console.log('campagnes notif du jour planifiées:', qi, 'envois en vagues');
+    return { ok: true, queued: qi };
+  } catch (e) { console.error('scheduleDailyCampaigns:', e.message); return { ok: false }; }
+}
+async function processNotifQueue() {
+  try {
+    const nowMs = Date.now();
+    const dayStart = new Date(); dayStart.setUTCHours(0, 0, 0, 0);
+    const due = await allRows(`SELECT q.id AS qid, q.user_id, q.campaign_id, c.type, c.title, c.body, u.tz,
+      u.campaign_notifs, u.fcm_token FROM notif_queue q
+      JOIN notif_campaigns c ON c.id=q.campaign_id JOIN users u ON u.id=q.user_id
+      WHERE q.sent_at IS NULL AND q.scheduled_at <= ? ORDER BY q.scheduled_at ASC LIMIT 200`, nowMs);
+    let sent = 0;
+    for (const d of due) {
+      try {
+        if (!d.fcm_token || d.campaign_notifs === 0) { await runSql('UPDATE notif_queue SET sent_at=? WHERE id=?', nowMs, d.qid); continue; }
+        // max 2/jour/utilisateur
+        const c = await get1('SELECT COUNT(*) AS n FROM notif_queue WHERE user_id=? AND sent_at>=?', d.user_id, dayStart.getTime());
+        if ((c.n || 0) >= 2) { await runSql('UPDATE notif_queue SET sent_at=? WHERE id=?', nowMs, d.qid); continue; }
+        // pas la nuit : 8h-22h heure locale
+        const h = userLocalHour(d.tz);
+        if (h < 8 || h >= 22) { await runSql('UPDATE notif_queue SET scheduled_at=? WHERE id=?', nextMorning8(d.tz), d.qid); continue; }
+        // voie principale : table notifications -> le poller NotifReceiver de l'app la délivre même app fermée
+        try { await insertId('INSERT INTO notifications(user_id,type,actor_id,video_id,title,text,is_read,created_at) VALUES(?,?,?,?,?,?,0,?)', d.user_id, d.type, null, null, d.title, d.body, nowMs); } catch (_) {}
+        const r = await sendFcmPush(d.user_id, d.title, d.body, { action: d.type === 'go_live' ? 'go_live' : 'invite', campaign_id: String(d.campaign_id) });
+        await runSql('UPDATE notif_queue SET sent_at=? WHERE id=?', nowMs, d.qid);
+        sent++;
+      } catch (_) {}
+    }
+    // campagnes terminées ?
+    const open = await allRows("SELECT c.id FROM notif_campaigns c WHERE c.status='sending' AND NOT EXISTS(SELECT 1 FROM notif_queue q WHERE q.campaign_id=c.id AND q.sent_at IS NULL)");
+    for (const o of open) await runSql("UPDATE notif_campaigns SET status='done' WHERE id=?", o.id);
+    if (sent) console.log('notifs campagne envoyées:', sent);
+    return { ok: true, sent };
+  } catch (e) { console.error('processNotifQueue:', e.message); return { ok: false }; }
+}
+// l'utilisateur règle ses notifs motivationnelles + son fuseau
+app.post('/api/me/campaign-notifs', auth, async (req, res) => {
+  try {
+    const en = req.body && req.body.enabled === false ? 0 : 1;
+    await runSql('UPDATE users SET campaign_notifs=? WHERE id=?', en, req.userId);
+    res.json({ ok: true, enabled: !!en });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.post('/api/me/tz', auth, async (req, res) => {
+  try {
+    let tz = String((req.body || {}).tz || '').slice(0, 60);
+    try { new Intl.DateTimeFormat('en-US', { timeZone: tz }); } catch (_) { tz = 'America/Port-au-Prince'; }
+    await runSql('UPDATE users SET tz=? WHERE id=?', tz, req.userId);
+    res.json({ ok: true, tz });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.get('/api/me/campaign-notifs', auth, async (req, res) => {
+  try {
+    const u = await get1('SELECT campaign_notifs FROM users WHERE id=?', req.userId);
+    res.json({ ok: true, enabled: !u || u.campaign_notifs !== 0 });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// déclenchement manuel (admin)
+app.post('/api/admin/campaigns/trigger', async (req, res) => {
+  try {
+    const t = req.headers['x-admin-token'];
+    if (!process.env.ADMIN_TOKEN || t !== process.env.ADMIN_TOKEN) return res.status(403).json({ error: 'non autorisé' });
+    const a = await scheduleDailyCampaigns();
+    const b = await processNotifQueue();
+    res.json({ ok: true, schedule: a, process: b });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
 // v1.77 : biographie du profil (150 caractères max)
 app.post('/api/me/bio', auth, async (req, res) => {
   try {
@@ -7120,6 +7276,9 @@ initDb().then(() => {
   expireSubs();
   setInterval(expireSubs, 86400000); // désactive les abonnements expirés toutes les 24 h
   setInterval(runVerificationBot, 3600000); // 🤖 bot de vérification toutes les heures
+  scheduleDailyCampaigns().catch(()=>{}); // campagnes notif du jour
+  setInterval(()=>{scheduleDailyCampaigns().catch(()=>{})}, 3600000); // vérifie chaque heure
+  setInterval(()=>{processNotifQueue().catch(()=>{})}, 600000); // traite la file toutes les 10 min
   runVerificationBot().catch(()=>{}); // + au démarrage
   const server = app.listen(PORT, () => console.log(
     `VidiGagne Server v2 sur http://localhost:${PORT} (db=${USE_PG ? 'postgres' : 'sqlite'}, storage=${USE_CLOUDINARY ? 'cloudinary' : 'local'})`));
