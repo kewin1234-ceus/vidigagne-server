@@ -681,6 +681,23 @@ app.post('/api/admin/verification/:id', async (req, res) => {
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
+// v1.66 : 🤖 le bot supprime à la publication tout hashtag mentionnant une plateforme concurrente
+const BANNED_PLATFORM_TAGS = new Set(("tiktok,tik_tok,tiktoker,tiktokeuse,tiktokfrance,tiktokviral,tiktokdance," +
+  "tiktokchallenge,doutok,douyin,facebook,fb,facebooks,youtube,youtu,youtuber,youtubeuse,instagram,insta,ig," +
+  "snapchat,snap,twitter,tweet,tweets,x,whatsapp,telegram,twitch,twitchtv,reddit,pinterest,linkedin,threads," +
+  "discord,kwai,triller,likee,dubsmash,vimeo,dailymotion,periscope,vine,musically,musicaly,reels,shorts,story").split(','));
+// un hashtag est interdit s'il EST ou CONTIENT un nom de plateforme (ex: #tiktokfrance)
+function stripBannedTags(text) {
+  let removed = [];
+  const clean = String(text || '').replace(/#([\p{L}\p{N}_]+)/gu, (m, tag) => {
+    const t = tag.toLowerCase();
+    for (const b of BANNED_PLATFORM_TAGS) {
+      if (t === b || t.includes(b) || b.includes(t) && t.length > 2) { removed.push('#' + tag); return ''; }
+    }
+    return m;
+  });
+  return { clean: clean.replace(/\s{2,}/g, ' ').trim(), removed: [...new Set(removed)] };
+}
 // ---------- v1.65 : 🤖 BOT DE VÉRIFICATION ----------
 // Le bot (pas l'admin) examine automatiquement :
 // 1. les demandes de badge vérifié
@@ -1834,7 +1851,13 @@ app.post('/api/videos', auth, upload.single('video'), async (req, res) => {
       return res.status(413).json({ error: 'quota de stockage atteint (2 Go)' });
     const fname = await storeVideo(req.file);
     const b = req.body || {};
-    const descText = String(b.description || b.desc || '').slice(0, 500);
+    let descText = String(b.description || b.desc || '').slice(0, 500);
+    // 🤖 le bot supprime les hashtags de plateformes concurrentes dès la publication
+    const _bt = stripBannedTags(descText);
+    descText = _bt.clean;
+    const _bt2 = stripBannedTags(String(b.tags || ''));
+    if (b.tags) b.tags = _bt2.clean;
+    const _bannedRemoved = [...new Set([..._bt.removed, ..._bt2.removed])];
     // publication programmée : scheduled_at (ms) doit être dans le futur, sinon publication immédiate
     let scheduledAt = null;
     const schRaw = Number(b.scheduled_at);
@@ -1862,6 +1885,10 @@ app.post('/api/videos', auth, upload.single('video'), async (req, res) => {
       req.userId, fname, descText, String(b.tags || '').slice(0, 300),
       String(b.sound || '').slice(0, 120), duration, scheduledAt, visibility, captions,
       isReplay, liveId, ttsText, ttsVoice, ttsRate, _tcJson, now());
+    if (_bannedRemoved.length) {
+      try { await notify(req.userId, 'system', null, null,
+        '🤖 Hashtags supprimés : ' + _bannedRemoved.join(' ') + ' (plateformes concurrentes interdites)'); } catch (_) {}
+    }
     // pièces : +10 par publication
     await runSql('UPDATE users SET coins=coins+10 WHERE id=?', req.userId);
     await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
@@ -1899,7 +1926,13 @@ app.post('/api/photos', auth, uploadPhotos.array('photos', 10), async (req, res)
     for (const f of files) raw.push(await storeImage(f, 'vidigagne/photos'));
     const urls = raw.map(fileUrl);
     const b = req.body || {};
-    const descText = String(b.description || b.desc || '').slice(0, 500);
+    let descText = String(b.description || b.desc || '').slice(0, 500);
+    // 🤖 le bot supprime les hashtags de plateformes concurrentes dès la publication
+    const _bt = stripBannedTags(descText);
+    descText = _bt.clean;
+    const _bt2 = stripBannedTags(String(b.tags || ''));
+    if (b.tags) b.tags = _bt2.clean;
+    const _bannedRemoved = [...new Set([..._bt.removed, ..._bt2.removed])];
     const captions = b.captions ? cleanCaptions(b.captions) : '[]';
     const id = await insertId(
       `INSERT INTO videos(user_id,file,description,tags,media_type,photos,captions,visibility,created_at)
