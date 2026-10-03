@@ -5091,7 +5091,7 @@ function liveJSON(l, row, viewersCount) {
     username: row ? row.username : undefined, name: row ? row.name : undefined, avatar: row ? row.avatar : undefined,
     viewers_count: viewersCount || 0,
     peak_viewers: Number(l.peak_viewers) || 0, duration_s: Number(l.duration_s) || 0,
-    gifts_total: Number(l.gifts_total) || 0, chat_total: Number(l.chat_total) || 0,
+    chat_total: Number(l.chat_total) || 0,
     likes: Number(l.likes) || 0, shares: Number(l.shares) || 0, live_type: l.live_type || 'guests', max_guests: Math.max(1, Math.min(8, Number(l.max_guests) || 8)),
   };
 }
@@ -5152,10 +5152,32 @@ app.get('/api/live/:id/stats', async (req, res) => {
       likes: Number(l.likes) || 0,
       shares: Number(l.shares) || 0,
       viewers: await liveViewersCount(l.id),
-      gifts_total: Number(l.gifts_total) || 0,
       chat_total: Number(l.chat_total) || 0,
       live_type: l.live_type || 'guests'
     });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+
+// Totaux cadeaux par participant — les gains du CRÉATEUR sont CONFIDENTIELS :
+// seul le créateur (et le système) voit son vrai total ; les spectateurs
+// voient les totaux des invités mais le total du créateur est masqué (null).
+app.get('/api/live/:id/gift-totals', auth, async (req, res) => {
+  try {
+    const l = await liveById(req.params.id);
+    if (!l) return res.status(404).json({ error: 'live introuvable' });
+    const isHost = Number(l.user_id) === Number(req.userId);
+    const rows = await allRows('SELECT to_id, COALESCE(SUM(cost),0) AS total FROM live_gifts WHERE live_id=? GROUP BY to_id', l.id);
+    const map = {};
+    (rows || []).forEach(r => { map[Number(r.to_id)] = Number(r.total) || 0; });
+    const guests = await allRows("SELECT user_id, username FROM live_guests WHERE live_id=? AND status='accepted' ORDER BY created_at ASC", l.id);
+    const host = await get1('SELECT id, username FROM users WHERE id=?', l.user_id);
+    const totals = [];
+    // hôte : total masqué pour les spectateurs
+    totals.push({ user_id: Number(l.user_id), username: host ? host.username : '', total: isHost ? (map[Number(l.user_id)] || 0) : null, hidden: !isHost });
+    (guests || []).forEach(g => {
+      totals.push({ user_id: Number(g.user_id), username: g.username || '', total: map[Number(g.user_id)] || 0, hidden: false });
+    });
+    res.json({ ok: true, is_host: isHost, totals });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 app.post('/api/live/:id/share', auth, async (req, res) => {
