@@ -338,6 +338,26 @@ CREATE TABLE IF NOT EXISTS live_chat(
   text TEXT NOT NULL,
   created_at BIGINT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS live_summaries(
+  id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+  live_id INTEGER NOT NULL UNIQUE,
+  user_id INTEGER NOT NULL,
+  title TEXT NOT NULL DEFAULT '',
+  started_at BIGINT NOT NULL,
+  ended_at BIGINT NOT NULL,
+  duration_s INTEGER NOT NULL DEFAULT 0,
+  peak_viewers INTEGER NOT NULL DEFAULT 0,
+  unique_viewers INTEGER NOT NULL DEFAULT 0,
+  likes INTEGER NOT NULL DEFAULT 0,
+  shares INTEGER NOT NULL DEFAULT 0,
+  chat_total INTEGER NOT NULL DEFAULT 0,
+  coins_earned INTEGER NOT NULL DEFAULT 0,
+  usd_earned REAL NOT NULL DEFAULT 0,
+  withdrawn_usd REAL NOT NULL DEFAULT 0,
+  exchanged_usd REAL NOT NULL DEFAULT 0,
+  created_at BIGINT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS live_viewers(
   live_id INTEGER NOT NULL,
   user_id INTEGER NOT NULL,
@@ -646,7 +666,13 @@ CREATE TABLE IF NOT EXISTS family_settings(
     for (const col of ["ALTER TABLE lives ADD COLUMN IF NOT EXISTS live_type TEXT NOT NULL DEFAULT 'guests'",
       "ALTER TABLE lives ADD COLUMN IF NOT EXISTS likes INTEGER NOT NULL DEFAULT 0",
       "ALTER TABLE lives ADD COLUMN IF NOT EXISTS shares INTEGER NOT NULL DEFAULT 0",
-      "ALTER TABLE lives ADD COLUMN IF NOT EXISTS max_guests INTEGER NOT NULL DEFAULT 8"]) {
+      "ALTER TABLE lives ADD COLUMN IF NOT EXISTS max_guests INTEGER NOT NULL DEFAULT 8",
+      "ALTER TABLE lives ADD COLUMN IF NOT EXISTS duration_s INTEGER NOT NULL DEFAULT 0",
+      "ALTER TABLE lives ADD COLUMN IF NOT EXISTS peak_viewers INTEGER NOT NULL DEFAULT 0",
+      "ALTER TABLE lives ADD COLUMN IF NOT EXISTS gifts_total INTEGER NOT NULL DEFAULT 0",
+      "ALTER TABLE lives ADD COLUMN IF NOT EXISTS chat_total INTEGER NOT NULL DEFAULT 0",
+      "ALTER TABLE live_summaries ADD COLUMN IF NOT EXISTS withdrawn_usd REAL NOT NULL DEFAULT 0",
+      "ALTER TABLE live_summaries ADD COLUMN IF NOT EXISTS exchanged_usd REAL NOT NULL DEFAULT 0"]) {
       try { await pool.query(col); } catch (e) {}
     }
   }
@@ -654,7 +680,13 @@ CREATE TABLE IF NOT EXISTS family_settings(
     try { lite.exec(`ALTER TABLE lives ADD COLUMN live_type TEXT NOT NULL DEFAULT 'guests'`); } catch (e) {}
     try { lite.exec(`ALTER TABLE lives ADD COLUMN likes INTEGER NOT NULL DEFAULT 0`); } catch (e) {}
     try { lite.exec(`ALTER TABLE lives ADD COLUMN shares INTEGER NOT NULL DEFAULT 0`); } catch (e) {}
-    try { lite.exec(`ALTER TABLE lives ADD COLUMN max_guests INTEGER NOT NULL DEFAULT 8`); } catch (e) {} }
+    try { lite.exec(`ALTER TABLE lives ADD COLUMN max_guests INTEGER NOT NULL DEFAULT 8`); } catch (e) {}
+    try { lite.exec(`ALTER TABLE lives ADD COLUMN duration_s INTEGER NOT NULL DEFAULT 0`); } catch (e) {}
+    try { lite.exec(`ALTER TABLE lives ADD COLUMN peak_viewers INTEGER NOT NULL DEFAULT 0`); } catch (e) {}
+    try { lite.exec(`ALTER TABLE lives ADD COLUMN gifts_total INTEGER NOT NULL DEFAULT 0`); } catch (e) {}
+    try { lite.exec(`ALTER TABLE lives ADD COLUMN chat_total INTEGER NOT NULL DEFAULT 0`); } catch (e) {}
+    try { lite.exec(`ALTER TABLE live_summaries ADD COLUMN withdrawn_usd REAL NOT NULL DEFAULT 0`); } catch (e) {}
+    try { lite.exec(`ALTER TABLE live_summaries ADD COLUMN exchanged_usd REAL NOT NULL DEFAULT 0`); } catch (e) {} }
   // migrations : colonnes d'authentification sociale
   if (USE_PG) {
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT`);
@@ -5096,6 +5128,108 @@ function liveJSON(l, row, viewersCount) {
   };
 }
 // Feed des lives en cours (pour les cartes LIVE dans "Pour toi")
+// NOTE: déclaré AVANT /api/live/:id sinon Express capture 'history' comme :id
+app.get('/api/live/history', auth, async (req, res) => {
+  const rows = await allRows('SELECT * FROM live_summaries WHERE user_id=? ORDER BY created_at DESC LIMIT 100', req.userId);
+  res.json({ lives: rows.map(liveSummaryJSON) });
+});
+// ---------- v2.05 : tableau de bord post-live enrichi ----------
+async function livePool(liveId, userId) {
+  const l = await liveById(liveId);
+  if (!l) return { err: 'live introuvable', code: 404 };
+  if (Number(l.user_id) !== Number(userId)) return { err: 'non autorisé', code: 403 };
+  const s = await get1('SELECT * FROM live_summaries WHERE live_id=?', l.id);
+  if (!s) return { err: 'live non terminé', code: 400 };
+  const earned = Number(s.usd_earned) || 0, wd = Number(s.withdrawn_usd) || 0, ex = Number(s.exchanged_usd) || 0;
+  return { live: l, summary: s, remaining: Math.max(0, Math.round((earned - wd - ex) * 100) / 100) };
+}
+// Résumé enrichi : top tapoteurs, top envoyeurs de cadeaux, invités montés à l'écran
+app.get('/api/live/:id/summary', auth, async (req, res) => {
+  try {
+    const p = await livePool(req.params.id, req.userId);
+    if (p.err) return res.status(p.code).json({ error: p.err });
+    const lid = p.live.id;
+    const tappers = await allRows(
+      "SELECT u.username, u.avatar, t.tap_count AS taps FROM live_taps t JOIN users u ON u.id=t.user_id WHERE t.live_id=? AND t.tap_count>0 ORDER BY t.tap_count DESC LIMIT 20", lid);
+    const gifters = await allRows(
+      "SELECT u.username, u.avatar, SUM(g.cost) AS total FROM live_gifts g JOIN users u ON u.id=g.from_id WHERE g.live_id=? GROUP BY g.from_id ORDER BY total DESC LIMIT 20", lid);
+    const gr = await get1("SELECT COUNT(*) AS c FROM live_guests WHERE live_id=? AND status='accepted'", lid);
+    res.json({ ok: true, summary: liveSummaryJSON(p.summary),
+      guests_on_screen: Number(gr && gr.c) || 0,
+      top_tappers: tappers.map(r => ({ username: r.username, avatar: r.avatar, taps: Number(r.taps) || 0 })),
+      top_gifters: gifters.map(r => ({ username: r.username, avatar: r.avatar, total: Number(r.total) || 0 })),
+      withdrawn_usd: Number(p.summary.withdrawn_usd) || 0,
+      exchanged_usd: Number(p.summary.exchanged_usd) || 0,
+      remaining_usd: p.remaining });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// Retrait partiel depuis les gains du live (montant en USD)
+app.post('/api/live/withdraw', auth, async (req, res) => {
+  try {
+    const { live_id, amount_usd, method_id } = req.body || {};
+    const amount = Math.round(Number(amount_usd) * 100) / 100;
+    const p = await livePool(live_id, req.userId);
+    if (p.err) return res.status(p.code).json({ error: p.err });
+    // Règle Kewin 2026-10-03 : gains LIVE -> retrait dès 1 $ (500 pièces), pas 2 $ comme les vidéos.
+    // Les taxes/frais des plateformes (PayPal, MonCash...) ne sont pas gérés : on affiche le montant demandé.
+    if (!amount || amount < 1) return res.status(400).json({ error: 'minimum 1 $ (500 pièces)' });
+    if (amount > p.remaining) return res.status(400).json({ error: 'montant supérieur aux gains restants (' + p.remaining.toFixed(2) + ' $)' });
+    const coins = Math.floor(amount * 500);
+    if (coins < 500) return res.status(400).json({ error: 'minimum 500 pièces' });
+    const pm = await get1('SELECT * FROM payment_methods WHERE id=? AND user_id=?', method_id, req.userId);
+    if (!pm) return res.status(400).json({ error: 'moyen de paiement introuvable — ajoute-le dans Retirer mes gains' });
+    const vc = await validCoins(req.userId);
+    if (coins > vc.valid) return res.status(400).json({ error: 'pas assez de pièces valides (' + vc.valid + ' disponibles)' });
+    // débit atomique des pièces + suivi du pool du live
+    const debited = await runSqlChanges('UPDATE users SET coins=coins-? WHERE id=? AND coins>=?', coins, req.userId, coins);
+    if (!debited) return res.status(400).json({ error: 'pas assez de pièces' });
+    await runSql('UPDATE live_summaries SET withdrawn_usd=withdrawn_usd+? WHERE live_id=?', amount, p.live.id);
+    await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
+      req.userId, -coins, 'retrait live #' + p.live.id + ' (' + pm.type + ')', now());
+    const usd = Math.floor(coins / 500 * 100) / 100;
+    const wid = await insertId(
+      'INSERT INTO withdrawals(user_id,coins,usd,method,account,status,created_at) VALUES(?,?,?,?,?,?,?)',
+      req.userId, coins, usd, pm.type, pm.account, 'pending', now());
+    const rid = await insertId(
+      'INSERT INTO receipts(withdrawal_id,user_id,receipt_no,coins,usd,method,account,status,email_status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)',
+      wid, req.userId, 'TMP', coins, usd, pm.label || pm.type, pm.account, 'pending', 'pending', now());
+    const receiptNo = 'VG-' + new Date().getFullYear() + '-' + String(rid).padStart(6, '0');
+    await runSql('UPDATE receipts SET receipt_no=? WHERE id=?', receiptNo, rid);
+    const me = await get1('SELECT * FROM users WHERE id=?', req.userId);
+    const r = await get1('SELECT * FROM receipts WHERE id=?', rid);
+    const emailStatus = await sendReceiptEmail(me, { ...r, receipt_no: receiptNo });
+    await runSql('UPDATE receipts SET email_status=? WHERE id=?', emailStatus, rid);
+    const bal = await get1('SELECT coins FROM users WHERE id=?', req.userId);
+    const s2 = await get1('SELECT withdrawn_usd, exchanged_usd, usd_earned FROM live_summaries WHERE live_id=?', p.live.id);
+    const rem = Math.max(0, Math.round((Number(s2.usd_earned) - Number(s2.withdrawn_usd) - Number(s2.exchanged_usd)) * 100) / 100);
+    res.json({ ok: true, id: wid, usd, coins, status: 'pending', receipt_no: receiptNo,
+      coins_balance: bal ? bal.coins : 0, remaining_usd: rem,
+      note: 'Le reste (' + rem.toFixed(2) + ' $) reste dans ton solde principal ✓' });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// Échange : convertir des gains USD du live en pièces virtuelles (1 $ = 500 pièces)
+// Les pièces sont déjà créditées au fur et à mesure des cadeaux : l'échange réserve
+// une part des gains pour booster des vidéos / envoyer des cadeaux en live.
+app.post('/api/live/exchange-coins', auth, async (req, res) => {
+  try {
+    const { live_id, amount_usd } = req.body || {};
+    const amount = Math.round(Number(amount_usd) * 100) / 100;
+    const p = await livePool(live_id, req.userId);
+    if (p.err) return res.status(p.code).json({ error: p.err });
+    if (!amount || amount <= 0) return res.status(400).json({ error: 'montant invalide' });
+    if (amount > p.remaining) return res.status(400).json({ error: 'montant supérieur aux gains restants (' + p.remaining.toFixed(2) + ' $)' });
+    const coins = Math.floor(amount * 500);
+    if (coins < 1) return res.status(400).json({ error: 'montant trop petit' });
+    await runSql('UPDATE live_summaries SET exchanged_usd=exchanged_usd+? WHERE live_id=?', amount, p.live.id);
+    await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
+      req.userId, 0, 'échange live #' + p.live.id + ' : ' + amount.toFixed(2) + ' $ → ' + coins + ' 🪙 réservées (boost / cadeaux live)', now()).catch(() => {});
+    const s2 = await get1('SELECT withdrawn_usd, exchanged_usd, usd_earned FROM live_summaries WHERE live_id=?', p.live.id);
+    const rem = Math.max(0, Math.round((Number(s2.usd_earned) - Number(s2.withdrawn_usd) - Number(s2.exchanged_usd)) * 100) / 100);
+    const bal = await get1('SELECT coins FROM users WHERE id=?', req.userId);
+    res.json({ ok: true, coins, usd: amount, coins_balance: bal ? bal.coins : 0, remaining_usd: rem,
+      note: coins + ' 🪙 disponibles dans ton solde pour booster tes vidéos ou envoyer des cadeaux en live ✓' });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
 app.get('/api/live/feed', async (req, res) => {
   try {
     const rows = await allRows(
@@ -5140,6 +5274,16 @@ app.post('/api/live/:id/tap', auth, async (req, res) => {
     if (!Number.isFinite(n) || n < 1) n = 1;
     if (n > 10000) n = 10000; // garde-fou anti-débordement par requête
     await runSql('UPDATE lives SET likes=likes+? WHERE id=?', n, l.id);
+    // v2.05 : comptabilise les taps par utilisateur pour le classement top tapoteurs
+    try {
+      if (USE_PG) {
+        await runSql('INSERT INTO live_taps(live_id,user_id,tap_count,window_start,last_tap_at) VALUES(?,?,?,0,?) ON CONFLICT(live_id,user_id) DO UPDATE SET tap_count=live_taps.tap_count+?',
+          l.id, req.userId, n, now(), n);
+      } else {
+        await runSql('INSERT INTO live_taps(live_id,user_id,tap_count,window_start,last_tap_at) VALUES(?,?,?,?,?) ON CONFLICT(live_id,user_id) DO UPDATE SET tap_count=tap_count+?',
+          l.id, req.userId, n, 0, now(), n);
+      }
+    } catch (e) {}
     const lj = await get1('SELECT likes FROM lives WHERE id=?', l.id);
     res.json({ ok: true, likes: Number(lj.likes) || 0, added: n });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
@@ -5510,14 +5654,39 @@ app.post('/api/live/:id/end', auth, async (req, res) => {
   const l = await liveById(req.params.id);
   if (!l) return res.status(404).json({ error: 'live introuvable' });
   if (Number(l.user_id) !== Number(req.userId)) return res.status(403).json({ error: 'non autorisé' });
+  if (l.ended_at) {
+    const ex = await get1('SELECT * FROM live_summaries WHERE live_id=?', l.id);
+    if (ex) return res.json({ ok: true, summary: liveSummaryJSON(ex) });
+  }
   const t = now();
   const durationS = Math.max(0, Math.round((t - Number(l.started_at)) / 1000));
   const hbCount = await liveViewersCount(l.id);
   const peak = Math.max(Number(l.peak_viewers) || 0, Number(l.viewers) || 0, hbCount);
   const gr = await get1('SELECT COALESCE(SUM(cost),0) AS s FROM gifts WHERE live_id=?', l.id);
   const cr = await get1('SELECT COUNT(*) AS c FROM live_chat WHERE live_id=?', l.id);
+  const uv = await get1('SELECT COUNT(DISTINCT user_id) AS c FROM live_viewers WHERE live_id=?', l.id);
+  const likes = Number(l.likes) || 0, shares = Number(l.shares) || 0;
+  const uniqueV = Number(uv && uv.c) || 0;
+  // pièces gagnées par le créateur pendant ce live (part 50% déjà créditée à chaque cadeau)
+  const ce = await get1('SELECT COALESCE(SUM(creator_share),0) AS s FROM live_gifts WHERE live_id=? AND to_id=?', l.id, l.user_id);
+  const coinsEarned = Number(ce && ce.s) || 0;
+  const usdEarned = Math.floor(coinsEarned / 500 * 100) / 100;
   await runSql('UPDATE lives SET ended_at=?, duration_s=?, peak_viewers=?, gifts_total=?, chat_total=? WHERE id=?',
     t, durationS, peak, Number(gr.s) || 0, Number(cr.c) || 0, l.id);
+  const summ = { live_id: l.id, user_id: l.user_id, title: l.title || '', started_at: Number(l.started_at),
+    ended_at: t, duration_s: durationS, peak_viewers: peak, unique_viewers: uniqueV, likes, shares,
+    chat_total: Number(cr.c) || 0, coins_earned: coinsEarned, usd_earned: usdEarned, created_at: t };
+  if (USE_PG) {
+    await runSql(`INSERT INTO live_summaries(live_id,user_id,title,started_at,ended_at,duration_s,peak_viewers,unique_viewers,likes,shares,chat_total,coins_earned,usd_earned,created_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(live_id) DO UPDATE SET ended_at=EXCLUDED.ended_at,duration_s=EXCLUDED.duration_s,peak_viewers=EXCLUDED.peak_viewers,unique_viewers=EXCLUDED.unique_viewers,likes=EXCLUDED.likes,shares=EXCLUDED.shares,chat_total=EXCLUDED.chat_total,coins_earned=EXCLUDED.coins_earned,usd_earned=EXCLUDED.usd_earned`,
+      summ.live_id, summ.user_id, summ.title, summ.started_at, summ.ended_at, summ.duration_s, summ.peak_viewers, summ.unique_viewers, summ.likes, summ.shares, summ.chat_total, summ.coins_earned, summ.usd_earned, summ.created_at);
+  } else {
+    await runSql(`INSERT OR REPLACE INTO live_summaries(live_id,user_id,title,started_at,ended_at,duration_s,peak_viewers,unique_viewers,likes,shares,chat_total,coins_earned,usd_earned,created_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      summ.live_id, summ.user_id, summ.title, summ.started_at, summ.ended_at, summ.duration_s, summ.peak_viewers, summ.unique_viewers, summ.likes, summ.shares, summ.chat_total, summ.coins_earned, summ.usd_earned, summ.created_at);
+  }
+  await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
+    l.user_id, 0, 'récap live #' + l.id + ' : ' + coinsEarned + ' pièces (≈ $' + usdEarned.toFixed(2) + ')', t).catch(() => {});
   const room = liveRooms[req.params.id];
   if (room) {
     const msg = JSON.stringify({ t: 'ended' });
@@ -5525,9 +5694,18 @@ app.post('/api/live/:id/end', auth, async (req, res) => {
     room.viewers.forEach((pid, w) => { if (w.readyState === 1) w.send(msg); });
     delete liveRooms[req.params.id];
   }
-  res.json({ ok: true, stats: { duration_s: durationS, peak_viewers: peak,
-    gifts_total: Number(gr.s) || 0, chat_total: Number(cr.c) || 0 } });
+  res.json({ ok: true, summary: summ, stats: { duration_s: durationS, peak_viewers: peak,
+    gifts_total: Number(gr.s) || 0, chat_total: Number(cr.c) || 0, coins_earned: coinsEarned, usd_earned: usdEarned,
+    unique_viewers: uniqueV, likes, shares } });
 });
+
+function liveSummaryJSON(s) {
+  return { live_id: Number(s.live_id), title: s.title || '', started_at: Number(s.started_at), ended_at: Number(s.ended_at),
+    duration_s: Number(s.duration_s), peak_viewers: Number(s.peak_viewers), unique_viewers: Number(s.unique_viewers),
+    likes: Number(s.likes), shares: Number(s.shares), chat_total: Number(s.chat_total),
+    coins_earned: Number(s.coins_earned), usd_earned: Number(s.usd_earned) };
+}
+
 
 // ---------- sons : bibliothèque ----------
 // upload audio (20 Mo max)
