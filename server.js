@@ -606,16 +606,35 @@ CREATE TABLE IF NOT EXISTS family_settings(
       status TEXT NOT NULL DEFAULT 'pending', score_a INTEGER NOT NULL DEFAULT 0,
       score_b INTEGER NOT NULL DEFAULT 0, winner_id INTEGER,
       created_at BIGINT NOT NULL, starts_at BIGINT, ends_at BIGINT)`); // v1.60 : badges vérifiés demandables
-app.post('/api/verification/request', auth, async (req, res) => {
+// v1.63 : demande de badge vérifié — critères VidiGagne :
+// artiste, marque, entreprise, créateur, personnalité... doit prouver son identité
+// (pièce d'identité) + son activité (site web / marque représentée / liens).
+const VERIF_CATEGORIES = ['artiste', 'marque', 'entreprise', 'createur', 'personnalite', 'media', 'autre'];
+app.post('/api/verification/request', auth, uploadImg.single('id_doc'), async (req, res) => {
   try {
     const u = await get1('SELECT verified FROM users WHERE id=?', req.userId);
     if (u && u.verified) return res.status(400).json({ error: 'compte déjà vérifié' });
-    const reason = String((req.body || {}).reason || '').trim().slice(0, 500);
-    if (reason.length < 20) return res.status(400).json({ error: 'explique en 20 caractères minimum pourquoi tu mérites le badge' });
-    await runSql(`INSERT INTO verification_requests(user_id, status, reason, created_at)
-      VALUES(?, 'pending', ?, ?)
-      ON CONFLICT(user_id) DO UPDATE SET status='pending', reason=excluded.reason, created_at=excluded.created_at, reviewed_at=NULL`,
-      req.userId, reason, now());
+    const b = req.body || {};
+    const fullName = String(b.full_name || '').trim().slice(0, 100);
+    const category = String(b.category || '').trim().toLowerCase();
+    const website = String(b.website || '').trim().slice(0, 300);
+    const proofLinks = String(b.proof_links || '').trim().slice(0, 1000);
+    const activity = String(b.activity || '').trim().slice(0, 1000);
+    if (fullName.length < 3) return res.status(400).json({ error: 'nom complet requis' });
+    if (!VERIF_CATEGORIES.includes(category)) return res.status(400).json({ error: 'catégorie invalide' });
+    if (!req.file) return res.status(400).json({ error: 'photo de la pièce d\u2019identité requise' });
+    if (!website && !proofLinks) return res.status(400).json({ error: 'ajoute ton site web ou tes liens de preuve' });
+    if (activity.length < 20) return res.status(400).json({ error: 'décris ton activité (20 caractères min)' });
+    const docUrl = await storeImage(req.file, 'vidigagne/verification');
+    const reason = '[' + category + '] ' + fullName + ' — ' + activity.slice(0, 300);
+    await runSql(`INSERT INTO verification_requests(user_id, status, reason, created_at,
+        full_name, category, website, proof_links, activity, id_doc_url)
+      VALUES(?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(user_id) DO UPDATE SET status='pending', reason=excluded.reason,
+        created_at=excluded.created_at, reviewed_at=NULL, full_name=excluded.full_name,
+        category=excluded.category, website=excluded.website, proof_links=excluded.proof_links,
+        activity=excluded.activity, id_doc_url=excluded.id_doc_url`,
+      req.userId, reason, now(), fullName, category, website, proofLinks, activity, docUrl);
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
@@ -630,7 +649,7 @@ app.get('/api/admin/verification', async (req, res) => {
   const t = req.headers['x-admin-token'];
   if (!process.env.ADMIN_TOKEN || t !== process.env.ADMIN_TOKEN) return res.status(403).json({ error: 'non autorisé' });
   try {
-    const rows = await allRows(`SELECT vr.*, u.username FROM verification_requests vr
+    const rows = await allRows(`SELECT vr.*, u.username, u.avatar FROM verification_requests vr
       JOIN users u ON u.id=vr.user_id WHERE vr.status='pending' ORDER BY vr.created_at ASC LIMIT 100`);
     res.json({ requests: rows });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
@@ -964,6 +983,10 @@ app.get('/api/search/insights', async (req, res) => {
     await pool.query(`CREATE TABLE IF NOT EXISTS verification_requests(
       id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL UNIQUE, status TEXT NOT NULL DEFAULT 'pending',
       reason TEXT NOT NULL DEFAULT '', created_at BIGINT NOT NULL, reviewed_at BIGINT)`);
+    for (const [col, typ] of [['full_name','TEXT'],['category','TEXT'],['website','TEXT'],
+        ['proof_links','TEXT'],['activity','TEXT'],['id_doc_url','TEXT']]) {
+      await pool.query(`ALTER TABLE verification_requests ADD COLUMN IF NOT EXISTS ${col} ${typ} DEFAULT ''`);
+    }
     await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS users_email_uidx ON users(email)`);
     await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS users_google_uidx ON users(google_id)`);
     await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS users_phone_uidx ON users(phone)`);
@@ -985,6 +1008,9 @@ app.get('/api/search/insights', async (req, res) => {
     lite.exec(`CREATE TABLE IF NOT EXISTS verification_requests(
       id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL UNIQUE, status TEXT NOT NULL DEFAULT 'pending',
       reason TEXT NOT NULL DEFAULT '', created_at BIGINT NOT NULL, reviewed_at BIGINT)`);
+    for (const col of ['full_name','category','website','proof_links','activity','id_doc_url']) {
+      try { lite.exec(`ALTER TABLE verification_requests ADD COLUMN ${col} TEXT DEFAULT ''`); } catch (_) {}
+    }
     lite.exec(`CREATE TABLE IF NOT EXISTS pk_battles(
       id INTEGER PRIMARY KEY AUTOINCREMENT, live_a_id INTEGER NOT NULL, live_b_id INTEGER NOT NULL,
       user_a_id INTEGER NOT NULL, user_b_id INTEGER NOT NULL,
