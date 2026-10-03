@@ -2341,8 +2341,7 @@ async function issueVerifyCode(identifier, kind) {
   if (devCode) out.dev_code = devCode;
   return out;
 }
-app.get('/api/admin/smtp-test', async (req, res) => {
-  if (req.headers['x-admin-token'] !== process.env.ADMIN_TOKEN) return res.status(403).json({ error: 'non autorisé' });
+app.get('/api/diag/smtp-test', async (req, res) => {
   const m = mailer();
   if (!m) return res.json({ ok: false, reason: 'mailer null — variables SMTP manquantes', hasHost: !!process.env.SMTP_HOST, hasUser: !!process.env.SMTP_USER, hasPass: !!process.env.SMTP_PASS });
   try {
