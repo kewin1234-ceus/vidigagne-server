@@ -140,7 +140,8 @@ CREATE TABLE IF NOT EXISTS lives(
   viewers INTEGER NOT NULL DEFAULT 0,
   live_type TEXT NOT NULL DEFAULT 'guests',
   likes INTEGER NOT NULL DEFAULT 0,
-  shares INTEGER NOT NULL DEFAULT 0
+  shares INTEGER NOT NULL DEFAULT 0,
+  max_guests INTEGER NOT NULL DEFAULT 8
 );
 CREATE TABLE IF NOT EXISTS fund_deposits(
   id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
@@ -644,14 +645,16 @@ CREATE TABLE IF NOT EXISTS family_settings(
   if (USE_PG) { await pool.query(schema);
     for (const col of ["ALTER TABLE lives ADD COLUMN IF NOT EXISTS live_type TEXT NOT NULL DEFAULT 'guests'",
       "ALTER TABLE lives ADD COLUMN IF NOT EXISTS likes INTEGER NOT NULL DEFAULT 0",
-      "ALTER TABLE lives ADD COLUMN IF NOT EXISTS shares INTEGER NOT NULL DEFAULT 0"]) {
+      "ALTER TABLE lives ADD COLUMN IF NOT EXISTS shares INTEGER NOT NULL DEFAULT 0",
+      "ALTER TABLE lives ADD COLUMN IF NOT EXISTS max_guests INTEGER NOT NULL DEFAULT 8"]) {
       try { await pool.query(col); } catch (e) {}
     }
   }
   else { lite.exec(schema); try { lite.exec(`ALTER TABLE users ADD COLUMN gender TEXT DEFAULT ''`); } catch (e) {}
     try { lite.exec(`ALTER TABLE lives ADD COLUMN live_type TEXT NOT NULL DEFAULT 'guests'`); } catch (e) {}
     try { lite.exec(`ALTER TABLE lives ADD COLUMN likes INTEGER NOT NULL DEFAULT 0`); } catch (e) {}
-    try { lite.exec(`ALTER TABLE lives ADD COLUMN shares INTEGER NOT NULL DEFAULT 0`); } catch (e) {} }
+    try { lite.exec(`ALTER TABLE lives ADD COLUMN shares INTEGER NOT NULL DEFAULT 0`); } catch (e) {}
+    try { lite.exec(`ALTER TABLE lives ADD COLUMN max_guests INTEGER NOT NULL DEFAULT 8`); } catch (e) {} }
   // migrations : colonnes d'authentification sociale
   if (USE_PG) {
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT`);
@@ -2772,9 +2775,12 @@ app.get('/api/creator/stats', auth, async (req, res) => {
 app.post('/api/live/start', auth, async (req, res) => {
   const title = String((req.body || {}).title || '').slice(0, 80);
   const liveType = String((req.body || {}).live_type || 'guests') === 'solo' ? 'solo' : 'guests';
-  const id = await insertId('INSERT INTO lives(user_id,title,started_at,viewers,live_type) VALUES(?,?,?,0,?)',
-    req.userId, title, now(), liveType);
-  res.json({ ok: true, id, live_type: liveType });
+  let maxGuests = parseInt((req.body || {}).max_guests, 10);
+  if (!Number.isFinite(maxGuests)) maxGuests = 8;
+  maxGuests = Math.max(1, Math.min(8, maxGuests));
+  const id = await insertId('INSERT INTO lives(user_id,title,started_at,viewers,live_type,max_guests) VALUES(?,?,?,?,?,?)',
+    req.userId, title, now(), 0, liveType, maxGuests);
+  res.json({ ok: true, id, live_type: liveType, max_guests: maxGuests });
 });
 // ---------- compte : export et suppression (droits RGPD) ----------
 app.get('/api/account/export', auth, async (req, res) => {
@@ -5086,7 +5092,7 @@ function liveJSON(l, row, viewersCount) {
     viewers_count: viewersCount || 0,
     peak_viewers: Number(l.peak_viewers) || 0, duration_s: Number(l.duration_s) || 0,
     gifts_total: Number(l.gifts_total) || 0, chat_total: Number(l.chat_total) || 0,
-    likes: Number(l.likes) || 0, shares: Number(l.shares) || 0, live_type: l.live_type || 'guests',
+    likes: Number(l.likes) || 0, shares: Number(l.shares) || 0, live_type: l.live_type || 'guests', max_guests: Math.max(1, Math.min(8, Number(l.max_guests) || 8)),
   };
 }
 // Feed des lives en cours (pour les cartes LIVE dans "Pour toi")
@@ -5097,9 +5103,10 @@ app.get('/api/live/feed', async (req, res) => {
     const lives = [];
     for (const r of rows) {
       const lj = liveJSON(r, r, await liveViewersCount(r.id));
-      const guests = await allRows("SELECT user_id, username, avatar FROM live_guests WHERE live_id=? AND status='accepted' ORDER BY created_at ASC LIMIT 8", r.id);
+      const maxGf = Math.max(1, Math.min(8, Number(r.max_guests) || 8));
+      const guests = await allRows("SELECT user_id, username, avatar FROM live_guests WHERE live_id=? AND status='accepted' ORDER BY created_at ASC LIMIT " + maxGf, r.id);
       lj.guests = guests;
-      lj.guest_slots = 8;
+      lj.guest_slots = maxGf;
       lives.push(lj);
     }
     res.json({ lives });
@@ -5292,7 +5299,8 @@ app.post('/api/live/:id/join', auth, async (req, res) => {
     }
     const row = await get1('SELECT username,name,avatar FROM users WHERE id=?', l.user_id);
     const lj = liveJSON(l, row, await liveViewersCount(l.id));
-    const guests = await allRows("SELECT user_id, username, avatar FROM live_guests WHERE live_id=? AND status='accepted' ORDER BY created_at ASC LIMIT 8", l.id);
+    const maxGj = Math.max(1, Math.min(8, Number(l.max_guests) || 8));
+    const guests = await allRows("SELECT user_id, username, avatar FROM live_guests WHERE live_id=? AND status='accepted' ORDER BY created_at ASC LIMIT " + maxGj, l.id);
     lj.guests = guests;
     const chat = await allRows('SELECT c.id, c.text, c.created_at, u.username, u.avatar FROM live_chat c JOIN users u ON u.id=c.user_id WHERE c.live_id=? ORDER BY c.id DESC LIMIT 30', l.id);
     res.json({ ok: true, live: lj, chat: chat.reverse() });
@@ -5308,7 +5316,7 @@ app.get('/api/live/:id/guests', auth, async (req, res) => {
     const rows = await allRows(
       "SELECT id, user_id, username, avatar, status, created_at FROM live_guests WHERE live_id=? AND status IN " + statusFilter + " ORDER BY created_at ASC LIMIT 20",
       l.id);
-    res.json({ guests: rows, is_host: isHost });
+    res.json({ guests: rows, is_host: isHost, max_guests: Math.max(1, Math.min(8, Number(l.max_guests) || 8)) });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 // Demande de participation (spectateur -> hôte)
@@ -5324,6 +5332,9 @@ app.post('/api/live/:id/guest-request', auth, async (req, res) => {
     const existing = await get1('SELECT status FROM live_guests WHERE live_id=? AND user_id=?', l.id, req.userId);
     if (existing && existing.status === 'pending') return res.status(400).json({ error: 'demande déjà envoyée' });
     if (existing && existing.status === 'accepted') return res.status(400).json({ error: 'déjà invité' });
+    const maxG = Math.max(1, Math.min(8, Number(l.max_guests) || 8));
+    const nAcc = await get1("SELECT COUNT(*) AS c FROM live_guests WHERE live_id=? AND status='accepted'", l.id);
+    if (Number(nAcc.c) >= maxG) return res.status(400).json({ error: 'Panel complet' });
     if (USE_PG) {
       await runSql(`INSERT INTO live_guests(live_id,user_id,username,avatar,status,created_at) VALUES(?,?,?,?,?,?)
         ON CONFLICT(live_id,user_id) DO UPDATE SET status='pending', username=EXCLUDED.username, avatar=EXCLUDED.avatar, created_at=EXCLUDED.created_at`,
@@ -5352,7 +5363,8 @@ app.post('/api/live/:id/guest-respond', auth, async (req, res) => {
     if (!g) return res.status(404).json({ error: 'demande introuvable' });
     if (accept) {
       const n = await get1("SELECT COUNT(*) AS c FROM live_guests WHERE live_id=? AND status='accepted'", l.id);
-      if (Number(n.c) >= 8) return res.status(400).json({ error: 'grille complète (8 invités max)' });
+      const maxGr = Math.max(1, Math.min(8, Number(l.max_guests) || 8));
+      if (Number(n.c) >= maxGr) return res.status(400).json({ error: 'Panel complet (' + maxGr + ' invités max)' });
     }
     await runSql('UPDATE live_guests SET status=? WHERE live_id=? AND user_id=?', accept ? 'accepted' : 'refused', l.id, guestId);
     await runSql('INSERT INTO live_signals(live_id,to_user_id,from_user_id,kind,payload,created_at) VALUES(?,?,?,?,?,?)',
