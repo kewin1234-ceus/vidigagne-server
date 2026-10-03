@@ -589,6 +589,9 @@ CREATE TABLE IF NOT EXISTS family_settings(
     await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS audio_url TEXT DEFAULT ''`); // v1.57 : messages vocaux
     await pool.query(`ALTER TABLE group_messages ADD COLUMN IF NOT EXISTS audio_url TEXT DEFAULT ''`);
     await pool.query(`ALTER TABLE videos ADD COLUMN IF NOT EXISTS phash TEXT DEFAULT ''`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS search_logs(
+      id SERIAL PRIMARY KEY, query TEXT NOT NULL, user_id INTEGER,
+      created_at BIGINT NOT NULL)`);
     await pool.query(`CREATE TABLE IF NOT EXISTS calls(
       id SERIAL PRIMARY KEY, caller_id INTEGER NOT NULL, callee_id INTEGER NOT NULL,
       ctype TEXT NOT NULL DEFAULT 'video', status TEXT NOT NULL DEFAULT 'ringing',
@@ -887,6 +890,76 @@ app.post('/api/admin/sounds/bulk-import', async (req, res) => {
   }
   res.json({ ok: true, imported: results.filter(r => r.status === 'ok').length, results });
 });
+// v1.63 : transcription vocale -> sous-titres auto (Vosk FR, hors ligne)
+const transcribeAudio = multer({ dest: '/tmp/', limits: { fileSize: 100 * 1024 * 1024 } });
+app.post('/api/transcribe', transcribeAudio.single('video'), async (req, res) => {
+  let fpath = null;
+  try {
+    if (req.file) fpath = req.file.path;
+    else if (req.body && req.body.video_url) {
+      // télécharge depuis une URL (Cloudinary)
+      const https = require('https'), http = require('http'), fs = require('fs');
+      fpath = '/tmp/tr_' + Date.now() + '.mp4';
+      const url = String(req.body.video_url);
+      await new Promise((resolve, reject) => {
+        const mod = url.startsWith('https') ? https : http;
+        const rq = mod.get(url, { timeout: 60000 }, (rs) => {
+          if (rs.statusCode !== 200) { rs.resume(); return reject(new Error('HTTP ' + rs.statusCode)); }
+          const ws = fs.createWriteStream(fpath);
+          rs.pipe(ws); ws.on('finish', resolve); ws.on('error', reject);
+        });
+        rq.on('timeout', () => { rq.destroy(); reject(new Error('timeout')); });
+        rq.on('error', reject);
+      });
+    } else return res.status(400).json({ error: 'vidéo requise' });
+    const { execFile } = require('child_process');
+    const out = await new Promise((resolve, reject) => {
+      execFile('python3', [__dirname + '/transcribe.py', fpath], { timeout: 300000 },
+        (err, stdout, stderr) => err ? reject(err) : resolve(stdout));
+    });
+    const d = JSON.parse(out);
+    if (d.error) return res.status(500).json({ error: d.error });
+    res.json({ words: d.words || [] });
+  } catch (e) {
+    res.status(500).json({ error: 'transcription impossible' });
+  } finally {
+    try { if (fpath && fpath.startsWith('/tmp/')) require('fs').unlinkSync(fpath); } catch (_) {}
+  }
+});
+// v1.63 : insights de recherche pour créateurs (tendances, requêtes montantes)
+app.get('/api/search/insights', async (req, res) => {
+  try {
+    const since7 = now() - 7 * 86400000, since1 = now() - 86400000;
+    // top recherches 7 jours
+    const top = await allRows(`SELECT query, COUNT(*) AS n FROM search_logs
+      WHERE created_at>? GROUP BY query ORDER BY n DESC LIMIT 20`, since7);
+    // requêtes en forte hausse (24h vs 7j)
+    const rising = await allRows(`SELECT query,
+        SUM(CASE WHEN created_at>? THEN 1 ELSE 0 END) AS d1,
+        COUNT(*) AS w1
+      FROM search_logs WHERE created_at>?
+      GROUP BY query HAVING COUNT(*)>=3
+      ORDER BY d1 DESC LIMIT 20`, since1, since7);
+    // hashtags tendance (depuis les vidéos récentes)
+    const tags = await allRows(`SELECT tags FROM videos
+      WHERE created_at>? AND hidden=0 AND tags IS NOT NULL AND tags<>''
+      ORDER BY created_at DESC LIMIT 500`, since7);
+    const tagCount = {};
+    for (const r of tags) {
+      String(r.tags || '').split(/[\s,]+/).forEach(t => {
+        t = t.trim().toLowerCase().replace(/^#/, '');
+        if (t.length >= 2 && t.length <= 30) tagCount[t] = (tagCount[t] || 0) + 1;
+      });
+    }
+    const topTags = Object.entries(tagCount).sort((a, b) => b[1] - a[1]).slice(0, 20)
+      .map(([tag, n]) => ({ tag, n }));
+    res.json({
+      trending: top.map(r => ({ query: r.query, searches: Number(r.n) })),
+      rising: rising.map(r => ({ query: r.query, day: Number(r.d1), week: Number(r.w1) })),
+      hashtags: topTags
+    });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
 // v1.58 : recherche par image
     await pool.query(`CREATE TABLE IF NOT EXISTS verification_requests(
       id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL UNIQUE, status TEXT NOT NULL DEFAULT 'pending',
@@ -925,6 +998,9 @@ app.post('/api/admin/sounds/bulk-import', async (req, res) => {
     lite.exec(`CREATE TABLE IF NOT EXISTS call_signals(
       id INTEGER PRIMARY KEY AUTOINCREMENT, call_id INTEGER NOT NULL, to_user_id INTEGER NOT NULL,
       from_user_id INTEGER NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL,
+      created_at BIGINT NOT NULL)`);
+    lite.exec(`CREATE TABLE IF NOT EXISTS search_logs(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, query TEXT NOT NULL, user_id INTEGER,
       created_at BIGINT NOT NULL)`);
     { const vc = lite.prepare(`PRAGMA table_info(videos)`).all().map(c => c.name);
       if (!vc.includes('phash')) lite.exec(`ALTER TABLE videos ADD COLUMN phash TEXT DEFAULT ''`); }
@@ -3528,8 +3604,16 @@ app.post('/api/search/image', auth, uploadImg.single('image'), async (req, res) 
 });
 app.get('/api/search', async (req, res) => {
   try {
-    const q = '%' + String(req.query.q || '').toLowerCase() + '%';
+    const rawQ = String(req.query.q || '').trim().toLowerCase().slice(0, 100);
+    const q = '%' + rawQ + '%';
     const meId = await optUserId(req);
+    // v1.63 : journalise les recherches pour les insights créateurs
+    if (rawQ.length >= 2) {
+      runSql('INSERT INTO search_logs(query,user_id,created_at) VALUES(?,?,?)',
+        rawQ, meId || null, now()).catch(() => {});
+      // nettoyage : garde 30 jours
+      runSql('DELETE FROM search_logs WHERE created_at<?', now() - 30 * 86400000).catch(() => {});
+    }
     const users = await allRows(
       'SELECT id,username,name,avatar FROM users WHERE username LIKE ? OR name LIKE ? LIMIT 20', q, q);
     const vf = visFilter('videos', meId);
