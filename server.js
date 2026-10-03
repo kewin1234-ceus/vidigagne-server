@@ -5180,6 +5180,26 @@ app.get('/api/live/:id/gift-totals', auth, async (req, res) => {
     res.json({ ok: true, is_host: isHost, totals });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
+// Top envoyeurs de cadeaux d'un live — PUBLIC : ce sont les DONS ENVOYÉS
+// par chaque spectateur (pas les gains reçus : le total reçu par le créateur
+// reste confidentiel via gift-totals). Tri décroissant, 200 max.
+app.get('/api/live/:id/top-gifters', async (req, res) => {
+  try {
+    const l = await liveById(req.params.id);
+    if (!l) return res.status(404).json({ error: 'live introuvable' });
+    let lim = parseInt(req.query.limit, 10) || 200;
+    if (lim < 1) lim = 1; if (lim > 200) lim = 200;
+    const rows = await allRows(
+      'SELECT g.from_id, COALESCE(SUM(g.cost),0) AS total, u.username, u.avatar FROM live_gifts g LEFT JOIN users u ON u.id=g.from_id WHERE g.live_id=? GROUP BY g.from_id, u.username, u.avatar ORDER BY total DESC LIMIT ?',
+      l.id, lim);
+    res.json({ ok: true, top: (rows || []).map(r => ({
+      user_id: Number(r.from_id),
+      username: r.username || '',
+      avatar: r.avatar || '',
+      total: Number(r.total) || 0
+    })) });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
 app.post('/api/live/:id/share', auth, async (req, res) => {
   try {
     const l = await liveById(req.params.id);
