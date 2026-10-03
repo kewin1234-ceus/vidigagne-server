@@ -594,6 +594,7 @@ CREATE TABLE IF NOT EXISTS family_settings(
     await pool.query(`ALTER TABLE videos ADD COLUMN IF NOT EXISTS target_countries TEXT DEFAULT ''`);
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS country TEXT DEFAULT ''`);
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS fcm_token TEXT DEFAULT ''`);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS bio TEXT DEFAULT ''`);
     await pool.query(`ALTER TABLE verification_requests ADD COLUMN IF NOT EXISTS reviewed_by TEXT DEFAULT ''`);
     await pool.query(`ALTER TABLE verification_requests ADD COLUMN IF NOT EXISTS review_reason TEXT DEFAULT ''`);
     await pool.query(`ALTER TABLE id_verifications ADD COLUMN IF NOT EXISTS reviewed_by TEXT DEFAULT ''`);
@@ -3930,6 +3931,14 @@ async function sendFcmPush(userId, title, body, data) {
     return { sent: true };
   } catch (e) { return { sent: false, reason: e.message.slice(0, 100) }; }
 }
+// v1.77 : biographie du profil (150 caractères max)
+app.post('/api/me/bio', auth, async (req, res) => {
+  try {
+    const bio = String((req.body || {}).bio || '').slice(0, 150);
+    await runSql('UPDATE users SET bio=? WHERE id=?', bio, req.userId);
+    res.json({ ok: true, bio });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
 // ---------- reposts ----------
 app.post('/api/videos/:id/repost', auth, async (req, res) => {
   try {
