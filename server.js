@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS users(
   first_name TEXT NOT NULL DEFAULT '',
   last_name TEXT NOT NULL DEFAULT '',
   birthdate TEXT NOT NULL DEFAULT '',
+  gender TEXT NOT NULL DEFAULT '',
   pass_hash TEXT NOT NULL,
   pass_salt TEXT NOT NULL,
   avatar TEXT NOT NULL DEFAULT '🙂',
@@ -385,6 +386,24 @@ CREATE TABLE IF NOT EXISTS coin_recharges(
   processed_at BIGINT
 );
 CREATE INDEX IF NOT EXISTS recharge_user_idx ON coin_recharges(user_id, status);
+CREATE TABLE IF NOT EXISTS verification_codes(
+  id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+  identifier TEXT NOT NULL,
+  kind TEXT NOT NULL DEFAULT 'email',
+  code TEXT NOT NULL,
+  expires_at BIGINT NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  used INTEGER NOT NULL DEFAULT 0,
+  created_at BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS vcodes_ident_idx ON verification_codes(identifier);
+CREATE TABLE IF NOT EXISTS verified_tokens(
+  token TEXT PRIMARY KEY,
+  identifier TEXT NOT NULL,
+  created_at BIGINT NOT NULL,
+  expires_at BIGINT NOT NULL,
+  consumed INTEGER NOT NULL DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS sounds(
   id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
   user_id INTEGER NOT NULL,
@@ -610,7 +629,7 @@ CREATE TABLE IF NOT EXISTS family_settings(
   dm_policy TEXT NOT NULL DEFAULT 'all'
 );`;
   if (USE_PG) { await pool.query(schema); }
-  else { lite.exec(schema); }
+  else { lite.exec(schema); try { lite.exec(`ALTER TABLE users ADD COLUMN gender TEXT DEFAULT ''`); } catch (e) {} }
   // migrations : colonnes d'authentification sociale
   if (USE_PG) {
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT`);
@@ -621,6 +640,7 @@ CREATE TABLE IF NOT EXISTS family_settings(
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS first_name TEXT DEFAULT ''`);
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_name TEXT DEFAULT ''`);
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS birthdate TEXT DEFAULT ''`);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS gender TEXT DEFAULT ''`);
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS ref_code TEXT`);
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by INTEGER`);
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS storage_bytes BIGINT DEFAULT 0`); // v1.54 : quota stockage
@@ -2026,6 +2046,7 @@ function pubUser(u) {
 function privUser(u) {
   const p = pubUser(u);
   p.first_name = u.first_name || ''; p.last_name = u.last_name || ''; p.birthdate = u.birthdate || '';
+  p.gender = u.gender || '';
   p.country = u.country || '';
   return p;
 }
@@ -2089,7 +2110,8 @@ function parseKeywords(s) {
 // ---------- auth ----------
 app.post('/api/auth/register', async (req, res) => {
   try {
-    let { username, name, password, email, first_name, last_name, birthdate } = req.body || {};
+    let { username, name, password, email, first_name, last_name, birthdate, gender } = req.body || {};
+    gender = ['male', 'female', 'other'].includes(String(gender || '')) ? String(gender) : '';
     username = (username || '').toLowerCase().trim();
     if (!validUsername(username))
       return res.status(400).json({ error: "pseudo invalide (lettres, chiffres, . _ — 2 à 24)" });
@@ -2098,6 +2120,11 @@ app.post('/api/auth/register', async (req, res) => {
     email = (email || '').trim().toLowerCase() || null;
     if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))
       return res.status(400).json({ error: 'e-mail invalide' });
+    if (email) {
+      const _vt = await peekVerifiedToken((req.body || {}).verification_token);
+      if (!_vt || String(_vt.identifier).toLowerCase() !== email)
+        return res.status(403).json({ error: 'vérifie ton e-mail avec le code reçu pour créer ton compte' });
+    }
     first_name = String(first_name || '').trim().slice(0, 40);
     last_name = String(last_name || '').trim().slice(0, 40);
     birthdate = /^\d{4}-\d{2}-\d{2}$/.test(birthdate || '') ? birthdate : '';
@@ -2110,8 +2137,8 @@ app.post('/api/auth/register', async (req, res) => {
     }
     const salt = crypto.randomBytes(16).toString('hex');
     const id = await insertId(
-      'INSERT INTO users(username,name,first_name,last_name,birthdate,email,pass_hash,pass_salt,created_at) VALUES(?,?,?,?,?,?,?,?,?)',
-      username, (name || username).slice(0, 40), first_name, last_name, birthdate, email, hashPass(password, salt), salt, now());
+      'INSERT INTO users(username,name,first_name,last_name,birthdate,gender,email,pass_hash,pass_salt,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)',
+      username, (name || username).slice(0, 40), first_name, last_name, birthdate, gender, email, hashPass(password, salt), salt, now());
     // code parrain unique
     let refCode = null;
     for (let i = 0; i < 20 && !refCode; i++) {
@@ -2122,6 +2149,7 @@ app.post('/api/auth/register', async (req, res) => {
     const token = crypto.randomBytes(32).toString('hex');
     await runSql('INSERT INTO tokens(token,user_id,created_at) VALUES(?,?,?)', token, id, now());
     const u = await get1('SELECT * FROM users WHERE id=?', id);
+    if (email) await consumeVerifiedToken((req.body || {}).verification_token);
     res.json({ token, user: privUser(u), coins: u.coins });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
@@ -2139,6 +2167,16 @@ function loginRateLimited(ip, ident) {
 }
 app.post('/api/auth/login', async (req, res) => {
   try {
+    const _vt = await peekVerifiedToken((req.body || {}).verification_token);
+    if (_vt) {
+      const _em = String(_vt.identifier).toLowerCase();
+      const _u = await get1('SELECT * FROM users WHERE email=?', _em);
+      if (!_u) return res.status(404).json({ error: 'aucun compte avec cet e-mail — inscris-toi' });
+      await consumeVerifiedToken((req.body || {}).verification_token);
+      const _token = crypto.randomBytes(32).toString('hex');
+      await runSql('INSERT INTO tokens(token,user_id,created_at) VALUES(?,?,?)', _token, _u.id, now());
+      return res.json({ token: _token, user: privUser(_u), coins: _u.coins });
+    }
     const ident = ((req.body || {}).username || (req.body || {}).identifier || (req.body || {}).email || '').toLowerCase().trim();
     if (loginRateLimited(clientIp(req), ident))
       return res.status(429).json({ error: 'trop de tentatives, réessaie dans 15 minutes' });
@@ -2164,15 +2202,129 @@ app.post('/api/auth/logout', auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 
+// ---------- v1.100 : vérification par code (e-mail, 60 s) ----------
+const CODE_TTL_MS = 60 * 1000;
+const CODE_RESEND_MS = 30 * 1000;
+const CODE_MAX_15MIN = 5;
+const VTOKEN_TTL_MS = 10 * 60 * 1000;
+
+function normIdentifier(id, kind) {
+  id = String(id || '').trim();
+  if (kind === 'email') return id.toLowerCase();
+  let ph = id.replace(/[\s\-.()]/g, '');
+  if (ph.charAt(0) !== '+') ph = '+' + ph;
+  ph = '+' + ph.slice(1).replace(/\D/g, '');
+  return ph;
+}
+function validIdentifier(id, kind) {
+  if (kind === 'email') return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(id);
+  return /^\+\d{7,15}$/.test(id);
+}
+async function issueVerifyCode(identifier, kind) {
+  const t = now();
+  try { await runSql('DELETE FROM verification_codes WHERE expires_at < ?', t - 3600 * 1000); } catch (e) {}
+  const last = await get1('SELECT created_at FROM verification_codes WHERE identifier=? ORDER BY id DESC LIMIT 1', identifier);
+  if (last && t - last.created_at < CODE_RESEND_MS)
+    return { error: 'attends quelques secondes avant de renvoyer', retry_after: Math.ceil((CODE_RESEND_MS - (t - last.created_at)) / 1000), status: 429 };
+  const cnt = await get1('SELECT COUNT(*) AS c FROM verification_codes WHERE identifier=? AND created_at>?', identifier, t - 15 * 60 * 1000);
+  if (cnt && cnt.c >= CODE_MAX_15MIN)
+    return { error: 'trop de codes demandés, réessaie dans quelques minutes', status: 429 };
+  const code = String(crypto.randomInt(100000, 1000000));
+  await runSql('DELETE FROM verification_codes WHERE identifier=? AND used=0', identifier);
+  await runSql('INSERT INTO verification_codes(identifier,kind,code,expires_at,attempts,used,created_at) VALUES(?,?,?,?,?,?,?)',
+    identifier, kind, code, t + CODE_TTL_MS, 0, 0, t);
+  let sent = false, devCode = null;
+  const m = mailer();
+  if (m) {
+    try {
+      await m.sendMail({
+        from: process.env.SMTP_FROM || process.env.SMTP_USER,
+        to: identifier,
+        subject: 'Ton code VidiGagne : ' + code,
+        text: 'Ton code de vérification VidiGagne est : ' + code + ' (expire dans 60 secondes).',
+        html: '<div style="font-family:sans-serif;text-align:center;padding:30px"><div style="font-size:24px;font-weight:800">VidiGagne</div><p>Ton code de vérification :</p><div style="font-size:44px;font-weight:800;letter-spacing:10px">' + code + '</div><p style="color:#888">Ce code expire dans 60 secondes.</p></div>',
+      });
+      sent = true;
+    } catch (e) { sent = false; }
+  }
+  if (!sent) {
+    console.log('[verify] SMTP indisponible — code pour ' + identifier + ' : ' + code);
+    if (process.env.NODE_ENV !== 'production') devCode = code;
+    else return { error: "l'envoi d'e-mails n'est pas encore configuré — réessaie plus tard", status: 503 };
+  }
+  const out = { ok: true, sent, expires_in: 60 };
+  if (devCode) out.dev_code = devCode;
+  return out;
+}
+app.post('/api/auth/send-code', async (req, res) => {
+  try {
+    const kind = ((req.body || {}).kind === 'phone') ? 'phone' : 'email';
+    const identifier = normIdentifier((req.body || {}).identifier, kind);
+    if (!validIdentifier(identifier, kind)) return res.status(400).json({ error: 'identifiant invalide' });
+    if (kind === 'phone')
+      return res.json({ ok: true, firebase: true, expires_in: 60 });
+    const r = await issueVerifyCode(identifier, kind);
+    if (r.error) return res.status(r.status || 400).json({ error: r.error, retry_after: r.retry_after });
+    res.json(r);
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.post('/api/auth/resend-code', async (req, res) => {
+  try {
+    const kind = ((req.body || {}).kind === 'phone') ? 'phone' : 'email';
+    const identifier = normIdentifier((req.body || {}).identifier, kind);
+    if (!validIdentifier(identifier, kind)) return res.status(400).json({ error: 'identifiant invalide' });
+    if (kind === 'phone')
+      return res.json({ ok: true, firebase: true, expires_in: 60 });
+    const prev = await get1('SELECT id FROM verification_codes WHERE identifier=? ORDER BY id DESC LIMIT 1', identifier);
+    if (!prev) return res.status(400).json({ error: "aucun code précédent — demande un code d'abord" });
+    const r = await issueVerifyCode(identifier, kind);
+    if (r.error) return res.status(r.status || 400).json({ error: r.error, retry_after: r.retry_after });
+    res.json(r);
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.post('/api/auth/verify-code', async (req, res) => {
+  try {
+    const kind = ((req.body || {}).kind === 'phone') ? 'phone' : 'email';
+    const identifier = normIdentifier((req.body || {}).identifier, kind);
+    const code = String((req.body || {}).code || '').replace(/\D/g, '');
+    if (!validIdentifier(identifier, kind) || code.length !== 6)
+      return res.status(400).json({ error: 'code invalide' });
+    const row = await get1('SELECT * FROM verification_codes WHERE identifier=? AND used=0 ORDER BY id DESC LIMIT 1', identifier);
+    if (!row) return res.status(400).json({ error: 'aucun code en attente — demande un nouveau code' });
+    if (row.attempts >= 5) return res.status(429).json({ error: 'trop de tentatives — demande un nouveau code' });
+    if (now() > row.expires_at) return res.status(410).json({ error: 'code expiré — demande un nouveau code', expired: true });
+    if (row.code !== code) {
+      await runSql('UPDATE verification_codes SET attempts=attempts+1 WHERE id=?', row.id);
+      return res.status(400).json({ error: 'code incorrect', attempts_left: Math.max(0, 4 - row.attempts) });
+    }
+    await runSql('UPDATE verification_codes SET used=1 WHERE id=?', row.id);
+    const vtoken = crypto.randomBytes(24).toString('hex');
+    const t = now();
+    await runSql('INSERT INTO verified_tokens(token,identifier,created_at,expires_at,consumed) VALUES(?,?,?,?,?)',
+      vtoken, identifier, t, t + VTOKEN_TTL_MS, 0);
+    res.json({ ok: true, verified: true, verification_token: vtoken });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+async function peekVerifiedToken(vtoken) {
+  const r = await get1('SELECT * FROM verified_tokens WHERE token=? AND consumed=0', String(vtoken || ''));
+  if (!r || now() > r.expires_at) return null;
+  return r;
+}
+async function consumeVerifiedToken(vtoken) {
+  await runSql('UPDATE verified_tokens SET consumed=1 WHERE token=?', String(vtoken || ''));
+}
+
 app.patch('/api/auth/me', auth, async (req, res) => {
-  const { name, avatar, bio, first_name, last_name, birthdate, sub_enabled, sub_price, country } = req.body || {};
-  await runSql('UPDATE users SET name=COALESCE(?,name), avatar=COALESCE(?,avatar), bio=COALESCE(?,bio), first_name=COALESCE(?,first_name), last_name=COALESCE(?,last_name), birthdate=COALESCE(?,birthdate), country=COALESCE(?,country) WHERE id=?',
+  const { name, avatar, bio, first_name, last_name, birthdate, gender, sub_enabled, sub_price, country } = req.body || {};
+  const _gender = ['male', 'female', 'other'].includes(String(gender || '')) ? String(gender) : null;
+  await runSql('UPDATE users SET name=COALESCE(?,name), avatar=COALESCE(?,avatar), bio=COALESCE(?,bio), first_name=COALESCE(?,first_name), last_name=COALESCE(?,last_name), birthdate=COALESCE(?,birthdate), gender=COALESCE(?,gender), country=COALESCE(?,country) WHERE id=?',
     name ? String(name).slice(0, 40) : null,
     avatar ? String(avatar).slice(0, 8) : null,
     bio ? String(bio).slice(0, 150) : null,
     first_name !== undefined ? String(first_name).trim().slice(0, 40) : null,
     last_name !== undefined ? String(last_name).trim().slice(0, 40) : null,
     /^\d{4}-\d{2}-\d{2}$/.test(birthdate || '') ? birthdate : null,
+    _gender,
     /^[A-Z]{2}$/.test(String(country || '')) ? String(country) : null, req.userId);
   // abonnement payant au créateur : activation + prix mensuel (pièces)
   if (sub_enabled !== undefined || sub_price !== undefined) {
@@ -4664,7 +4816,8 @@ app.get('/api/auth/google/poll', async (req, res) => {
     if (!row) return res.json({ done: false });
     await runSql('DELETE FROM oauth_sessions WHERE session=?', s); // usage unique
     const u = await get1('SELECT * FROM users WHERE id=?', row.user_id);
-    res.json({ done: true, token: row.token, user: privUser(u), coins: u.coins });
+    const _pu = privUser(u); _pu.email = u.email || ''; // v1.100 : l'app envoie le code à cet e-mail
+    res.json({ done: true, token: row.token, user: _pu, coins: u.coins });
   } catch (e) { res.json({ done: false }); }
 });
 
