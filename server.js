@@ -2319,15 +2319,53 @@ async function issueVerifyCode(identifier, kind) {
   await runSql('INSERT INTO verification_codes(identifier,kind,code,expires_at,attempts,used,created_at) VALUES(?,?,?,?,?,?,?)',
     identifier, kind, code, t + CODE_TTL_MS, 0, 0, t);
   let sent = false, devCode = null;
-  const m = mailer();
+  // Priorité : Brevo API (HTTP, jamais bloqué) puis SMTP
+  if (process.env.BREVO_API_KEY) {
+    try {
+      const br = await fetch('https://api.brevo.com/v3/smtp/email', {
+        method: 'POST',
+        headers: { 'api-key': process.env.BREVO_API_KEY, 'Content-Type': 'application/json', 'accept': 'application/json' },
+        body: JSON.stringify({
+          sender: { name: process.env.BREVO_FROM_NAME || 'VidiGagne', email: process.env.BREVO_FROM_EMAIL || process.env.SMTP_USER },
+          to: [{ email: identifier }],
+          subject: '✨ Bienvenue sur VidiGagne — ton code de vérification',
+          htmlContent: '<div style="font-family:sans-serif;max-width:480px;margin:0 auto;background:#0a0a0a;border-radius:16px;overflow:hidden">'
+      + '<div style="background:linear-gradient(135deg,#b8860b,#ffd700);padding:30px;text-align:center">'
+      + '<div style="font-size:32px;font-weight:900;color:#000;letter-spacing:1px">VidiGagne</div>'
+      + '<div style="color:#000;font-size:14px;margin-top:6px">Regarde des vidéos. Gagne de l\'argent.</div></div>'
+      + '<div style="padding:30px;text-align:center;color:#fff">'
+      + '<p style="font-size:18px">👋 Bienvenue dans la famille VidiGagne !</p>'
+      + '<p style="color:#ccc;font-size:14px">Nous sommes ravis de te compter parmi nous. Pour sécuriser ton compte, voici ton code de vérification :</p>'
+      + '<div style="font-size:48px;font-weight:900;letter-spacing:12px;color:#ffd700;margin:20px 0">' + code + '</div>'
+      + '<p style="color:#999;font-size:12px">⏱️ Ce code expire dans 60 secondes.</p>'
+      + '<p style="color:#ccc;font-size:14px;margin-top:20px">💰 Des milliers de créateurs gagnent déjà de l\'argent chaque jour sur VidiGagne.<br>À ton tour de briller ! ✨</p>'
+      + '</div>'
+      + '<div style="padding:20px;text-align:center;color:#666;font-size:11px;border-top:1px solid #222">Si tu n\'as pas demandé ce code, ignore simplement cet e-mail.<br>© 2026 VidiGagne — Fait avec ❤️</div></div>',
+        }),
+      });
+      if (br.ok) sent = true;
+    } catch (e) { sent = false; }
+  }
+  const m = !sent && mailer();
   if (m) {
     try {
       await m.sendMail({
         from: process.env.SMTP_FROM || process.env.SMTP_USER,
         to: identifier,
-        subject: 'Ton code VidiGagne : ' + code,
-        text: 'Ton code de vérification VidiGagne est : ' + code + ' (expire dans 60 secondes).',
-        html: '<div style="font-family:sans-serif;text-align:center;padding:30px"><div style="font-size:24px;font-weight:800">VidiGagne</div><p>Ton code de vérification :</p><div style="font-size:44px;font-weight:800;letter-spacing:10px">' + code + '</div><p style="color:#888">Ce code expire dans 60 secondes.</p></div>',
+        subject: '✨ Bienvenue sur VidiGagne — ton code de vérification',
+        text: 'Bienvenue sur VidiGagne ! Ton code de vérification est : ' + code + '. Il expire dans 60 secondes. Nous sommes ravis de te compter parmi nous !',
+        html: '<div style="font-family:sans-serif;max-width:480px;margin:0 auto;background:#0a0a0a;border-radius:16px;overflow:hidden">'
+      + '<div style="background:linear-gradient(135deg,#b8860b,#ffd700);padding:30px;text-align:center">'
+      + '<div style="font-size:32px;font-weight:900;color:#000;letter-spacing:1px">VidiGagne</div>'
+      + '<div style="color:#000;font-size:14px;margin-top:6px">Regarde des vidéos. Gagne de l\'argent.</div></div>'
+      + '<div style="padding:30px;text-align:center;color:#fff">'
+      + '<p style="font-size:18px">👋 Bienvenue dans la famille VidiGagne !</p>'
+      + '<p style="color:#ccc;font-size:14px">Nous sommes ravis de te compter parmi nous. Pour sécuriser ton compte, voici ton code de vérification :</p>'
+      + '<div style="font-size:48px;font-weight:900;letter-spacing:12px;color:#ffd700;margin:20px 0">' + code + '</div>'
+      + '<p style="color:#999;font-size:12px">⏱️ Ce code expire dans 60 secondes.</p>'
+      + '<p style="color:#ccc;font-size:14px;margin-top:20px">💰 Des milliers de créateurs gagnent déjà de l\'argent chaque jour sur VidiGagne.<br>À ton tour de briller ! ✨</p>'
+      + '</div>'
+      + '<div style="padding:20px;text-align:center;color:#666;font-size:11px;border-top:1px solid #222">Si tu n\'as pas demandé ce code, ignore simplement cet e-mail.<br>© 2026 VidiGagne — Fait avec ❤️</div></div>',
       });
       sent = true;
     } catch (e) { sent = false; }
