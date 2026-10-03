@@ -349,6 +349,42 @@ CREATE TABLE IF NOT EXISTS live_signals(
   created_at BIGINT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS live_sig_idx ON live_signals(live_id, id);
+CREATE TABLE IF NOT EXISTS live_guests(
+  id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+  live_id INTEGER NOT NULL,
+  user_id INTEGER NOT NULL,
+  username TEXT NOT NULL DEFAULT '',
+  avatar TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'pending',
+  created_at BIGINT NOT NULL,
+  UNIQUE(live_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS live_guests_idx ON live_guests(live_id, status);
+CREATE TABLE IF NOT EXISTS live_gifts(
+  id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+  live_id INTEGER NOT NULL,
+  from_id INTEGER NOT NULL,
+  to_id INTEGER NOT NULL,
+  gift TEXT NOT NULL,
+  cost INTEGER NOT NULL,
+  creator_share INTEGER NOT NULL DEFAULT 0,
+  platform_share INTEGER NOT NULL DEFAULT 0,
+  created_at BIGINT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS coin_recharges(
+  id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+  user_id INTEGER NOT NULL,
+  method TEXT NOT NULL,
+  coins INTEGER NOT NULL,
+  amount_usd REAL NOT NULL DEFAULT 0,
+  currency TEXT NOT NULL DEFAULT 'USD',
+  status TEXT NOT NULL DEFAULT 'pending',
+  paypal_order_id TEXT NOT NULL DEFAULT '',
+  details TEXT NOT NULL DEFAULT '',
+  created_at BIGINT NOT NULL,
+  processed_at BIGINT
+);
+CREATE INDEX IF NOT EXISTS recharge_user_idx ON coin_recharges(user_id, status);
 CREATE TABLE IF NOT EXISTS sounds(
   id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
   user_id INTEGER NOT NULL,
@@ -2374,12 +2410,37 @@ app.post('/api/stories', auth, uploadStory.fields([{ name: 'video', maxCount: 1 
   } catch (e) { res.status(500).json({ error: 'échec du téléversement' }); }
 });
 // ---------- cadeaux ----------
+// Partage 50/50 VidiGagne : l'envoyeur est débité du coût total,
+// le créateur reçoit 50%, la plateforme 50% (commission).
+async function applyGiftSplit(fromId, toId, cost, giftId, liveId) {
+  const creatorShare = Math.floor(cost / 2);
+  const platformShare = cost - creatorShare;
+  await runSql('UPDATE users SET coins=coins+? WHERE id=?', creatorShare, toId);
+  await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
+    fromId, -cost, 'cadeau ' + giftId, now());
+  await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
+    toId, creatorShare, 'cadeau reçu ' + giftId + ' (50%)', now());
+  await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
+    0, platformShare, 'commission cadeau ' + giftId, now());
+  if (liveId) {
+    await runSql('INSERT INTO live_gifts(live_id,from_id,to_id,gift,cost,creator_share,platform_share,created_at) VALUES(?,?,?,?,?,?,?,?)',
+      liveId, fromId, toId, giftId, cost, creatorShare, platformShare, now()).catch(() => {});
+  }
+  return { creatorShare, platformShare };
+}
 const GIFT_CATALOG = [
+  { id: 'coeur', emoji: '❤️', cost: 1, name: 'Cœur' },
   { id: 'rose', emoji: '🌹', cost: 10, name: 'Rose' },
-  { id: 'coeur', emoji: '💖', cost: 50, name: 'Cœur' },
+  { id: 'cadeau', emoji: '🎁', cost: 30, name: 'Cadeau' },
+  { id: 'coeurbrillant', emoji: '💖', cost: 50, name: 'Cœur brillant' },
   { id: 'cafe', emoji: '☕', cost: 100, name: 'Café' },
+  { id: 'micro', emoji: '🎤', cost: 200, name: 'Micro' },
+  { id: 'champagne', emoji: '🍾', cost: 300, name: 'Champagne' },
   { id: 'couronne', emoji: '👑', cost: 500, name: 'Couronne' },
+  { id: 'fusee', emoji: '🚀', cost: 800, name: 'Fusée' },
   { id: 'diamant', emoji: '💎', cost: 1000, name: 'Diamant' },
+  { id: 'trophee', emoji: '🏆', cost: 2000, name: 'Trophée' },
+  { id: 'etoile', emoji: '🌟', cost: 5000, name: 'Superstar' },
 ];
 app.get('/api/gifts/catalog', (req, res) => res.json({ gifts: GIFT_CATALOG }));
 app.post('/api/gifts', auth, async (req, res) => {
@@ -2394,11 +2455,7 @@ app.post('/api/gifts', auth, async (req, res) => {
     if (dest.id === req.userId) return res.status(400).json({ error: 'impossible' });
     const debited = await runSqlChanges('UPDATE users SET coins=coins-? WHERE id=? AND coins>=?', g.cost, req.userId, g.cost);
     if (!debited) return res.status(400).json({ error: 'pas assez de pièces' });
-    await runSql('UPDATE users SET coins=coins+? WHERE id=?', g.cost, dest.id);
-    await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
-      req.userId, -g.cost, 'cadeau ' + g.id, now());
-    await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
-      dest.id, g.cost, 'cadeau reçu ' + g.id, now());
+    await applyGiftSplit(req.userId, dest.id, g.cost, g.id, null);
     await runSql('INSERT INTO gifts(from_id,to_id,video_id,gift,cost,created_at) VALUES(?,?,?,?,?,?)',
       req.userId, dest.id, video_id || null, g.id, g.cost, now());
     await notify(dest.id, 'gift', req.userId, video_id || null, g.id);
@@ -2933,6 +2990,156 @@ app.post('/api/referral', auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 // v1.65 : solde de pièces valides vs expirées (3 mois)
+// ==================== RECHARGE DE PIÈCES ====================
+const RECHARGE_PACKS = [
+  { coins: 100, usd: 0.99 }, { coins: 500, usd: 4.99 },
+  { coins: 1000, usd: 9.99 }, { coins: 5000, usd: 49.99 },
+];
+const RECHARGE_METHODS = [
+  { id: 'paypal', name: 'PayPal', emoji: '💙', desc: 'Paiement en ligne sécurisé', auto: true },
+  { id: 'card', name: 'Carte bancaire', emoji: '💳', desc: 'Visa, Mastercard', auto: false },
+  { id: 'googlepay', name: 'Google Pay', emoji: '🅖', desc: 'Paiement Google', auto: false },
+  { id: 'natcash', name: 'NatCash', emoji: '📱', desc: 'Haïti — vérification manuelle', auto: false },
+  { id: 'moncash', name: 'MonCash', emoji: '📲', desc: 'Haïti — vérification manuelle', auto: false },
+];
+app.get('/api/coins/recharge-methods', async (req, res) => {
+  const cfg = paypalCfg();
+  res.json({ methods: RECHARGE_METHODS.map(m => ({ ...m, available: m.id === 'paypal' ? !!cfg : true })), packs: RECHARGE_PACKS });
+});
+// Helper : token d'accès PayPal (cache 8 min)
+let _ppToken = null, _ppTokenExp = 0;
+async function paypalToken() {
+  const cfg = paypalCfg();
+  if (!cfg) return null;
+  if (_ppToken && now() < _ppTokenExp) return _ppToken;
+  const creds = Buffer.from(cfg.id + ':' + cfg.secret).toString('base64');
+  const r = await fetch(cfg.api + '/v1/oauth2/token', {
+    method: 'POST',
+    headers: { 'Authorization': 'Basic ' + creds, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: 'grant_type=client_credentials'
+  });
+  const d = await r.json().catch(() => ({}));
+  if (!d.access_token) return null;
+  _ppToken = d.access_token;
+  _ppTokenExp = now() + 8 * 60 * 1000;
+  return _ppToken;
+}
+// Créer une recharge : PayPal (auto) ou méthodes manuelles (formulaire -> pending)
+app.post('/api/coins/recharge', auth, async (req, res) => {
+  try {
+    const b = req.body || {};
+    const method = String(b.method || 'paypal');
+    const pack = RECHARGE_PACKS.find(x => x.coins === Number(b.pack));
+    if (!pack) return res.status(400).json({ error: 'pack invalide' });
+    const m = RECHARGE_METHODS.find(x => x.id === method);
+    if (!m) return res.status(400).json({ error: 'méthode inconnue' });
+    const details = String(b.details || '').slice(0, 500);
+    const t = now();
+    if (method === 'paypal') {
+      const cfg = paypalCfg();
+      if (!cfg) return res.status(400).json({ error: 'PayPal non configuré' });
+      const token = await paypalToken();
+      if (!token) return res.status(500).json({ error: 'PayPal indisponible pour le moment' });
+      const rid = await insertId('INSERT INTO coin_recharges(user_id,method,coins,amount_usd,currency,status,created_at) VALUES(?,?,?,?,?,?,?)',
+        req.userId, 'paypal', pack.coins, pack.usd, 'USD', 'awaiting_payment', t);
+      const returnUrl = (process.env.SERVER_URL || 'https://vidigagne-server.onrender.com') + '/api/coins/recharge/paypal/callback?rid=' + rid;
+      const or = await fetch(cfg.api + '/v2/checkout/orders', {
+        method: 'POST',
+        headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          intent: 'CAPTURE',
+          purchase_units: [{ amount: { currency_code: 'USD', value: pack.usd.toFixed(2) }, description: pack.coins + ' pièces VidiGagne', custom_id: 'recharge-' + rid }],
+          application_context: { return_url: returnUrl, cancel_url: returnUrl + '&cancel=1', brand_name: 'VidiGagne', user_action: 'PAY_NOW' }
+        })
+      });
+      const od = await or.json().catch(() => ({}));
+      const approval = (od.links || []).find(x => x.rel === 'approve');
+      if (!od.id || !approval) {
+        await runSql("UPDATE coin_recharges SET status='failed' WHERE id=?", rid);
+        return res.status(500).json({ error: 'création du paiement PayPal impossible' });
+      }
+      await runSql('UPDATE coin_recharges SET paypal_order_id=? WHERE id=?', od.id, rid);
+      return res.json({ ok: true, recharge_id: rid, approval_url: approval.href, method: 'paypal' });
+    }
+    // Méthodes manuelles : formulaire fonctionnel -> demande en attente de vérification
+    if (!details && (method === 'natcash' || method === 'moncash')) {
+      return res.status(400).json({ error: 'numéro de téléphone et référence requis' });
+    }
+    const rid = await insertId('INSERT INTO coin_recharges(user_id,method,coins,amount_usd,currency,status,details,created_at) VALUES(?,?,?,?,?,?,?,?)',
+      req.userId, method, pack.coins, pack.usd, method === 'natcash' || method === 'moncash' ? 'HTG' : 'USD', 'pending', details, t);
+    await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)', req.userId, 0, 'recharge ' + method + ' en attente (' + pack.coins + ')', now()).catch(() => {});
+    res.json({ ok: true, recharge_id: rid, status: 'pending', method,
+      message: method === 'card' || method === 'googlepay'
+        ? 'Demande enregistrée. Tes pièces seront créditées après vérification du paiement.'
+        : 'Demande enregistrée. Envoie le paiement puis tes pièces seront créditées après vérification.' });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// Retour PayPal après approbation -> capture + crédit des pièces
+app.get('/api/coins/recharge/paypal/callback', async (req, res) => {
+  try {
+    const rid = Number(req.query.rid);
+    const rc = rid ? await get1('SELECT * FROM coin_recharges WHERE id=?', rid) : null;
+    if (!rc) return res.status(404).send('Recharge introuvable');
+    if (req.query.cancel) {
+      await runSql("UPDATE coin_recharges SET status='cancelled' WHERE id=?", rid);
+      return res.send('<html><body style="font-family:sans-serif;text-align:center;padding:40px"><h2>Paiement annulé</h2><p>Tu peux fermer cette page et revenir dans VidiGagne.</p></body></html>');
+    }
+    if (rc.status === 'completed') {
+      return res.send('<html><body style="font-family:sans-serif;text-align:center;padding:40px"><h2>✅ Déjà crédité</h2><p>Tes pièces sont sur ton compte VidiGagne.</p></body></html>');
+    }
+    const cfg = paypalCfg();
+    const token = cfg ? await paypalToken() : null;
+    if (!token || !rc.paypal_order_id) return res.status(500).send('Paiement indisponible');
+    const cr = await fetch(cfg.api + '/v2/checkout/orders/' + encodeURIComponent(rc.paypal_order_id) + '/capture', {
+      method: 'POST', headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' }, body: '{}'
+    });
+    const cd = await cr.json().catch(() => ({}));
+    const captured = cd.status === 'COMPLETED' || (cd.purchase_units || []).some(p => (p.payments || {}).captures);
+    if (!captured) {
+      await runSql("UPDATE coin_recharges SET status='failed' WHERE id=?", rid);
+      return res.status(400).send('Le paiement n\'a pas pu être capturé. Réessaie.');
+    }
+    await runSql('UPDATE users SET coins=coins+? WHERE id=?', rc.coins, rc.user_id);
+    await runSql("UPDATE coin_recharges SET status='completed', processed_at=? WHERE id=?", now(), rid);
+    await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
+      rc.user_id, rc.coins, 'recharge PayPal ' + rc.coins, now());
+    await notify(rc.user_id, 'recharge', null, null, String(rc.coins)).catch(() => {});
+    res.send('<html><body style="font-family:sans-serif;text-align:center;padding:40px"><h2>✅ Paiement réussi !</h2><p>' + rc.coins + ' pièces ont été ajoutées à ton compte VidiGagne.</p><p>Tu peux fermer cette page.</p></body></html>');
+  } catch (e) { res.status(500).send('Erreur lors du traitement du paiement'); }
+});
+// Statut d'une recharge
+app.get('/api/coins/recharge/:id/status', auth, async (req, res) => {
+  try {
+    const rc = await get1('SELECT id, method, coins, status, created_at FROM coin_recharges WHERE id=? AND user_id=?', Number(req.params.id), req.userId);
+    if (!rc) return res.status(404).json({ error: 'introuvable' });
+    const bal = await get1('SELECT coins FROM users WHERE id=?', req.userId);
+    res.json({ ok: true, recharge: rc, balance: bal ? bal.coins : 0 });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// Admin : liste des recharges en attente
+app.get('/api/admin/recharges', adminAuth, async (req, res) => {
+  try {
+    const rows = await allRows(`SELECT r.*, u.username FROM coin_recharges r JOIN users u ON u.id=r.user_id WHERE r.status IN ('pending','awaiting_payment') ORDER BY r.created_at DESC LIMIT 100`);
+    res.json({ recharges: rows });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// Admin : approuver / rejeter une recharge manuelle
+app.post('/api/admin/recharges/:id/approve', adminAuth, async (req, res) => {
+  try {
+    const rc = await get1('SELECT * FROM coin_recharges WHERE id=?', Number(req.params.id));
+    if (!rc) return res.status(404).json({ error: 'introuvable' });
+    if (rc.status !== 'pending') return res.status(400).json({ error: 'déjà traitée' });
+    const approve = String((req.body || {}).action || 'approve') === 'approve';
+    if (approve) {
+      await runSql('UPDATE users SET coins=coins+? WHERE id=?', rc.coins, rc.user_id);
+      await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
+        rc.user_id, rc.coins, 'recharge ' + rc.method + ' ' + rc.coins + ' (validée)', now());
+      await notify(rc.user_id, 'recharge', null, null, String(rc.coins)).catch(() => {});
+    }
+    await runSql("UPDATE coin_recharges SET status=?, processed_at=? WHERE id=?", approve ? 'completed' : 'rejected', now(), rc.id);
+    res.json({ ok: true, approved: approve });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
 app.get('/api/coins/valid', auth, async (req, res) => {
   const vc = await validCoins(req.userId);
   res.json({ valid: vc.valid, expired: vc.expired, expiry_days: 90 });
@@ -4705,6 +4912,22 @@ function liveJSON(l, row, viewersCount) {
     gifts_total: Number(l.gifts_total) || 0, chat_total: Number(l.chat_total) || 0,
   };
 }
+// Feed des lives en cours (pour les cartes LIVE dans "Pour toi")
+app.get('/api/live/feed', async (req, res) => {
+  try {
+    const rows = await allRows(
+      'SELECT l.*, u.username, u.name, u.avatar FROM lives l JOIN users u ON u.id=l.user_id WHERE l.ended_at IS NULL ORDER BY l.started_at DESC LIMIT 50');
+    const lives = [];
+    for (const r of rows) {
+      const lj = liveJSON(r, r, await liveViewersCount(r.id));
+      const guests = await allRows("SELECT user_id, username, avatar FROM live_guests WHERE live_id=? AND status='accepted' ORDER BY created_at ASC LIMIT 8", r.id);
+      lj.guests = guests;
+      lj.guest_slots = 8;
+      lives.push(lj);
+    }
+    res.json({ lives });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
 app.get('/api/live', async (req, res) => {
   const rows = await allRows(
     'SELECT l.*, u.username, u.name, u.avatar FROM lives l JOIN users u ON u.id=l.user_id WHERE l.ended_at IS NULL ORDER BY l.started_at DESC');
@@ -4789,8 +5012,8 @@ app.get('/api/live/:id/signal', auth, async (req, res) => {
         l.id, since, l.user_id, l.user_id);
     } else {
       // un viewer récupère les signaux du diffuseur (offre/réponse/candidats, pour lui ou diffusés)
-      rows = await allRows("SELECT * FROM live_signals WHERE live_id=? AND id>? AND from_user_id=? AND (to_user_id IS NULL OR to_user_id=?) AND kind IN ('offer','answer','candidate') ORDER BY id ASC LIMIT 50",
-        l.id, since, l.user_id, req.userId);
+      rows = await allRows("SELECT * FROM live_signals WHERE live_id=? AND id>? AND ((from_user_id=? AND (to_user_id IS NULL OR to_user_id=?) AND kind IN ('offer','answer','candidate')) OR (to_user_id=? AND kind IN ('guest_accept','guest_refuse','guest_invite','guest_invite_accept','guest_invite_refuse'))) ORDER BY id ASC LIMIT 50",
+        l.id, since, l.user_id, req.userId, req.userId);
     }
     res.json({ signals: rows.map(s => ({ id: s.id, kind: s.kind, from: s.from_user_id, payload: s.payload })) });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
@@ -4816,15 +5039,144 @@ app.post('/api/live/:id/gift', auth, async (req, res) => {
     // débit atomique anti double-envoi (race condition)
     const debited = await runSqlChanges('UPDATE users SET coins=coins-? WHERE id=? AND coins>=?', g.cost, req.userId, g.cost);
     if (!debited) return res.status(400).json({ error: 'pas assez de pièces' });
-    await runSql('UPDATE users SET coins=coins+? WHERE id=?', g.cost, l.user_id);
-    await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
-      req.userId, -g.cost, 'cadeau live ' + g.id, now());
-    await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
-      l.user_id, g.cost, 'cadeau live reçu ' + g.id, now());
+    const split = await applyGiftSplit(req.userId, l.user_id, g.cost, g.id, l.id);
     await runSql('INSERT INTO gifts(from_id,to_id,video_id,live_id,gift,cost,created_at) VALUES(?,?,?,?,?,?,?)',
       req.userId, l.user_id, null, l.id, g.id, g.cost, now());
+    await runSql('UPDATE lives SET gifts_total=COALESCE(gifts_total,0)+? WHERE id=?', split.creatorShare, l.id).catch(() => {});
     await notify(l.user_id, 'gift', req.userId, null, g.id);
     res.json({ ok: true, coins: me.coins - g.cost });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// ==================== LIVE façon TikTok : invités, feed, join ====================
+// Rejoindre un live comme spectateur (enregistre la présence)
+app.post('/api/live/:id/join', auth, async (req, res) => {
+  try {
+    const l = await liveById(req.params.id);
+    if (!l) return res.status(404).json({ error: 'live introuvable' });
+    if (l.ended_at) return res.status(403).json({ error: 'live terminé' });
+    if (USE_PG) {
+      await runSql('INSERT INTO live_viewers(live_id,user_id,updated_at) VALUES(?,?,?) ON CONFLICT(live_id,user_id) DO UPDATE SET updated_at=EXCLUDED.updated_at', l.id, req.userId, now());
+    } else {
+      await runSql('INSERT OR REPLACE INTO live_viewers(live_id,user_id,updated_at) VALUES(?,?,?)', l.id, req.userId, now());
+    }
+    const row = await get1('SELECT username,name,avatar FROM users WHERE id=?', l.user_id);
+    const lj = liveJSON(l, row, await liveViewersCount(l.id));
+    const guests = await allRows("SELECT user_id, username, avatar FROM live_guests WHERE live_id=? AND status='accepted' ORDER BY created_at ASC LIMIT 8", l.id);
+    lj.guests = guests;
+    const chat = await allRows('SELECT c.id, c.text, c.created_at, u.username, u.avatar FROM live_chat c JOIN users u ON u.id=c.user_id WHERE c.live_id=? ORDER BY c.id DESC LIMIT 30', l.id);
+    res.json({ ok: true, live: lj, chat: chat.reverse() });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// Liste des invités (demandes en attente pour l'hôte, acceptés pour tous)
+app.get('/api/live/:id/guests', auth, async (req, res) => {
+  try {
+    const l = await liveById(req.params.id);
+    if (!l) return res.status(404).json({ error: 'live introuvable' });
+    const isHost = Number(l.user_id) === Number(req.userId);
+    const statusFilter = isHost ? "('pending','accepted')" : "('accepted')";
+    const rows = await allRows(
+      "SELECT id, user_id, username, avatar, status, created_at FROM live_guests WHERE live_id=? AND status IN " + statusFilter + " ORDER BY created_at ASC LIMIT 20",
+      l.id);
+    res.json({ guests: rows, is_host: isHost });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// Demande de participation (spectateur -> hôte)
+app.post('/api/live/:id/guest-request', auth, async (req, res) => {
+  try {
+    const l = await liveById(req.params.id);
+    if (!l) return res.status(404).json({ error: 'live introuvable' });
+    if (l.ended_at) return res.status(403).json({ error: 'live terminé' });
+    if (Number(l.user_id) === Number(req.userId)) return res.status(400).json({ error: 'tu es l\'hôte' });
+    const me = await get1('SELECT username, avatar FROM users WHERE id=?', req.userId);
+    const un = me ? me.username : 'user' + req.userId;
+    const av = me ? (me.avatar || '') : '';
+    const existing = await get1('SELECT status FROM live_guests WHERE live_id=? AND user_id=?', l.id, req.userId);
+    if (existing && existing.status === 'pending') return res.status(400).json({ error: 'demande déjà envoyée' });
+    if (existing && existing.status === 'accepted') return res.status(400).json({ error: 'déjà invité' });
+    if (USE_PG) {
+      await runSql(`INSERT INTO live_guests(live_id,user_id,username,avatar,status,created_at) VALUES(?,?,?,?,?,?)
+        ON CONFLICT(live_id,user_id) DO UPDATE SET status='pending', username=EXCLUDED.username, avatar=EXCLUDED.avatar, created_at=EXCLUDED.created_at`,
+        l.id, req.userId, un, av, 'pending', now());
+    } else {
+      await runSql(`INSERT OR REPLACE INTO live_guests(live_id,user_id,username,avatar,status,created_at) VALUES(?,?,?,?,?,?)`,
+        l.id, req.userId, un, av, 'pending', now());
+    }
+    // notifie l'hôte en temps réel via le canal signaux
+    await runSql('INSERT INTO live_signals(live_id,to_user_id,from_user_id,kind,payload,created_at) VALUES(?,?,?,?,?,?)',
+      l.id, l.user_id, req.userId, 'guest_request', JSON.stringify({ username: un, avatar: av }), now()).catch(() => {});
+    await notify(l.user_id, 'guest_request', req.userId, null, null).catch(() => {});
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// Réponse de l'hôte (accepter / refuser une demande)
+app.post('/api/live/:id/guest-respond', auth, async (req, res) => {
+  try {
+    const l = await liveById(req.params.id);
+    if (!l) return res.status(404).json({ error: 'live introuvable' });
+    if (Number(l.user_id) !== Number(req.userId)) return res.status(403).json({ error: 'réservé à l\'hôte' });
+    const guestId = Number((req.body || {}).user_id);
+    const accept = String((req.body || {}).action || '') === 'accept';
+    if (!guestId) return res.status(400).json({ error: 'user_id requis' });
+    const g = await get1("SELECT * FROM live_guests WHERE live_id=? AND user_id=? AND status='pending'", l.id, guestId);
+    if (!g) return res.status(404).json({ error: 'demande introuvable' });
+    if (accept) {
+      const n = await get1("SELECT COUNT(*) AS c FROM live_guests WHERE live_id=? AND status='accepted'", l.id);
+      if (Number(n.c) >= 8) return res.status(400).json({ error: 'grille complète (8 invités max)' });
+    }
+    await runSql('UPDATE live_guests SET status=? WHERE live_id=? AND user_id=?', accept ? 'accepted' : 'refused', l.id, guestId);
+    await runSql('INSERT INTO live_signals(live_id,to_user_id,from_user_id,kind,payload,created_at) VALUES(?,?,?,?,?,?)',
+      l.id, guestId, req.userId, accept ? 'guest_accept' : 'guest_refuse', JSON.stringify({ live_id: l.id }), now()).catch(() => {});
+    res.json({ ok: true, accepted: accept });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// L'hôte invite directement un spectateur
+app.post('/api/live/:id/guest-invite', auth, async (req, res) => {
+  try {
+    const l = await liveById(req.params.id);
+    if (!l) return res.status(404).json({ error: 'live introuvable' });
+    if (Number(l.user_id) !== Number(req.userId)) return res.status(403).json({ error: 'réservé à l\'hôte' });
+    const guestId = Number((req.body || {}).user_id);
+    if (!guestId || guestId === Number(req.userId)) return res.status(400).json({ error: 'user_id invalide' });
+    const u = await get1('SELECT username, avatar FROM users WHERE id=?', guestId);
+    if (!u) return res.status(404).json({ error: 'utilisateur introuvable' });
+    if (USE_PG) {
+      await runSql(`INSERT INTO live_guests(live_id,user_id,username,avatar,status,created_at) VALUES(?,?,?,?,?,?)
+        ON CONFLICT(live_id,user_id) DO UPDATE SET status='invited', created_at=EXCLUDED.created_at`,
+        l.id, guestId, u.username, u.avatar || '', 'invited', now());
+    } else {
+      await runSql(`INSERT OR REPLACE INTO live_guests(live_id,user_id,username,avatar,status,created_at) VALUES(?,?,?,?,?,?)`,
+        l.id, guestId, u.username, u.avatar || '', 'invited', now());
+    }
+    await runSql('INSERT INTO live_signals(live_id,to_user_id,from_user_id,kind,payload,created_at) VALUES(?,?,?,?,?,?)',
+      l.id, guestId, req.userId, 'guest_invite', JSON.stringify({ live_id: l.id, title: l.title }), now()).catch(() => {});
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// Le spectateur répond à l'invitation de l'hôte
+app.post('/api/live/:id/guest-invite-respond', auth, async (req, res) => {
+  try {
+    const l = await liveById(req.params.id);
+    if (!l) return res.status(404).json({ error: 'live introuvable' });
+    const accept = String((req.body || {}).action || '') === 'accept';
+    const g = await get1("SELECT * FROM live_guests WHERE live_id=? AND user_id=? AND status='invited'", l.id, req.userId);
+    if (!g) return res.status(404).json({ error: 'invitation introuvable' });
+    if (accept) {
+      const n = await get1("SELECT COUNT(*) AS c FROM live_guests WHERE live_id=? AND status='accepted'", l.id);
+      if (Number(n.c) >= 8) return res.status(400).json({ error: 'grille complète (8 invités max)' });
+    }
+    await runSql('UPDATE live_guests SET status=? WHERE live_id=? AND user_id=?', accept ? 'accepted' : 'refused', l.id, req.userId);
+    await runSql('INSERT INTO live_signals(live_id,to_user_id,from_user_id,kind,payload,created_at) VALUES(?,?,?,?,?,?)',
+      l.id, l.user_id, req.userId, accept ? 'guest_invite_accept' : 'guest_invite_refuse', JSON.stringify({ username: g.username }), now()).catch(() => {});
+    res.json({ ok: true, accepted: accept });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// Annuler sa demande / quitter la grille
+app.post('/api/live/:id/guest-leave', auth, async (req, res) => {
+  try {
+    const l = await liveById(req.params.id);
+    if (!l) return res.status(404).json({ error: 'live introuvable' });
+    await runSql("UPDATE live_guests SET status='cancelled' WHERE live_id=? AND user_id=? AND status IN ('pending','invited','accepted')", l.id, req.userId);
+    res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 // ---------- coffres au trésor du live (pièces via le serveur, pas en local) ----------
