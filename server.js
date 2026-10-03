@@ -609,6 +609,8 @@ CREATE TABLE IF NOT EXISTS family_settings(
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_adimp_day ON ad_impressions(created_at)`);
     await pool.query(`ALTER TABLE sounds ADD COLUMN IF NOT EXISTS license TEXT DEFAULT ''`);
     await pool.query(`ALTER TABLE sounds ADD COLUMN IF NOT EXISTS attribution TEXT DEFAULT ''`);
+    await pool.query(`ALTER TABLE videos ADD COLUMN IF NOT EXISTS reply_to_comment_id INTEGER DEFAULT 0`);
+    await pool.query(`ALTER TABLE comments ADD COLUMN IF NOT EXISTS video_reply_id INTEGER DEFAULT 0`);
     await pool.query(`CREATE TABLE IF NOT EXISTS live_goals(
       id SERIAL PRIMARY KEY, live_id INTEGER NOT NULL, title TEXT NOT NULL,
       target_coins INTEGER NOT NULL, created_at BIGINT NOT NULL)`);
@@ -997,109 +999,6 @@ app.get('/api/monetization/status', auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 // distribution quotidienne à 23h59 UTC (avec le calcul 50-50 existant)
-// ---------- v1.65 : 🤖 BOT DE VÉRIFICATION ----------
-// Le bot (pas l'admin) examine automatiquement :
-// 1. les demandes de badge vérifié
-// 2. les vérifications d'identité KYC (monétisation)
-// 3. l'expiration des pièces : les pièces gagnées il y a 3 mois ou plus
-//    sont expirées → tout retrait avec des pièces expirées est rejeté à l'immédiat.
-const COIN_EXPIRY_MS = 90 * 24 * 3600 * 1000; // 3 mois
-
-// pièces valides (non expirées) d'un utilisateur — comptabilité FIFO sur le ledger
-async function validCoins(userId) {
-  const rows = await allRows(
-    'SELECT amount, created_at FROM ledger WHERE user_id=? ORDER BY created_at ASC, id ASC', userId);
-  const tnow = now();
-  const queue = []; // crédits [montant, timestamp]
-  for (const r of rows) {
-    const amt = Number(r.amount) || 0;
-    if (amt > 0) {
-      queue.push([amt, Number(r.created_at) || 0]);
-    } else if (amt < 0) {
-      let need = -amt;
-      while (need > 0 && queue.length) {
-        const take = Math.min(queue[0][0], need);
-        queue[0][0] -= take; need -= take;
-        if (queue[0][0] <= 0) queue.shift();
-      }
-    }
-  }
-  // expire les crédits de 3 mois ou plus
-  let valid = 0, expired = 0;
-  for (const [amt, ts] of queue) {
-    if (tnow - ts >= COIN_EXPIRY_MS) expired += amt;
-    else valid += amt;
-  }
-  return { valid: Math.floor(valid), expired: Math.floor(expired) };
-}
-
-// --- bot : badge vérifié ---
-async function botReviewBadge(r) {
-  const fails = [];
-  if (!r.full_name || r.full_name.trim().length < 3) fails.push('nom complet manquant');
-  if (!VERIF_CATEGORIES.includes(String(r.category || '').toLowerCase())) fails.push('catégorie invalide');
-  if (!r.id_doc_url || !/^https?:\/\//.test(r.id_doc_url)) fails.push('pièce d\u2019identité manquante ou illisible');
-  if (!r.website && !r.proof_links) fails.push('aucun site web ni lien de preuve');
-  if (!r.activity || r.activity.trim().length < 20) fails.push('description d\u2019activité trop courte');
-  // critères d'authenticité façon TikTok
-  const u = await get1('SELECT avatar, created_at FROM users WHERE id=?', r.user_id);
-  if (!u || !u.avatar) fails.push('profil incomplet (photo de profil requise)');
-  const nv = await get1('SELECT COUNT(*) AS c FROM videos WHERE user_id=? AND hidden=0', r.user_id);
-  if (!nv || Number(nv.c) < 1) fails.push('aucune vidéo publiée');
-  if (fails.length) return { approved: false, reason: 'Rejeté par le bot : ' + fails.join(' ; ') };
-  return { approved: true, reason: 'Vérifié par le bot : identité + preuves + activité confirmées' };
-}
-
-// --- bot : KYC monétisation ---
-async function botReviewKyc(v) {
-  const fails = [];
-  if (!/^[A-Z]{2}$/.test(String(v.country || ''))) fails.push('pays invalide');
-  if (!v.doc_front || !/^https?:\/\//.test(v.doc_front)) fails.push('photo du document manquante');
-  try {
-    if (!kycAllowedDocs(String(v.country).toUpperCase()).includes(v.doc_type)) fails.push('document non accepté pour ce pays');
-  } catch (_) { fails.push('type de document invalide'); }
-  if (v.expiry) {
-    const expDate = new Date(v.expiry + '-01T00:00:00Z');
-    expDate.setMonth(expDate.getMonth() + 1);
-    if (expDate <= new Date()) fails.push('document expiré');
-  }
-  if (fails.length) return { approved: false, reason: 'Rejeté par le bot : ' + fails.join(' ; ') };
-  return { approved: true, reason: 'Vérifié par le bot : document valide et en cours de validité' };
-}
-
-// --- le bot traite toutes les demandes en attente ---
-async function runVerificationBot() {
-  try {
-    // 1. badges
-    const badges = await allRows(`SELECT * FROM verification_requests WHERE status='pending' LIMIT 50`);
-    for (const r of badges) {
-      try {
-        const verdict = await botReviewBadge(r);
-        await runSql(`UPDATE verification_requests SET status=?, reviewed_at=?, reviewed_by='bot', review_reason=? WHERE id=?`,
-          verdict.approved ? 'approved' : 'rejected', now(), verdict.reason, r.id);
-        if (verdict.approved) {
-          await runSql('UPDATE users SET verified=1 WHERE id=?', r.user_id);
-          await notify(r.user_id, 'system', null, null, '🤖✔️ Ton compte est maintenant vérifié !');
-        } else {
-          await notify(r.user_id, 'system', null, null, '🤖 ' + verdict.reason);
-        }
-      } catch (_) {}
-    }
-    // 2. KYC
-    const kycs = await allRows(`SELECT * FROM id_verifications WHERE status='pending' LIMIT 50`);
-    for (const v of kycs) {
-      try {
-        const verdict = await botReviewKyc(v);
-        await runSql(`UPDATE id_verifications SET status=?, reviewed_at=?, reviewed_by='bot', review_reason=? WHERE id=?`,
-          verdict.approved ? 'approved' : 'rejected', now(), verdict.reason, v.id);
-        const u = await get1('SELECT username FROM users WHERE id=?', v.user_id);
-        await notify(v.user_id, 'system', null, null,
-          verdict.approved ? '🤖✔️ Ton identité est vérifiée — tu peux retirer tes gains !'
-                           : '🤖 ' + verdict.reason);
-      } catch (_) {}
-    }
-  } catch (e) { console.error('bot vérification:', e.message); }
-}
 
 // v1.61 : battles PK entre deux lives
 const PK_DURATION_MS = 5 * 60 * 1000;
@@ -1619,6 +1518,111 @@ app.get('/api/search/insights', async (req, res) => {
     }
   } catch (e) {}
 }
+
+// ---------- v1.65 : 🤖 BOT DE VÉRIFICATION ----------
+// Le bot (pas l'admin) examine automatiquement :
+// 1. les demandes de badge vérifié
+// 2. les vérifications d'identité KYC (monétisation)
+// 3. l'expiration des pièces : les pièces gagnées il y a 3 mois ou plus
+//    sont expirées → tout retrait avec des pièces expirées est rejeté à l'immédiat.
+const COIN_EXPIRY_MS = 90 * 24 * 3600 * 1000; // 3 mois
+
+// pièces valides (non expirées) d'un utilisateur — comptabilité FIFO sur le ledger
+async function validCoins(userId) {
+  const rows = await allRows(
+    'SELECT amount, created_at FROM ledger WHERE user_id=? ORDER BY created_at ASC, id ASC', userId);
+  const tnow = now();
+  const queue = []; // crédits [montant, timestamp]
+  for (const r of rows) {
+    const amt = Number(r.amount) || 0;
+    if (amt > 0) {
+      queue.push([amt, Number(r.created_at) || 0]);
+    } else if (amt < 0) {
+      let need = -amt;
+      while (need > 0 && queue.length) {
+        const take = Math.min(queue[0][0], need);
+        queue[0][0] -= take; need -= take;
+        if (queue[0][0] <= 0) queue.shift();
+      }
+    }
+  }
+  // expire les crédits de 3 mois ou plus
+  let valid = 0, expired = 0;
+  for (const [amt, ts] of queue) {
+    if (tnow - ts >= COIN_EXPIRY_MS) expired += amt;
+    else valid += amt;
+  }
+  return { valid: Math.floor(valid), expired: Math.floor(expired) };
+}
+
+// --- bot : badge vérifié ---
+async function botReviewBadge(r) {
+  const fails = [];
+  if (!r.full_name || r.full_name.trim().length < 3) fails.push('nom complet manquant');
+  if (!VERIF_CATEGORIES.includes(String(r.category || '').toLowerCase())) fails.push('catégorie invalide');
+  if (!r.id_doc_url || !/^https?:\/\//.test(r.id_doc_url)) fails.push('pièce d\u2019identité manquante ou illisible');
+  if (!r.website && !r.proof_links) fails.push('aucun site web ni lien de preuve');
+  if (!r.activity || r.activity.trim().length < 20) fails.push('description d\u2019activité trop courte');
+  // critères d'authenticité façon TikTok
+  const u = await get1('SELECT avatar, created_at FROM users WHERE id=?', r.user_id);
+  if (!u || !u.avatar) fails.push('profil incomplet (photo de profil requise)');
+  const nv = await get1('SELECT COUNT(*) AS c FROM videos WHERE user_id=? AND hidden=0', r.user_id);
+  if (!nv || Number(nv.c) < 1) fails.push('aucune vidéo publiée');
+  if (fails.length) return { approved: false, reason: 'Rejeté par le bot : ' + fails.join(' ; ') };
+  return { approved: true, reason: 'Vérifié par le bot : identité + preuves + activité confirmées' };
+}
+
+// --- bot : KYC monétisation ---
+async function botReviewKyc(v) {
+  const fails = [];
+  if (!/^[A-Z]{2}$/.test(String(v.country || ''))) fails.push('pays invalide');
+  if (!v.doc_front || !/^https?:\/\//.test(v.doc_front)) fails.push('photo du document manquante');
+  try {
+    if (!kycAllowedDocs(String(v.country).toUpperCase()).includes(v.doc_type)) fails.push('document non accepté pour ce pays');
+  } catch (_) { fails.push('type de document invalide'); }
+  if (v.expiry) {
+    const expDate = new Date(v.expiry + '-01T00:00:00Z');
+    expDate.setMonth(expDate.getMonth() + 1);
+    if (expDate <= new Date()) fails.push('document expiré');
+  }
+  if (fails.length) return { approved: false, reason: 'Rejeté par le bot : ' + fails.join(' ; ') };
+  return { approved: true, reason: 'Vérifié par le bot : document valide et en cours de validité' };
+}
+
+// --- le bot traite toutes les demandes en attente ---
+async function runVerificationBot() {
+  try {
+    // 1. badges
+    const badges = await allRows(`SELECT * FROM verification_requests WHERE status='pending' LIMIT 50`);
+    for (const r of badges) {
+      try {
+        const verdict = await botReviewBadge(r);
+        await runSql(`UPDATE verification_requests SET status=?, reviewed_at=?, reviewed_by='bot', review_reason=? WHERE id=?`,
+          verdict.approved ? 'approved' : 'rejected', now(), verdict.reason, r.id);
+        if (verdict.approved) {
+          await runSql('UPDATE users SET verified=1 WHERE id=?', r.user_id);
+          await notify(r.user_id, 'system', null, null, '🤖✔️ Ton compte est maintenant vérifié !');
+        } else {
+          await notify(r.user_id, 'system', null, null, '🤖 ' + verdict.reason);
+        }
+      } catch (_) {}
+    }
+    // 2. KYC
+    const kycs = await allRows(`SELECT * FROM id_verifications WHERE status='pending' LIMIT 50`);
+    for (const v of kycs) {
+      try {
+        const verdict = await botReviewKyc(v);
+        await runSql(`UPDATE id_verifications SET status=?, reviewed_at=?, reviewed_by='bot', review_reason=? WHERE id=?`,
+          verdict.approved ? 'approved' : 'rejected', now(), verdict.reason, v.id);
+        const u = await get1('SELECT username FROM users WHERE id=?', v.user_id);
+        await notify(v.user_id, 'system', null, null,
+          verdict.approved ? '🤖✔️ Ton identité est vérifiée — tu peux retirer tes gains !'
+                           : '🤖 ' + verdict.reason);
+      } catch (_) {}
+    }
+  } catch (e) { console.error('bot vérification:', e.message); }
+}
+
 
 // une ligne ou undefined
 async function get1(sql, ...params) {
@@ -3815,6 +3819,36 @@ app.get('/api/collections/:id', async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 
+// v1.68 : réponses vidéo aux commentaires (façon TikTok)
+app.post('/api/comments/:id/video-reply', auth, upload.single('video'), async (req, res) => {
+  try {
+    const c = await get1('SELECT * FROM comments WHERE id=?', req.params.id);
+    if (!c) return res.status(404).json({ error: 'commentaire introuvable' });
+    const v = await get1('SELECT user_id FROM videos WHERE id=?', c.video_id);
+    if (!v || Number(v.user_id) !== Number(req.userId))
+      return res.status(403).json({ error: 'seul le créateur peut répondre en vidéo' });
+    if (!req.file) return res.status(400).json({ error: 'vidéo requise' });
+    // upload via le même pipeline que /api/videos (simplifié : stocke et crée la vidéo)
+    const fname = 'vidigagne/videos/' + Date.now() + '_' + Math.random().toString(36).slice(2, 8) + '.mp4';
+    let fileUrl = '';
+    if (USE_CLOUDINARY && cloudinary) {
+      const up = await new Promise((resolve, reject) => {
+        const st = cloudinary.uploader.upload_stream(
+          { resource_type: 'video', folder: 'vidigagne/videos', format: 'mp4' },
+          (err, r) => err ? reject(err) : resolve(r));
+        st.end(req.file.buffer);
+      });
+      fileUrl = up.secure_url;
+    } else { fileUrl = fname; }
+    const descText = '🎬 Réponse à @' + (c.username || 'commentaire');
+    const vid = await insertId(
+      `INSERT INTO videos(user_id,file,description,visibility,reply_to_comment_id,created_at)
+       VALUES(?,?,?,?,?,?)`, req.userId, fileUrl, descText, 'public', c.id, now());
+    await runSql('UPDATE comments SET video_reply_id=? WHERE id=?', vid, c.id);
+    await notify(c.user_id, 'video_reply', req.userId, vid, String(c.id));
+    res.json({ ok: true, video_id: vid });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
 // ---------- reposts ----------
 app.post('/api/videos/:id/repost', auth, async (req, res) => {
   try {
