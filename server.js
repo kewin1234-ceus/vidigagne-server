@@ -597,6 +597,28 @@ CREATE TABLE IF NOT EXISTS family_settings(
     await pool.query(`ALTER TABLE verification_requests ADD COLUMN IF NOT EXISTS review_reason TEXT DEFAULT ''`);
     await pool.query(`ALTER TABLE id_verifications ADD COLUMN IF NOT EXISTS reviewed_by TEXT DEFAULT ''`);
     await pool.query(`ALTER TABLE id_verifications ADD COLUMN IF NOT EXISTS review_reason TEXT DEFAULT ''`);
+    await pool.query(`ALTER TABLE videos ADD COLUMN IF NOT EXISTS ad_impressions INTEGER DEFAULT 0`);
+    await pool.query(`ALTER TABLE videos ADD COLUMN IF NOT EXISTS ad_revenue_usd REAL DEFAULT 0`);
+    await pool.query(`ALTER TABLE videos ADD COLUMN IF NOT EXISTS monetized_views INTEGER DEFAULT 0`);
+    await pool.query(`ALTER TABLE videos ADD COLUMN IF NOT EXISTS demonetized INTEGER DEFAULT 0`);
+    await pool.query(`ALTER TABLE videos ADD COLUMN IF NOT EXISTS monetization_enabled INTEGER DEFAULT 1`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS ad_impressions(
+      id SERIAL PRIMARY KEY, video_id INTEGER NOT NULL, creator_id INTEGER NOT NULL,
+      ad_type TEXT NOT NULL DEFAULT 'interstitial', created_at BIGINT NOT NULL)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_adimp_video ON ad_impressions(video_id)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_adimp_day ON ad_impressions(created_at)`);
+    await pool.query(`ALTER TABLE sounds ADD COLUMN IF NOT EXISTS license TEXT DEFAULT ''`);
+    await pool.query(`ALTER TABLE sounds ADD COLUMN IF NOT EXISTS attribution TEXT DEFAULT ''`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS live_goals(
+      id SERIAL PRIMARY KEY, live_id INTEGER NOT NULL, title TEXT NOT NULL,
+      target_coins INTEGER NOT NULL, created_at BIGINT NOT NULL)`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS challenges(
+      id SERIAL PRIMARY KEY, title TEXT NOT NULL, description TEXT NOT NULL,
+      bonus_coins INTEGER NOT NULL, goal_type TEXT NOT NULL, goal_value INTEGER NOT NULL,
+      start_at BIGINT NOT NULL, end_at BIGINT NOT NULL, active INTEGER DEFAULT 1)`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS challenge_claims(
+      id SERIAL PRIMARY KEY, challenge_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+      claimed_at BIGINT NOT NULL, UNIQUE(challenge_id, user_id))`);
     await pool.query(`CREATE TABLE IF NOT EXISTS search_logs(
       id SERIAL PRIMARY KEY, query TEXT NOT NULL, user_id INTEGER,
       created_at BIGINT NOT NULL)`);
@@ -698,6 +720,283 @@ function stripBannedTags(text) {
   });
   return { clean: clean.replace(/\s{2,}/g, ' ').trim(), removed: [...new Set(removed)] };
 }
+// ---------- v1.67 : PROGRAMME DE MONÉTISATION ----------
+// Règles de Kewin :
+// - TOUS les pays sont éligibles (aucune restriction géographique)
+// - Revenu = pubs diffusées sur la vidéo × 50% créateur
+// - Plus la vidéo est longue, nette, haute qualité, retient les gens → plus de pubs → plus de gains
+// - Plus la vidéo est virale → plus de gains
+// - MAIS : vidéo virale SANS pub = ZÉRO revenu
+const MONET_MIN_FOLLOWERS = 1000;
+const MONET_MIN_VIEWS = 50000;
+
+// score de qualité d'une vidéo (détermine la priorité de diffusion des pubs)
+async function videoQualityScore(v) {
+  let score = 50; // base
+  // longueur : plus c'est long, plus il y a de slots pubs (max 10 min)
+  const dur = Number(v.duration) || 0;
+  if (dur >= 600) score += 25;
+  else if (dur >= 180) score += 18;
+  else if (dur >= 60) score += 12;
+  else if (dur >= 30) score += 6;
+  // rétention : % moyen regardé (depuis watch_events)
+  try {
+    const wr = await get1(`SELECT AVG(completed) AS r, COUNT(*) AS n FROM watch_events WHERE video_id=?`, v.id);
+    if (wr && Number(wr.n) >= 5) score += Math.round(Number(wr.r || 0) * 20); // 0-20 pts
+  } catch (_) {}
+  // engagement : likes / vues
+  const views = Number(v.views) || 0;
+  const likes = Number(v.likes) || 0;
+  if (views > 100) {
+    const eng = likes / views;
+    if (eng > 0.1) score += 10; else if (eng > 0.05) score += 5;
+  }
+  // viralité : vues
+  if (views >= 1000000) score += 15;
+  else if (views >= 100000) score += 10;
+  else if (views >= 10000) score += 5;
+  return Math.min(100, Math.max(0, Math.round(score)));
+}
+
+// éligibilité monétisation : TOUS les pays ✅ + seuils + KYC
+async function monetizationEligibility(userId) {
+  const u = await get1('SELECT * FROM users WHERE id=?', userId);
+  if (!u) return { eligible: false, reason: 'compte introuvable' };
+  const followers = Number((await get1('SELECT COUNT(*) AS c FROM follows WHERE followed_id=?', userId)).c);
+  const views = Number((await get1('SELECT COALESCE(SUM(views),0) AS s FROM videos WHERE user_id=? AND hidden=0', userId)).s);
+  const kyc = await get1(`SELECT status FROM id_verifications WHERE user_id=?`, userId);
+  const checks = {
+    followers: { ok: followers >= MONET_MIN_FOLLOWERS, have: followers, need: MONET_MIN_FOLLOWERS },
+    views: { ok: views >= MONET_MIN_VIEWS, have: views, need: MONET_MIN_VIEWS },
+    kyc: { ok: !!(kyc && kyc.status === 'approved'), have: kyc ? kyc.status : 'none' },
+    country: { ok: true, note: 'tous les pays éligibles' },
+  };
+  const eligible = checks.followers.ok && checks.views.ok && checks.kyc.ok;
+  return { eligible, checks };
+}
+
+// distribution quotidienne des revenus pubs aux créateurs
+// 50% du revenu pub du jour → réparti au prorata de (impressions pubs × score qualité)
+async function distributeAdRevenue(dayStr) {
+  try {
+    const day = await get1('SELECT ad_revenue_usd FROM ad_daily WHERE day=?', dayStr);
+    const revenue = day ? Number(day.ad_revenue_usd) || 0 : 0;
+    if (revenue <= 0) return { day: dayStr, distributed: 0, note: 'aucun revenu pub' };
+    const creatorPool = revenue * 0.5;
+    // impressions pubs du jour par vidéo (avec score qualité)
+    const rows = await allRows(`SELECT ai.video_id, COUNT(*) AS imp, v.user_id AS creator_id
+      FROM ad_impressions ai JOIN videos v ON v.id=ai.video_id
+      WHERE ai.created_at >= ? AND ai.created_at < ? AND v.hidden=0
+      GROUP BY ai.video_id, v.user_id`,
+      new Date(dayStr + 'T00:00:00Z').getTime(), new Date(dayStr + 'T00:00:00Z').getTime() + 86400000);
+    if (!rows.length) return { day: dayStr, distributed: 0, note: 'aucune impression pub' };
+    // calcule le poids de chaque vidéo : impressions × score qualité
+    let totalWeight = 0;
+    const weighted = [];
+    for (const r of rows) {
+      const elig = await monetizationEligibility(r.creator_id);
+      if (!elig.eligible) continue; // pas éligible → pas de gains
+      const v = await get1('SELECT * FROM videos WHERE id=?', r.video_id);
+      if (!v) continue;
+      const q = await videoQualityScore(v);
+      const w = Number(r.imp) * (0.5 + q / 100); // qualité booste le poids
+      totalWeight += w;
+      weighted.push({ ...r, weight: w, quality: q });
+    }
+    if (!weighted.length || totalWeight <= 0) return { day: dayStr, distributed: 0, note: 'aucune vidéo éligible' };
+    let distributed = 0;
+    for (const w of weighted) {
+      const share = creatorPool * (w.weight / totalWeight);
+      const coins = Math.floor(share * 500); // 1 USD = 500 pièces
+      if (coins > 0) {
+        await runSql('UPDATE users SET coins=coins+? WHERE id=?', coins, w.creator_id);
+        await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
+          w.creator_id, coins, 'revenu pub vidéo #' + w.video_id, now());
+        await runSql('UPDATE videos SET ad_revenue_usd=ad_revenue_usd+? WHERE id=?', share, w.video_id);
+        distributed += share;
+      }
+      await runSql('UPDATE videos SET monetized_views=monetized_views+? WHERE id=?', Number(w.imp), w.video_id);
+    }
+    return { day: dayStr, revenue_usd: revenue, creator_pool_usd: creatorPool, distributed_usd: +distributed.toFixed(4), videos: weighted.length };
+  } catch (e) { return { error: e.message }; }
+}
+
+// v1.67 : sons originaux rémunérés — +2 pièces au créateur du son à chaque utilisation
+app.post('/api/sounds/:id/use', auth, async (req, res) => {
+  try {
+    const s = await get1('SELECT * FROM sounds WHERE id=?', req.params.id);
+    if (!s) return res.status(404).json({ error: 'son introuvable' });
+    await runSql('UPDATE sounds SET use_count=use_count+1 WHERE id=?', s.id);
+    // le créateur du son gagne +2 pièces par utilisation (max 200/jour anti-abus)
+    if (Number(s.user_id) !== Number(req.userId)) {
+      const dayStart = new Date().setHours(0, 0, 0, 0);
+      const r = await get1(`SELECT COALESCE(SUM(amount),0) AS t FROM ledger
+        WHERE user_id=? AND reason LIKE 'son utilisé%' AND created_at>=?`, s.user_id, dayStart);
+      if ((Number(r.t) || 0) < 200) {
+        await runSql('UPDATE users SET coins=coins+2 WHERE id=?', s.user_id);
+        await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
+          s.user_id, 2, 'son utilisé : ' + String(s.title).slice(0, 60), now());
+      }
+    }
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// v1.67 : objectifs de live (barre de progression des cadeaux)
+app.post('/api/live/:id/goal', auth, async (req, res) => {
+  try {
+    const live = await get1('SELECT * FROM lives WHERE id=?', req.params.id);
+    if (!live) return res.status(404).json({ error: 'live introuvable' });
+    if (Number(live.broadcaster_id) !== Number(req.userId)) return res.status(403).json({ error: 'non autorisé' });
+    const title = String((req.body || {}).title || 'Objectif').slice(0, 80);
+    const target = Math.max(10, Math.min(1000000, Math.floor(Number((req.body || {}).target_coins) || 100)));
+    const gid = await insertId('INSERT INTO live_goals(live_id,title,target_coins,created_at) VALUES(?,?,?,?)',
+      live.id, title, target, now());
+    res.json({ ok: true, id: gid });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.get('/api/live/:id/goals', async (req, res) => {
+  try {
+    const goals = await allRows('SELECT * FROM live_goals WHERE live_id=? ORDER BY created_at DESC', req.params.id);
+    const out = [];
+    for (const g of goals) {
+      const r = await get1(`SELECT COALESCE(SUM(cost),0) AS s FROM gift_events WHERE live_id=? AND created_at>=?`,
+        g.live_id, g.created_at);
+      out.push({ ...g, current_coins: Number(r.s) || 0 });
+    }
+    res.json({ goals: out });
+  } catch (e) { res.json({ goals: [] }); }
+});
+// v1.67 : défis créateurs (bonus en pièces)
+app.get('/api/challenges', auth, async (req, res) => {
+  try {
+    const t = now();
+    const rows = await allRows(`SELECT c.*, (SELECT 1 FROM challenge_claims cc
+      WHERE cc.challenge_id=c.id AND cc.user_id=?) AS claimed FROM challenges c
+      WHERE c.active=1 AND c.start_at<=? AND c.end_at>=? ORDER BY c.end_at ASC`, req.userId, t, t);
+    const out = [];
+    for (const c of rows) {
+      let progress = 0;
+      if (c.goal_type === 'videos') {
+        const r = await get1('SELECT COUNT(*) AS n FROM videos WHERE user_id=? AND created_at>=? AND hidden=0',
+          req.userId, c.start_at);
+        progress = Number(r.n) || 0;
+      } else if (c.goal_type === 'views') {
+        const r = await get1('SELECT COALESCE(SUM(views),0) AS s FROM videos WHERE user_id=? AND hidden=0', req.userId);
+        progress = Number(r.s) || 0;
+      } else if (c.goal_type === 'followers') {
+        const r = await get1('SELECT COUNT(*) AS n FROM follows WHERE followed_id=?', req.userId);
+        progress = Number(r.n) || 0;
+      }
+      out.push({ ...c, progress, done: progress >= Number(c.goal_value) });
+    }
+    res.json({ challenges: out });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.post('/api/challenges/:id/claim', auth, async (req, res) => {
+  try {
+    const c = await get1('SELECT * FROM challenges WHERE id=? AND active=1', req.params.id);
+    if (!c) return res.status(404).json({ error: 'défi introuvable' });
+    const t = now();
+    if (t < Number(c.start_at) || t > Number(c.end_at)) return res.status(400).json({ error: 'défi expiré' });
+    const done = await get1('SELECT 1 FROM challenge_claims WHERE challenge_id=? AND user_id=?', c.id, req.userId);
+    if (done) return res.status(400).json({ error: 'déjà réclamé' });
+    let progress = 0;
+    if (c.goal_type === 'videos') {
+      const r = await get1('SELECT COUNT(*) AS n FROM videos WHERE user_id=? AND created_at>=? AND hidden=0', req.userId, c.start_at);
+      progress = Number(r.n) || 0;
+    } else if (c.goal_type === 'views') {
+      const r = await get1('SELECT COALESCE(SUM(views),0) AS s FROM videos WHERE user_id=? AND hidden=0', req.userId);
+      progress = Number(r.s) || 0;
+    } else if (c.goal_type === 'followers') {
+      const r = await get1('SELECT COUNT(*) AS n FROM follows WHERE followed_id=?', req.userId);
+      progress = Number(r.n) || 0;
+    }
+    if (progress < Number(c.goal_value)) return res.status(400).json({ error: 'objectif non atteint (' + progress + '/' + c.goal_value + ')' });
+    await runSql('INSERT INTO challenge_claims(challenge_id,user_id,claimed_at) VALUES(?,?,?)', c.id, req.userId, t);
+    await runSql('UPDATE users SET coins=coins+? WHERE id=?', Number(c.bonus_coins), req.userId);
+    await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
+      req.userId, Number(c.bonus_coins), 'défi créateur : ' + c.title, t);
+    res.json({ ok: true, bonus: Number(c.bonus_coins) });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// v1.67 : historique des gains + export
+app.get('/api/earnings/history', auth, async (req, res) => {
+  try {
+    const rows = await allRows(`SELECT amount, reason, created_at FROM ledger
+      WHERE user_id=? AND amount>0 ORDER BY created_at DESC LIMIT 200`, req.userId);
+    res.json({ history: rows });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.get('/api/earnings/export', auth, async (req, res) => {
+  try {
+    const rows = await allRows(`SELECT amount, reason, created_at FROM ledger
+      WHERE user_id=? AND amount>0 ORDER BY created_at DESC LIMIT 1000`, req.userId);
+    let csv = 'date;montant_pieces;motif\n';
+    for (const r of rows) {
+      const d = new Date(Number(r.created_at)).toISOString().slice(0, 10);
+      csv += d + ';' + r.amount + ';"' + String(r.reason || '').replace(/"/g, '""') + '"\n';
+    }
+    res.type('text/csv').set('Content-Disposition', 'attachment; filename="gains-vidigagne.csv"').send(csv);
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// v1.67 : le créateur active/coupe la monétisation d'une de ses vidéos
+app.post('/api/videos/:id/monetization', auth, async (req, res) => {
+  try {
+    const v = await get1('SELECT * FROM videos WHERE id=?', req.params.id);
+    if (!v) return res.status(404).json({ error: 'vidéo introuvable' });
+    if (Number(v.user_id) !== Number(req.userId)) return res.status(403).json({ error: 'non autorisé' });
+    const enabled = (req.body || {}).enabled !== false ? 1 : 0;
+    await runSql('UPDATE videos SET monetization_enabled=? WHERE id=?', enabled, v.id);
+    res.json({ ok: true, monetization_enabled: !!enabled });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// v1.67 : règles de démonétisation (contenus exclus des pubs)
+const DEMONETIZED_KEYWORDS = ['violence','arme','drogue','sexe','porno','haine','terrorisme','suicide','automutilation'];
+app.post('/api/admin/videos/:id/demonetize', async (req, res) => {
+  const t = req.headers['x-admin-token'];
+  if (!process.env.ADMIN_TOKEN || t !== process.env.ADMIN_TOKEN) return res.status(403).json({ error: 'non autorisé' });
+  try {
+    const demonetized = (req.body || {}).demonetized !== false ? 1 : 0;
+    const reason = String((req.body || {}).reason || '').slice(0, 200);
+    await runSql('UPDATE videos SET demonetized=? WHERE id=?', demonetized, req.params.id);
+    const v = await get1('SELECT user_id FROM videos WHERE id=?', req.params.id);
+    if (v) await notify(v.user_id, 'system', null, null, demonetized
+      ? '⚠️ Ta vidéo a été démonétisée' + (reason ? ' : ' + reason : '') + ' — aucune pub ne sera diffusée dessus.'
+      : '✅ Ta vidéo est de nouveau monétisée.');
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// v1.67 : une pub s'affiche après/pendant une vidéo → impression comptabilisée pour le créateur
+app.post('/api/ads/impression', auth, async (req, res) => {
+  try {
+    const vid = Number((req.body || {}).video_id) || 0;
+    const adType = String((req.body || {}).ad_type || 'interstitial').slice(0, 30);
+    if (!vid) return res.status(400).json({ error: 'video_id requis' });
+    const v = await get1('SELECT id, user_id, hidden, demonetized, monetization_enabled FROM videos WHERE id=?', vid);
+    if (!v || v.hidden) return res.status(404).json({ error: 'vidéo introuvable' });
+    if (v.demonetized) return res.json({ ok: true, skipped: 'demonetized' }); // pas de pub = pas de revenu
+    if (!v.monetization_enabled) return res.json({ ok: true, skipped: 'disabled_by_creator' });
+    await runSql('INSERT INTO ad_impressions(video_id, creator_id, ad_type, created_at) VALUES(?,?,?,?)',
+      vid, v.user_id, adType, now());
+    await runSql('UPDATE videos SET ad_impressions=ad_impressions+1 WHERE id=?', vid);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// éligibilité + statut monétisation du créateur connecté
+app.get('/api/monetization/status', auth, async (req, res) => {
+  try {
+    const elig = await monetizationEligibility(req.userId);
+    const vids = await allRows(`SELECT id, description, views, likes, ad_impressions, ad_revenue_usd,
+      monetized_views, demonetized, duration, created_at FROM videos
+      WHERE user_id=? AND hidden=0 ORDER BY created_at DESC LIMIT 100`, req.userId);
+    const vq = [];
+    for (const v of vids) vq.push({ ...v, quality: await videoQualityScore(v) });
+    const totalEarned = vq.reduce((s, v) => s + (Number(v.ad_revenue_usd) || 0), 0);
+    const totalImp = vq.reduce((s, v) => s + (Number(v.ad_impressions) || 0), 0);
+    res.json({ ...elig, total_earned_usd: +totalEarned.toFixed(4), total_impressions: totalImp, videos: vq });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// distribution quotidienne à 23h59 UTC (avec le calcul 50-50 existant)
 // ---------- v1.65 : 🤖 BOT DE VÉRIFICATION ----------
 // Le bot (pas l'admin) examine automatiquement :
 // 1. les demandes de badge vérifié
@@ -1029,9 +1328,9 @@ app.post('/api/admin/sounds/bulk-import', async (req, res) => {
           (err, r) => err ? reject(err) : resolve(r));
         st.end(buf);
       });
-      await runSql(`INSERT INTO sounds(user_id,title,artist,audio_url,use_count,created_at)
-        VALUES(0,?,?,?,0,?)`, title, String(tr.artist || '').slice(0, 200),
-        up.secure_url, now());
+      await runSql(`INSERT INTO sounds(user_id,title,artist,audio_url,use_count,license,attribution,created_at)
+        VALUES(0,?,?,?,?,?,?,?)`, title, String(tr.artist || '').slice(0, 200),
+        up.secure_url, 0, String(tr.license || '').slice(0, 100), String(tr.attribution || '').slice(0, 500), now());
       results.push({ title, status: 'ok' });
     } catch (e) {
       results.push({ title, status: 'erreur: ' + e.message });
@@ -5443,6 +5742,8 @@ setInterval(async () => {
       if(computeDaily5050._done !== dayStr){
         computeDaily5050._done = dayStr;
         const r = await computeDaily5050(dayStr);
+        const dist = await distributeAdRevenue(dayStr);
+        console.log('revenus créateurs distribués pour', dayStr, JSON.stringify(dist));
         console.log('50-50 calculé pour', dayStr, JSON.stringify(r));
       }
     }
