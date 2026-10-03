@@ -722,106 +722,6 @@ function stripBannedTags(text) {
   });
   return { clean: clean.replace(/\s{2,}/g, ' ').trim(), removed: [...new Set(removed)] };
 }
-// ---------- v1.67 : PROGRAMME DE MONÉTISATION ----------
-// Règles de Kewin :
-// - TOUS les pays sont éligibles (aucune restriction géographique)
-// - Revenu = pubs diffusées sur la vidéo × 50% créateur
-// - Plus la vidéo est longue, nette, haute qualité, retient les gens → plus de pubs → plus de gains
-// - Plus la vidéo est virale → plus de gains
-// - MAIS : vidéo virale SANS pub = ZÉRO revenu
-const MONET_MIN_FOLLOWERS = 1000;
-const MONET_MIN_VIEWS = 50000;
-
-// score de qualité d'une vidéo (détermine la priorité de diffusion des pubs)
-async function videoQualityScore(v) {
-  let score = 50; // base
-  // longueur : plus c'est long, plus il y a de slots pubs (max 10 min)
-  const dur = Number(v.duration) || 0;
-  if (dur >= 600) score += 25;
-  else if (dur >= 180) score += 18;
-  else if (dur >= 60) score += 12;
-  else if (dur >= 30) score += 6;
-  // rétention : % moyen regardé (depuis watch_events)
-  try {
-    const wr = await get1(`SELECT AVG(completed) AS r, COUNT(*) AS n FROM watch_events WHERE video_id=?`, v.id);
-    if (wr && Number(wr.n) >= 5) score += Math.round(Number(wr.r || 0) * 20); // 0-20 pts
-  } catch (_) {}
-  // engagement : likes / vues
-  const views = Number(v.views) || 0;
-  const likes = Number(v.likes) || 0;
-  if (views > 100) {
-    const eng = likes / views;
-    if (eng > 0.1) score += 10; else if (eng > 0.05) score += 5;
-  }
-  // viralité : vues
-  if (views >= 1000000) score += 15;
-  else if (views >= 100000) score += 10;
-  else if (views >= 10000) score += 5;
-  return Math.min(100, Math.max(0, Math.round(score)));
-}
-
-// éligibilité monétisation : TOUS les pays ✅ + seuils + KYC
-async function monetizationEligibility(userId) {
-  const u = await get1('SELECT * FROM users WHERE id=?', userId);
-  if (!u) return { eligible: false, reason: 'compte introuvable' };
-  const followers = Number((await get1('SELECT COUNT(*) AS c FROM follows WHERE followed_id=?', userId)).c);
-  const views = Number((await get1('SELECT COALESCE(SUM(views),0) AS s FROM videos WHERE user_id=? AND hidden=0', userId)).s);
-  const kyc = await get1(`SELECT status FROM id_verifications WHERE user_id=?`, userId);
-  const checks = {
-    followers: { ok: followers >= MONET_MIN_FOLLOWERS, have: followers, need: MONET_MIN_FOLLOWERS },
-    views: { ok: views >= MONET_MIN_VIEWS, have: views, need: MONET_MIN_VIEWS },
-    kyc: { ok: !!(kyc && kyc.status === 'approved'), have: kyc ? kyc.status : 'none' },
-    country: { ok: true, note: 'tous les pays éligibles' },
-  };
-  const eligible = checks.followers.ok && checks.views.ok && checks.kyc.ok;
-  return { eligible, checks };
-}
-
-// distribution quotidienne des revenus pubs aux créateurs
-// 50% du revenu pub du jour → réparti au prorata de (impressions pubs × score qualité)
-async function distributeAdRevenue(dayStr) {
-  try {
-    const day = await get1('SELECT ad_revenue_usd FROM ad_daily WHERE day=?', dayStr);
-    const revenue = day ? Number(day.ad_revenue_usd) || 0 : 0;
-    if (revenue <= 0) return { day: dayStr, distributed: 0, note: 'aucun revenu pub' };
-    const creatorPool = revenue * 0.5;
-    // impressions pubs du jour par vidéo (avec score qualité)
-    const rows = await allRows(`SELECT ai.video_id, COUNT(*) AS imp, v.user_id AS creator_id
-      FROM ad_impressions ai JOIN videos v ON v.id=ai.video_id
-      WHERE ai.created_at >= ? AND ai.created_at < ? AND v.hidden=0
-      GROUP BY ai.video_id, v.user_id`,
-      new Date(dayStr + 'T00:00:00Z').getTime(), new Date(dayStr + 'T00:00:00Z').getTime() + 86400000);
-    if (!rows.length) return { day: dayStr, distributed: 0, note: 'aucune impression pub' };
-    // calcule le poids de chaque vidéo : impressions × score qualité
-    let totalWeight = 0;
-    const weighted = [];
-    for (const r of rows) {
-      const elig = await monetizationEligibility(r.creator_id);
-      if (!elig.eligible) continue; // pas éligible → pas de gains
-      const v = await get1('SELECT * FROM videos WHERE id=?', r.video_id);
-      if (!v) continue;
-      const q = await videoQualityScore(v);
-      const w = Number(r.imp) * (0.5 + q / 100); // qualité booste le poids
-      totalWeight += w;
-      weighted.push({ ...r, weight: w, quality: q });
-    }
-    if (!weighted.length || totalWeight <= 0) return { day: dayStr, distributed: 0, note: 'aucune vidéo éligible' };
-    let distributed = 0;
-    for (const w of weighted) {
-      const share = creatorPool * (w.weight / totalWeight);
-      const coins = Math.floor(share * 500); // 1 USD = 500 pièces
-      if (coins > 0) {
-        await runSql('UPDATE users SET coins=coins+? WHERE id=?', coins, w.creator_id);
-        await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
-          w.creator_id, coins, 'revenu pub vidéo #' + w.video_id, now());
-        await runSql('UPDATE videos SET ad_revenue_usd=ad_revenue_usd+? WHERE id=?', share, w.video_id);
-        distributed += share;
-      }
-      await runSql('UPDATE videos SET monetized_views=monetized_views+? WHERE id=?', Number(w.imp), w.video_id);
-    }
-    return { day: dayStr, revenue_usd: revenue, creator_pool_usd: creatorPool, distributed_usd: +distributed.toFixed(4), videos: weighted.length };
-  } catch (e) { return { error: e.message }; }
-}
 
 // v1.67 : sons originaux rémunérés — +2 pièces au créateur du son à chaque utilisation
 app.post('/api/sounds/:id/use', auth, async (req, res) => {
@@ -1518,6 +1418,108 @@ app.get('/api/search/insights', async (req, res) => {
     }
   } catch (e) {}
 }
+
+// ---------- v1.67 : PROGRAMME DE MONÉTISATION ----------
+// Règles de Kewin :
+// - TOUS les pays sont éligibles (aucune restriction géographique)
+// - Revenu = pubs diffusées sur la vidéo × 50% créateur
+// - Plus la vidéo est longue, nette, haute qualité, retient les gens → plus de pubs → plus de gains
+// - Plus la vidéo est virale → plus de gains
+// - MAIS : vidéo virale SANS pub = ZÉRO revenu
+const MONET_MIN_FOLLOWERS = 1000;
+const MONET_MIN_VIEWS = 50000;
+
+// score de qualité d'une vidéo (détermine la priorité de diffusion des pubs)
+async function videoQualityScore(v) {
+  let score = 50; // base
+  // longueur : plus c'est long, plus il y a de slots pubs (max 10 min)
+  const dur = Number(v.duration) || 0;
+  if (dur >= 600) score += 25;
+  else if (dur >= 180) score += 18;
+  else if (dur >= 60) score += 12;
+  else if (dur >= 30) score += 6;
+  // rétention : % moyen regardé (depuis watch_events)
+  try {
+    const wr = await get1(`SELECT AVG(completed) AS r, COUNT(*) AS n FROM watch_events WHERE video_id=?`, v.id);
+    if (wr && Number(wr.n) >= 5) score += Math.round(Number(wr.r || 0) * 20); // 0-20 pts
+  } catch (_) {}
+  // engagement : likes / vues
+  const views = Number(v.views) || 0;
+  const likes = Number(v.likes) || 0;
+  if (views > 100) {
+    const eng = likes / views;
+    if (eng > 0.1) score += 10; else if (eng > 0.05) score += 5;
+  }
+  // viralité : vues
+  if (views >= 1000000) score += 15;
+  else if (views >= 100000) score += 10;
+  else if (views >= 10000) score += 5;
+  return Math.min(100, Math.max(0, Math.round(score)));
+}
+
+// éligibilité monétisation : TOUS les pays ✅ + seuils + KYC
+async function monetizationEligibility(userId) {
+  const u = await get1('SELECT * FROM users WHERE id=?', userId);
+  if (!u) return { eligible: false, reason: 'compte introuvable' };
+  const followers = Number((await get1('SELECT COUNT(*) AS c FROM follows WHERE followed_id=?', userId)).c);
+  const views = Number((await get1('SELECT COALESCE(SUM(views),0) AS s FROM videos WHERE user_id=? AND hidden=0', userId)).s);
+  const kyc = await get1(`SELECT status FROM id_verifications WHERE user_id=?`, userId);
+  const checks = {
+    followers: { ok: followers >= MONET_MIN_FOLLOWERS, have: followers, need: MONET_MIN_FOLLOWERS },
+    views: { ok: views >= MONET_MIN_VIEWS, have: views, need: MONET_MIN_VIEWS },
+    kyc: { ok: !!(kyc && kyc.status === 'approved'), have: kyc ? kyc.status : 'none' },
+    country: { ok: true, note: 'tous les pays éligibles' },
+  };
+  const eligible = checks.followers.ok && checks.views.ok && checks.kyc.ok;
+  return { eligible, checks };
+}
+
+// distribution quotidienne des revenus pubs aux créateurs
+// 50% du revenu pub du jour → réparti au prorata de (impressions pubs × score qualité)
+async function distributeAdRevenue(dayStr) {
+  try {
+    const day = await get1('SELECT ad_revenue_usd FROM ad_daily WHERE day=?', dayStr);
+    const revenue = day ? Number(day.ad_revenue_usd) || 0 : 0;
+    if (revenue <= 0) return { day: dayStr, distributed: 0, note: 'aucun revenu pub' };
+    const creatorPool = revenue * 0.5;
+    // impressions pubs du jour par vidéo (avec score qualité)
+    const rows = await allRows(`SELECT ai.video_id, COUNT(*) AS imp, v.user_id AS creator_id
+      FROM ad_impressions ai JOIN videos v ON v.id=ai.video_id
+      WHERE ai.created_at >= ? AND ai.created_at < ? AND v.hidden=0
+      GROUP BY ai.video_id, v.user_id`,
+      new Date(dayStr + 'T00:00:00Z').getTime(), new Date(dayStr + 'T00:00:00Z').getTime() + 86400000);
+    if (!rows.length) return { day: dayStr, distributed: 0, note: 'aucune impression pub' };
+    // calcule le poids de chaque vidéo : impressions × score qualité
+    let totalWeight = 0;
+    const weighted = [];
+    for (const r of rows) {
+      const elig = await monetizationEligibility(r.creator_id);
+      if (!elig.eligible) continue; // pas éligible → pas de gains
+      const v = await get1('SELECT * FROM videos WHERE id=?', r.video_id);
+      if (!v) continue;
+      const q = await videoQualityScore(v);
+      const w = Number(r.imp) * (0.5 + q / 100); // qualité booste le poids
+      totalWeight += w;
+      weighted.push({ ...r, weight: w, quality: q });
+    }
+    if (!weighted.length || totalWeight <= 0) return { day: dayStr, distributed: 0, note: 'aucune vidéo éligible' };
+    let distributed = 0;
+    for (const w of weighted) {
+      const share = creatorPool * (w.weight / totalWeight);
+      const coins = Math.floor(share * 500); // 1 USD = 500 pièces
+      if (coins > 0) {
+        await runSql('UPDATE users SET coins=coins+? WHERE id=?', coins, w.creator_id);
+        await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
+          w.creator_id, coins, 'revenu pub vidéo #' + w.video_id, now());
+        await runSql('UPDATE videos SET ad_revenue_usd=ad_revenue_usd+? WHERE id=?', share, w.video_id);
+        distributed += share;
+      }
+      await runSql('UPDATE videos SET monetized_views=monetized_views+? WHERE id=?', Number(w.imp), w.video_id);
+    }
+    return { day: dayStr, revenue_usd: revenue, creator_pool_usd: creatorPool, distributed_usd: +distributed.toFixed(4), videos: weighted.length };
+  } catch (e) { return { error: e.message }; }
+}
+
 
 // ---------- v1.65 : 🤖 BOT DE VÉRIFICATION ----------
 // Le bot (pas l'admin) examine automatiquement :
