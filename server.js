@@ -2341,6 +2341,15 @@ async function issueVerifyCode(identifier, kind) {
   if (devCode) out.dev_code = devCode;
   return out;
 }
+app.get('/api/admin/smtp-test', async (req, res) => {
+  if (req.headers['x-admin-token'] !== process.env.ADMIN_TOKEN) return res.status(403).json({ error: 'non autorisé' });
+  const m = mailer();
+  if (!m) return res.json({ ok: false, reason: 'mailer null — variables SMTP manquantes', hasHost: !!process.env.SMTP_HOST, hasUser: !!process.env.SMTP_USER, hasPass: !!process.env.SMTP_PASS });
+  try {
+    await m.verify();
+    res.json({ ok: true, message: 'connexion SMTP vérifiée' });
+  } catch (e) { res.json({ ok: false, reason: String(e && e.message || e).slice(0, 200) }); }
+});
 app.post('/api/auth/send-code', async (req, res) => {
   try {
     const kind = ((req.body || {}).kind === 'phone') ? 'phone' : 'email';
