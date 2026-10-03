@@ -589,6 +589,8 @@ CREATE TABLE IF NOT EXISTS family_settings(
     await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS audio_url TEXT DEFAULT ''`); // v1.57 : messages vocaux
     await pool.query(`ALTER TABLE group_messages ADD COLUMN IF NOT EXISTS audio_url TEXT DEFAULT ''`);
     await pool.query(`ALTER TABLE videos ADD COLUMN IF NOT EXISTS phash TEXT DEFAULT ''`);
+    await pool.query(`ALTER TABLE videos ADD COLUMN IF NOT EXISTS target_countries TEXT DEFAULT ''`);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS country TEXT DEFAULT ''`);
     await pool.query(`CREATE TABLE IF NOT EXISTS search_logs(
       id SERIAL PRIMARY KEY, query TEXT NOT NULL, user_id INTEGER,
       created_at BIGINT NOT NULL)`);
@@ -1028,6 +1030,10 @@ app.get('/api/search/insights', async (req, res) => {
     lite.exec(`CREATE TABLE IF NOT EXISTS search_logs(
       id INTEGER PRIMARY KEY AUTOINCREMENT, query TEXT NOT NULL, user_id INTEGER,
       created_at BIGINT NOT NULL)`);
+    { const vc2 = lite.prepare(`PRAGMA table_info(videos)`).all().map(c => c.name);
+    if (!vc2.includes('target_countries')) lite.exec(`ALTER TABLE videos ADD COLUMN target_countries TEXT DEFAULT ''`);
+    const uc = lite.prepare(`PRAGMA table_info(users)`).all().map(c => c.name);
+    if (!uc.includes('country')) lite.exec(`ALTER TABLE users ADD COLUMN country TEXT DEFAULT ''`); }
     { const vc = lite.prepare(`PRAGMA table_info(videos)`).all().map(c => c.name);
       if (!vc.includes('phash')) lite.exec(`ALTER TABLE videos ADD COLUMN phash TEXT DEFAULT ''`); }
     for (const c of ['first_name', 'last_name', 'birthdate']) {
@@ -1455,6 +1461,7 @@ function pubUser(u) {
 function privUser(u) {
   const p = pubUser(u);
   p.first_name = u.first_name || ''; p.last_name = u.last_name || ''; p.birthdate = u.birthdate || '';
+  p.country = u.country || '';
   return p;
 }
 async function videoJSON(v, meId) {
@@ -1489,6 +1496,7 @@ async function videoJSON(v, meId) {
     id: v.id, desc: v.description, tags: v.tags, sound: v.sound || '', duration: Number(v.duration) || 0,
     url: mediaUrl, visibility: v.visibility || 'public', subscribed,
     media_type: v.media_type || 'video', photos: mediaPhotos, captions,
+    target_countries: v.target_countries || '[]',
     series_id: seriesId, series_locked: seriesLocked, locked: seriesLocked || undefined,
     // v13 : replay de live + voix de synthèse + explication "pourquoi cette vidéo"
     is_replay: Number(v.is_replay) || 0,
@@ -1587,14 +1595,15 @@ app.post('/api/auth/logout', auth, async (req, res) => {
 });
 
 app.patch('/api/auth/me', auth, async (req, res) => {
-  const { name, avatar, bio, first_name, last_name, birthdate, sub_enabled, sub_price } = req.body || {};
-  await runSql('UPDATE users SET name=COALESCE(?,name), avatar=COALESCE(?,avatar), bio=COALESCE(?,bio), first_name=COALESCE(?,first_name), last_name=COALESCE(?,last_name), birthdate=COALESCE(?,birthdate) WHERE id=?',
+  const { name, avatar, bio, first_name, last_name, birthdate, sub_enabled, sub_price, country } = req.body || {};
+  await runSql('UPDATE users SET name=COALESCE(?,name), avatar=COALESCE(?,avatar), bio=COALESCE(?,bio), first_name=COALESCE(?,first_name), last_name=COALESCE(?,last_name), birthdate=COALESCE(?,birthdate), country=COALESCE(?,country) WHERE id=?',
     name ? String(name).slice(0, 40) : null,
     avatar ? String(avatar).slice(0, 8) : null,
     bio ? String(bio).slice(0, 150) : null,
     first_name !== undefined ? String(first_name).trim().slice(0, 40) : null,
     last_name !== undefined ? String(last_name).trim().slice(0, 40) : null,
-    /^\d{4}-\d{2}-\d{2}$/.test(birthdate || '') ? birthdate : null, req.userId);
+    /^\d{4}-\d{2}-\d{2}$/.test(birthdate || '') ? birthdate : null,
+    /^[A-Z]{2}$/.test(String(country || '')) ? String(country) : null, req.userId);
   // abonnement payant au créateur : activation + prix mensuel (pièces)
   if (sub_enabled !== undefined || sub_price !== undefined) {
     const se = sub_enabled ? 1 : 0;
@@ -1735,11 +1744,13 @@ app.post('/api/videos', auth, upload.single('video'), async (req, res) => {
     let ttsRate = Number(b.tts_rate) || 1;
     if (ttsRate < 0.5) ttsRate = 0.5;
     if (ttsRate > 2) ttsRate = 2;
+    const _tc = Array.isArray(b.target_countries) ? b.target_countries.filter(x => /^[A-Z]{2}$/.test(String(x))).slice(0, 10) : [];
+    const _tcJson = JSON.stringify(_tc);
     const id = await insertId(
-      'INSERT INTO videos(user_id,file,description,tags,sound,duration,scheduled_at,visibility,captions,is_replay,live_id,tts_text,tts_voice,tts_rate,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+      'INSERT INTO videos(user_id,file,description,tags,sound,duration,scheduled_at,visibility,captions,is_replay,live_id,tts_text,tts_voice,tts_rate,target_countries,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
       req.userId, fname, descText, String(b.tags || '').slice(0, 300),
       String(b.sound || '').slice(0, 120), duration, scheduledAt, visibility, captions,
-      isReplay, liveId, ttsText, ttsVoice, ttsRate, now());
+      isReplay, liveId, ttsText, ttsVoice, ttsRate, _tcJson, now());
     // pièces : +10 par publication
     await runSql('UPDATE users SET coins=coins+10 WHERE id=?', req.userId);
     await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
@@ -2533,6 +2544,9 @@ function tagsOf(v) {
 // les agrégats simples sont en SQL, le reste est calculé en JS.
 async function scoreForYou(candidates, meId) {
   if (!candidates.length) return [];
+  // v1.64 : pays du spectateur pour le ciblage d'audience
+  let myCountry = '';
+  try { const mu = await get1('SELECT country FROM users WHERE id=?', meId); if (mu) myCountry = String(mu.country || '').toUpperCase(); } catch (_) {}
   // affinité créateur : taux de complétion moyen de mes watch_events par créateur
   const creatorRows = await allRows(
     `SELECT v.user_id AS uid, AVG(we.completed) AS r FROM watch_events we
@@ -2581,10 +2595,19 @@ async function scoreForYou(candidates, meId) {
     const recency = 1 / (1 + hours / 24);
     const affC = affCreator[v.user_id] || 0;
     const seen = seenFull.has(Number(v.id));
+    // v1.64 : boost si la vidéo cible mon pays
+    let countryBoost = 0;
+    if (myCountry) {
+      try {
+        const tc = JSON.parse(v.target_countries || '[]');
+        if (Array.isArray(tc) && tc.includes(myCountry)) countryBoost = 0.3;
+      } catch (_) {}
+    }
     const score = 0.35 * affC
       + 0.25 * affTags
       + 0.25 * likeRate
       + 0.15 * recency
+      + countryBoost
       - 0.9 * (seen ? 1 : 0);
     // v13 : explication "pourquoi cette vidéo ?" (façon TikTok)
     const why = [];
@@ -2595,6 +2618,7 @@ async function scoreForYou(candidates, meId) {
     }
     if (likeRate > 0.08) why.push('Populaire auprès des spectateurs');
     if (recency > 0.7) why.push('Publiée récemment');
+    if (countryBoost > 0) why.push('Ciblée pour ton pays');
     if (seen) why.push('Déjà vue en entier');
     if (!why.length) why.push('Sélectionnée pour toi');
     v._why = why.slice(0, 3);
