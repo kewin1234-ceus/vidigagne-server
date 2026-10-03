@@ -1324,6 +1324,83 @@ app.get('/api/search/insights', async (req, res) => {
   await mig('videos', 'tts_rate', `REAL NOT NULL DEFAULT 1`);
   await mig('comments', 'audio_url', `TEXT`);
   await mig('qa_questions', 'asker_id', `INTEGER`);
+  // v1.84 : fonctionnalités TikTok — historique recherche, épingles, duos/collages,
+  // permissions vidéo, brouillons, demandes de messages, modérateurs live,
+  // statut d'activité, mode restreint, préférences notifications, effets, lieux
+  await mig('videos', 'duet_of', `INTEGER NOT NULL DEFAULT 0`);
+  await mig('videos', 'stitch_of', `INTEGER NOT NULL DEFAULT 0`);
+  await mig('videos', 'allow_duet', `INTEGER NOT NULL DEFAULT 1`);
+  await mig('videos', 'allow_stitch', `INTEGER NOT NULL DEFAULT 1`);
+  await mig('videos', 'allow_download', `INTEGER NOT NULL DEFAULT 1`);
+  await mig('videos', 'allow_comments', `INTEGER NOT NULL DEFAULT 1`);
+  await mig('videos', 'location', `TEXT NOT NULL DEFAULT ''`);
+  await mig('videos', 'effect', `TEXT NOT NULL DEFAULT ''`);
+  await mig('videos', 'is_private', `INTEGER NOT NULL DEFAULT 0`);
+  await mig('videos', 'visibility', `TEXT NOT NULL DEFAULT 'public'`);
+  await mig('users', 'last_seen', `BIGINT NOT NULL DEFAULT 0`);
+  await mig('users', 'activity_status', `TEXT NOT NULL DEFAULT 'public'`);
+  await mig('users', 'restricted_mode', `INTEGER NOT NULL DEFAULT 0`);
+  await mig('users', 'notif_likes', `INTEGER NOT NULL DEFAULT 1`);
+  await mig('users', 'notif_comments', `INTEGER NOT NULL DEFAULT 1`);
+  await mig('users', 'notif_follows', `INTEGER NOT NULL DEFAULT 1`);
+  await mig('users', 'notif_mentions', `INTEGER NOT NULL DEFAULT 1`);
+  await mig('users', 'notif_lives', `INTEGER NOT NULL DEFAULT 1`);
+  await mig('users', 'dm_privacy', `TEXT NOT NULL DEFAULT 'everyone'`);
+  await mig('users', 'comment_privacy', `TEXT NOT NULL DEFAULT 'everyone'`);
+  await mig('users', 'mention_privacy', `TEXT NOT NULL DEFAULT 'everyone'`);
+  await mig('users', 'download_privacy', `TEXT NOT NULL DEFAULT 'everyone'`);
+  await mig('users', 'liked_visibility', `TEXT NOT NULL DEFAULT 'me'`);
+  await mig('users', 'following_visibility', `TEXT NOT NULL DEFAULT 'me'`);
+  // Tables TikTok
+  if (USE_PG) {
+    await pool.query(`CREATE TABLE IF NOT EXISTS video_pins(
+      id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL, video_id INTEGER NOT NULL,
+      pinned_at BIGINT NOT NULL, UNIQUE(user_id, video_id))`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS video_drafts(
+      id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL, video_url TEXT NOT NULL DEFAULT '',
+      thumb_url TEXT NOT NULL DEFAULT '', description TEXT NOT NULL DEFAULT '',
+      created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL)`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS message_requests(
+      id SERIAL PRIMARY KEY, from_user_id INTEGER NOT NULL, to_user_id INTEGER NOT NULL,
+      text TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'pending',
+      created_at BIGINT NOT NULL)`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS live_moderators(
+      id SERIAL PRIMARY KEY, live_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+      added_at BIGINT NOT NULL, UNIQUE(live_id, user_id))`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS content_prefs(
+      id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL, topic TEXT NOT NULL,
+      pref TEXT NOT NULL DEFAULT 'more', created_at BIGINT NOT NULL,
+      UNIQUE(user_id, topic))`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS effects(
+      id SERIAL PRIMARY KEY, name TEXT NOT NULL, icon_url TEXT NOT NULL DEFAULT '',
+      use_count INTEGER NOT NULL DEFAULT 0, created_at BIGINT NOT NULL)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_vpins_user ON video_pins(user_id)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_drafts_user ON video_drafts(user_id)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_msgreq_to ON message_requests(to_user_id, status)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_effects_name ON effects(name)`);
+  } else {
+    lite.exec(`CREATE TABLE IF NOT EXISTS video_pins(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, video_id INTEGER NOT NULL,
+      pinned_at BIGINT NOT NULL, UNIQUE(user_id, video_id))`);
+    lite.exec(`CREATE TABLE IF NOT EXISTS video_drafts(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, video_url TEXT NOT NULL DEFAULT '',
+      thumb_url TEXT NOT NULL DEFAULT '', description TEXT NOT NULL DEFAULT '',
+      created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL)`);
+    lite.exec(`CREATE TABLE IF NOT EXISTS message_requests(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, from_user_id INTEGER NOT NULL, to_user_id INTEGER NOT NULL,
+      text TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'pending',
+      created_at BIGINT NOT NULL)`);
+    lite.exec(`CREATE TABLE IF NOT EXISTS live_moderators(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, live_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+      added_at BIGINT NOT NULL, UNIQUE(live_id, user_id))`);
+    lite.exec(`CREATE TABLE IF NOT EXISTS content_prefs(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, topic TEXT NOT NULL,
+      pref TEXT NOT NULL DEFAULT 'more', created_at BIGINT NOT NULL,
+      UNIQUE(user_id, topic))`);
+    lite.exec(`CREATE TABLE IF NOT EXISTS effects(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, icon_url TEXT NOT NULL DEFAULT '',
+      use_count INTEGER NOT NULL DEFAULT 0, created_at BIGINT NOT NULL)`);
+  }
   // Tables Q&A
   if (USE_PG) {
     await pool.query(`CREATE TABLE IF NOT EXISTS qa_questions(
@@ -1808,16 +1885,33 @@ const pushSockets = new Map();
 async function notify(userId, type, actorId, videoId, text) {
   try {
     if (!userId || Number(userId) === Number(actorId)) return;
+    // v1.84 : vérifie les préférences de notification du destinataire
+    try {
+      const prefs = await get1('SELECT notif_likes,notif_comments,notif_follows,notif_mentions,notif_lives FROM users WHERE id=?', userId);
+      if (prefs) {
+        const prefMap = { like: 'notif_likes', comment: 'notif_comments', follow: 'notif_follows', mention: 'notif_mentions', live: 'notif_lives' };
+        const col = prefMap[type];
+        if (col && Number(prefs[col]) === 0) return; // désactivé par l'utilisateur
+      }
+    } catch (_) {}
     const id = await insertId('INSERT INTO notifications(user_id,type,actor_id,video_id,text,is_read,created_at) VALUES(?,?,?,?,?,0,?)',
       userId, type, actorId || null, videoId || null, String(text || '').slice(0, 200), now());
+    let actorName = '';
+    try { if (actorId) { const a = await get1('SELECT username FROM users WHERE id=?', actorId); if (a) actorName = a.username; } } catch (_) {}
     // push instantané si le destinataire est connecté en WebSocket
     try {
       const ws = pushSockets.get(Number(userId));
       if (ws && ws.readyState === 1) {
-        let actorName = '';
-        if (actorId) { const a = await get1('SELECT username FROM users WHERE id=?', actorId); if (a) actorName = a.username; }
         ws.send(JSON.stringify({ t: 'push', id, type, text: String(text || '').slice(0, 200), actor: actorName }));
       }
+    } catch (_) {}
+    // v1.84 : tentative de push FCM (fonctionne même app fermée)
+    try {
+      const titles = { like: 'Nouveau J\u2019aime', comment: 'Nouveau commentaire', follow: 'Nouvel abonné',
+        mention: 'Mention', live: 'En direct', repost: 'Repost', default: 'VidiGagne' };
+      const title = (actorName ? actorName + ' — ' : '') + (titles[type] || titles.default);
+      sendFcmPush(userId, title, String(text || '').slice(0, 200),
+        { type, notif_id: String(id), actor: actorName }).catch(() => {});
     } catch (_) {}
   } catch (e) {}
 }
@@ -1938,6 +2032,11 @@ async function videoJSON(v, meId) {
     live_id: v.live_id ? Number(v.live_id) : null,
     tts: { text: v.tts_text || '', voice: v.tts_voice || '', rate: Number(v.tts_rate) || 1 },
     why: Array.isArray(v._why) ? v._why : null,
+    // v1.84 : duos/collages, permissions, lieu, effet (façon TikTok)
+    duet_of: Number(v.duet_of) || 0, stitch_of: Number(v.stitch_of) || 0,
+    allow_duet: Number(v.allow_duet ?? 1), allow_stitch: Number(v.allow_stitch ?? 1),
+    allow_download: Number(v.allow_download ?? 1), allow_comments: Number(v.allow_comments ?? 1),
+    location: v.location || '', effect: v.effect || '',
     views: Number(v.views), likes: Number(likes), comments: Number(cmts), liked,
     created_at: Number(v.created_at),
     user: privUser(u),
@@ -3010,6 +3109,16 @@ async function scoreForYou(candidates, meId) {
   // v1.64 : pays du spectateur pour le ciblage d'audience
   let myCountry = '';
   try { const mu = await get1('SELECT country FROM users WHERE id=?', meId); if (mu) myCountry = String(mu.country || '').toUpperCase(); } catch (_) {}
+  // v1.84 : préférences de contenu (sujets + / -), comptes suivis, mode restreint
+  let prefMore = [], prefLess = [], followedSet = new Set(), restricted = false;
+  try {
+    const pr = await allRows('SELECT topic, pref FROM content_prefs WHERE user_id=?', meId);
+    for (const p of pr) { if (p.pref === 'less') prefLess.push(p.topic); else prefMore.push(p.topic); }
+    const fr = await allRows('SELECT followed_id FROM follows WHERE follower_id=?', meId);
+    for (const f of fr) followedSet.add(Number(f.followed_id));
+    const mu2 = await get1('SELECT restricted_mode FROM users WHERE id=?', meId);
+    restricted = mu2 && Number(mu2.restricted_mode) === 1;
+  } catch (_) {}
   // affinité créateur : taux de complétion moyen de mes watch_events par créateur
   const creatorRows = await allRows(
     `SELECT v.user_id AS uid, AVG(we.completed) AS r FROM watch_events we
@@ -3066,14 +3175,26 @@ async function scoreForYou(candidates, meId) {
         if (Array.isArray(tc) && tc.includes(myCountry)) countryBoost = 0.3;
       } catch (_) {}
     }
+    // v1.84 : boost sujets aimés, malus sujets rejetés, boost suivis
+    let prefBoost = 0;
+    if (vtags.length) {
+      for (const t of vtags) {
+        if (prefMore.includes(t)) prefBoost += 0.25;
+        if (prefLess.includes(t)) prefBoost -= 0.5;
+      }
+    }
+    const followBoost = followedSet.has(Number(v.user_id)) ? 0.3 : 0;
     const score = 0.35 * affC
       + 0.25 * affTags
       + 0.25 * likeRate
       + 0.15 * recency
       + countryBoost
+      + prefBoost
+      + followBoost
       - 0.9 * (seen ? 1 : 0);
     // v13 : explication "pourquoi cette vidéo ?" (façon TikTok)
     const why = [];
+    if (followedSet.has(Number(v.user_id))) why.push('Un créateur que tu suis');
     if (affC > 0.5) why.push('Tu regardes souvent ce créateur');
     if (affTags > 0.5) {
       const top = Object.keys(sharedTags).sort((a, b) => sharedTags[b] - sharedTags[a]).slice(0, 3);
@@ -3087,8 +3208,14 @@ async function scoreForYou(candidates, meId) {
     v._why = why.slice(0, 3);
     return { v, score };
   });
-  scored.sort((a, b) => b.score - a.score);
-  return scored.slice(0, 50).map(s => s.v);
+  // v1.84 : exclut les vidéos dont tous les tags sont rejetés
+  const filtered = scored.filter(s => {
+    const vtags = tagsOf(s.v);
+    if (!vtags.length) return true;
+    return !vtags.every(t => prefLess.includes(t));
+  });
+  filtered.sort((a, b) => b.score - a.score);
+  return filtered.slice(0, 50).map(s => s.v);
 }
 
 app.get('/api/feed', async (req, res) => {
@@ -3421,6 +3548,7 @@ app.post('/api/videos/:id/comments', auth, uploadMedia.fields([{name:'video',max
       `SELECT c.*, u.username, u.name, u.avatar FROM comments c
        JOIN users u ON u.id=c.user_id WHERE c.id=?`, id);
     await notify(v.user_id, 'comment', req.userId, v.id, text.slice(0, 100));
+    notifyMentions(text, req.userId, v.id); // v1.84 : notifie les @mentionnés
     res.json({ comment: c });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
@@ -5873,6 +6001,303 @@ setInterval(async () => {
     }
   }catch(e){}
 }, 30000);
+
+
+// ==================== v1.84 : FONCTIONNALITÉS TIKTOK ====================
+
+// ---------- historique de recherche ----------
+app.get('/api/search/history', auth, async (req, res) => {
+  try {
+    const rows = await allRows('SELECT DISTINCT query, MAX(created_at) AS ts FROM search_logs WHERE user_id=? GROUP BY query ORDER BY ts DESC LIMIT 30', req.userId);
+    res.json({ ok: true, history: rows.map(r => r.query) });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.delete('/api/search/history', auth, async (req, res) => {
+  try { await runSql('DELETE FROM search_logs WHERE user_id=?', req.userId); res.json({ ok: true }); }
+  catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.delete('/api/search/history/:q', auth, async (req, res) => {
+  try { await runSql('DELETE FROM search_logs WHERE user_id=? AND query=?', req.userId, req.params.q); res.json({ ok: true }); }
+  catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// ---------- suggestions de recherche ----------
+app.get('/api/search/suggest', async (req, res) => {
+  try {
+    const q = String(req.query.q || '').trim().toLowerCase().slice(0, 50);
+    if (!q) return res.json({ ok: true, suggestions: [] });
+    const rows = await allRows(`SELECT query, COUNT(*) AS c FROM search_logs WHERE LOWER(query) LIKE ? GROUP BY query ORDER BY c DESC LIMIT 8`, q + '%');
+    res.json({ ok: true, suggestions: rows.map(r => r.query) });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+
+// ---------- vidéos épinglées (max 3, façon TikTok) ----------
+app.post('/api/videos/:id/pin', auth, async (req, res) => {
+  try {
+    const v = await get1('SELECT * FROM videos WHERE id=?', req.params.id);
+    if (!v) return res.status(404).json({ error: 'vidéo introuvable' });
+    if (Number(v.user_id) !== Number(req.userId)) return res.status(403).json({ error: 'non autorisé' });
+    const c = await get1('SELECT COUNT(*) AS c FROM video_pins WHERE user_id=?', req.userId);
+    if (Number(c.c) >= 3) return res.status(400).json({ error: '3 vidéos épinglées maximum' });
+    await insertIgnore('INSERT OR IGNORE INTO video_pins(user_id,video_id,pinned_at) VALUES(?,?,?)', req.userId, v.id, now());
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.delete('/api/videos/:id/pin', auth, async (req, res) => {
+  try { await runSql('DELETE FROM video_pins WHERE user_id=? AND video_id=?', req.userId, req.params.id); res.json({ ok: true }); }
+  catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.get('/api/users/:username/pinned', async (req, res) => {
+  try {
+    const u = await get1('SELECT id FROM users WHERE username=?', req.params.username);
+    if (!u) return res.status(404).json({ error: 'utilisateur introuvable' });
+    const rows = await allRows(`SELECT v.* FROM video_pins p JOIN videos v ON v.id=p.video_id WHERE p.user_id=? ORDER BY p.pinned_at DESC`, u.id);
+    res.json({ ok: true, videos: rows });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+
+// ---------- duos et collages ----------
+app.post('/api/videos/:id/duet', auth, async (req, res) => {
+  try {
+    const orig = await get1('SELECT * FROM videos WHERE id=?', req.params.id);
+    if (!orig) return res.status(404).json({ error: 'vidéo introuvable' });
+    if (!Number(orig.allow_duet)) return res.status(403).json({ error: 'duos non autorisés sur cette vidéo' });
+    res.json({ ok: true, original: { id: orig.id, url: orig.url, user_id: orig.user_id } });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.post('/api/videos/:id/stitch', auth, async (req, res) => {
+  try {
+    const orig = await get1('SELECT * FROM videos WHERE id=?', req.params.id);
+    if (!orig) return res.status(404).json({ error: 'vidéo introuvable' });
+    if (!Number(orig.allow_stitch)) return res.status(403).json({ error: 'collages non autorisés sur cette vidéo' });
+    res.json({ ok: true, original: { id: orig.id, url: orig.url, user_id: orig.user_id, duration: orig.duration } });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// ---------- permissions vidéo (à la publication) ----------
+app.post('/api/videos/:id/permissions', auth, async (req, res) => {
+  try {
+    const v = await get1('SELECT * FROM videos WHERE id=?', req.params.id);
+    if (!v) return res.status(404).json({ error: 'vidéo introuvable' });
+    if (Number(v.user_id) !== Number(req.userId)) return res.status(403).json({ error: 'non autorisé' });
+    const b = req.body || {};
+    const cols = ['allow_duet', 'allow_stitch', 'allow_download', 'allow_comments', 'visibility', 'location'];
+    const sets = [], vals = [];
+    if (b.allow_duet !== undefined) { sets.push('allow_duet=?'); vals.push(b.allow_duet ? 1 : 0); }
+    if (b.allow_stitch !== undefined) { sets.push('allow_stitch=?'); vals.push(b.allow_stitch ? 1 : 0); }
+    if (b.allow_download !== undefined) { sets.push('allow_download=?'); vals.push(b.allow_download ? 1 : 0); }
+    if (b.allow_comments !== undefined) { sets.push('allow_comments=?'); vals.push(b.allow_comments ? 1 : 0); }
+    if (b.visibility && ['public', 'friends', 'private'].includes(b.visibility)) { sets.push('visibility=?'); vals.push(b.visibility); }
+    if (b.location !== undefined) { sets.push('location=?'); vals.push(String(b.location).slice(0, 100)); }
+    if (sets.length) { vals.push(v.id); await runSql(`UPDATE videos SET ${sets.join(',')} WHERE id=?`, ...vals); }
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+
+// ---------- brouillons ----------
+app.get('/api/drafts', auth, async (req, res) => {
+  try {
+    const rows = await allRows('SELECT * FROM video_drafts WHERE user_id=? ORDER BY updated_at DESC', req.userId);
+    res.json({ ok: true, drafts: rows });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.post('/api/drafts', auth, async (req, res) => {
+  try {
+    const b = req.body || {};
+    const id = await insertId('INSERT INTO video_drafts(user_id,video_url,thumb_url,description,created_at,updated_at) VALUES(?,?,?,?,?,?)',
+      req.userId, String(b.video_url || ''), String(b.thumb_url || ''), String(b.description || '').slice(0, 500), now(), now());
+    res.json({ ok: true, id });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.delete('/api/drafts/:id', auth, async (req, res) => {
+  try { await runSql('DELETE FROM video_drafts WHERE id=? AND user_id=?', req.params.id, req.userId); res.json({ ok: true }); }
+  catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+
+// ---------- demandes de messages (inconnus) ----------
+app.get('/api/messages/requests', auth, async (req, res) => {
+  try {
+    const rows = await allRows(`SELECT mr.*, u.username FROM message_requests mr JOIN users u ON u.id=mr.from_user_id WHERE mr.to_user_id=? AND mr.status='pending' ORDER BY mr.created_at DESC`, req.userId);
+    res.json({ ok: true, requests: rows });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.post('/api/messages/requests/:id/accept', auth, async (req, res) => {
+  try {
+    const r = await get1('SELECT * FROM message_requests WHERE id=? AND to_user_id=?', req.params.id, req.userId);
+    if (!r) return res.status(404).json({ error: 'introuvable' });
+    await runSql("UPDATE message_requests SET status='accepted' WHERE id=?", r.id);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.post('/api/messages/requests/:id/decline', auth, async (req, res) => {
+  try { await runSql("UPDATE message_requests SET status='declined' WHERE id=? AND to_user_id=?", req.params.id, req.userId); res.json({ ok: true }); }
+  catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+
+// ---------- modérateurs de live ----------
+app.post('/api/lives/:id/moderators', auth, async (req, res) => {
+  try {
+    const l = await get1('SELECT * FROM lives WHERE id=?', req.params.id);
+    if (!l) return res.status(404).json({ error: 'live introuvable' });
+    if (Number(l.user_id) !== Number(req.userId)) return res.status(403).json({ error: 'non autorisé' });
+    const target = await get1('SELECT id FROM users WHERE username=?', String((req.body || {}).username || ''));
+    if (!target) return res.status(404).json({ error: 'utilisateur introuvable' });
+    await insertIgnore('INSERT OR IGNORE INTO live_moderators(live_id,user_id,added_at) VALUES(?,?,?)', l.id, target.id, now());
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.delete('/api/lives/:id/moderators/:uid', auth, async (req, res) => {
+  try {
+    const l = await get1('SELECT * FROM lives WHERE id=?', req.params.id);
+    if (!l || Number(l.user_id) !== Number(req.userId)) return res.status(403).json({ error: 'non autorisé' });
+    await runSql('DELETE FROM live_moderators WHERE live_id=? AND user_id=?', l.id, req.params.uid);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.get('/api/lives/:id/moderators', async (req, res) => {
+  try {
+    const rows = await allRows(`SELECT u.id, u.username FROM live_moderators m JOIN users u ON u.id=m.user_id WHERE m.live_id=?`, req.params.id);
+    res.json({ ok: true, moderators: rows });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+
+// ---------- statut d'activité (en ligne) ----------
+app.post('/api/me/heartbeat', auth, async (req, res) => {
+  try { await runSql('UPDATE users SET last_seen=? WHERE id=?', now(), req.userId); res.json({ ok: true }); }
+  catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.get('/api/users/:username/online', async (req, res) => {
+  try {
+    const u = await get1('SELECT last_seen, activity_status FROM users WHERE username=?', req.params.username);
+    if (!u) return res.status(404).json({ error: 'introuvable' });
+    const online = u.activity_status !== 'nobody' && (now() - Number(u.last_seen || 0)) < 120000;
+    res.json({ ok: true, online });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+
+// ---------- mode restreint ----------
+app.post('/api/me/restricted', auth, async (req, res) => {
+  try {
+    await runSql('UPDATE users SET restricted_mode=? WHERE id=?', (req.body || {}).enabled ? 1 : 0, req.userId);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+
+// ---------- préférences de notifications ----------
+app.get('/api/me/notif-prefs', auth, async (req, res) => {
+  try {
+    const u = await get1('SELECT notif_likes,notif_comments,notif_follows,notif_mentions,notif_lives FROM users WHERE id=?', req.userId);
+    res.json({ ok: true, prefs: u || {} });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.post('/api/me/notif-prefs', auth, async (req, res) => {
+  try {
+    const b = req.body || {}, sets = [], vals = [];
+    for (const k of ['notif_likes', 'notif_comments', 'notif_follows', 'notif_mentions', 'notif_lives']) {
+      if (b[k] !== undefined) { sets.push(k + '=?'); vals.push(b[k] ? 1 : 0); }
+    }
+    if (sets.length) { vals.push(req.userId); await runSql(`UPDATE users SET ${sets.join(',')} WHERE id=?`, ...vals); }
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+
+// ---------- préférences de confidentialité (façon TikTok) ----------
+app.post('/api/me/privacy', auth, async (req, res) => {
+  try {
+    const b = req.body || {}, sets = [], vals = [];
+    const allowed = { dm_privacy: ['everyone', 'friends', 'nobody'], comment_privacy: ['everyone', 'friends', 'nobody'],
+      mention_privacy: ['everyone', 'friends', 'nobody'], download_privacy: ['everyone', 'friends', 'nobody'],
+      liked_visibility: ['everyone', 'friends', 'me'], following_visibility: ['everyone', 'friends', 'me'],
+      activity_status: ['public', 'friends', 'nobody'] };
+    for (const k of Object.keys(allowed)) {
+      if (b[k] !== undefined && allowed[k].includes(b[k])) { sets.push(k + '=?'); vals.push(b[k]); }
+    }
+    if (sets.length) { vals.push(req.userId); await runSql(`UPDATE users SET ${sets.join(',')} WHERE id=?`, ...vals); }
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+
+// ---------- préférences de contenu (sujets + / -) ----------
+app.get('/api/me/content-prefs', auth, async (req, res) => {
+  try {
+    const rows = await allRows('SELECT topic, pref FROM content_prefs WHERE user_id=?', req.userId);
+    res.json({ ok: true, prefs: rows });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.post('/api/me/content-prefs', auth, async (req, res) => {
+  try {
+    const topic = String((req.body || {}).topic || '').trim().toLowerCase().slice(0, 50);
+    const pref = (req.body || {}).pref === 'less' ? 'less' : 'more';
+    if (!topic) return res.status(400).json({ error: 'sujet requis' });
+    await insertIgnore('INSERT OR IGNORE INTO content_prefs(user_id,topic,pref,created_at) VALUES(?,?,?,?)', req.userId, topic, pref, now());
+    await runSql('UPDATE content_prefs SET pref=? WHERE user_id=? AND topic=?', pref, req.userId, topic);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+
+// ---------- pages dédiées : effets ----------
+app.get('/api/effects', async (req, res) => {
+  try {
+    const rows = await allRows('SELECT * FROM effects ORDER BY use_count DESC LIMIT 50');
+    res.json({ ok: true, effects: rows });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.get('/api/effects/:id/videos', async (req, res) => {
+  try {
+    const e = await get1('SELECT * FROM effects WHERE id=?', req.params.id);
+    if (!e) return res.status(404).json({ error: 'effet introuvable' });
+    const rows = await allRows('SELECT * FROM videos WHERE effect=? AND hidden=0 ORDER BY created_at DESC LIMIT 30', e.name);
+    res.json({ ok: true, effect: e, videos: rows });
+  } catch (e2) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.post('/api/effects', auth, async (req, res) => {
+  try {
+    const name = String((req.body || {}).name || '').trim().slice(0, 80);
+    if (!name) return res.status(400).json({ error: 'nom requis' });
+    const id = await insertId('INSERT INTO effects(name,icon_url,created_at) VALUES(?,?,?)', name, String((req.body || {}).icon_url || ''), now());
+    res.json({ ok: true, id });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+
+// ---------- pages dédiées : lieux ----------
+app.get('/api/places/:name/videos', async (req, res) => {
+  try {
+    const rows = await allRows('SELECT * FROM videos WHERE location=? AND hidden=0 ORDER BY created_at DESC LIMIT 30', req.params.name);
+    res.json({ ok: true, videos: rows });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+
+// ---------- mentions : notifie les @mentionnés dans un commentaire ----------
+async function notifyMentions(text, actorId, videoId) {
+  try {
+    const mentions = String(text || '').match(/@([a-zA-Z0-9._]{2,20})/g) || [];
+    const seen = new Set();
+    for (const m of mentions.slice(0, 5)) {
+      const uname = m.slice(1).toLowerCase();
+      if (seen.has(uname)) continue; seen.add(uname);
+      const u = await get1('SELECT id FROM users WHERE LOWER(username)=?', uname);
+      if (u && Number(u.id) !== Number(actorId)) {
+        await notify(u.id, 'mention', actorId, videoId, '@' + uname + ' vous a mentionné');
+      }
+    }
+  } catch (_) {}
+}
+
+// ---------- téléchargement vidéo (si autorisé) ----------
+app.get('/api/videos/:id/download-url', auth, async (req, res) => {
+  try {
+    const v = await get1('SELECT * FROM videos WHERE id=?', req.params.id);
+    if (!v) return res.status(404).json({ error: 'vidéo introuvable' });
+    if (!Number(v.allow_download)) return res.status(403).json({ error: 'téléchargement non autorisé' });
+    res.json({ ok: true, url: v.url });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+
+// ---------- vidéos privées (onglet cadenas) ----------
+app.get('/api/videos/mine/private', auth, async (req, res) => {
+  try {
+    const rows = await allRows(`SELECT * FROM videos WHERE user_id=? AND (is_private=1 OR visibility='private') ORDER BY created_at DESC`, req.userId);
+    res.json({ ok: true, videos: rows });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
 
 initDb().then(() => {
   publishDue();
