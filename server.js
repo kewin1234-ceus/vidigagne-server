@@ -593,6 +593,7 @@ CREATE TABLE IF NOT EXISTS family_settings(
     await pool.query(`ALTER TABLE videos ADD COLUMN IF NOT EXISTS phash TEXT DEFAULT ''`);
     await pool.query(`ALTER TABLE videos ADD COLUMN IF NOT EXISTS target_countries TEXT DEFAULT ''`);
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS country TEXT DEFAULT ''`);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS fcm_token TEXT DEFAULT ''`);
     await pool.query(`ALTER TABLE verification_requests ADD COLUMN IF NOT EXISTS reviewed_by TEXT DEFAULT ''`);
     await pool.query(`ALTER TABLE verification_requests ADD COLUMN IF NOT EXISTS review_reason TEXT DEFAULT ''`);
     await pool.query(`ALTER TABLE id_verifications ADD COLUMN IF NOT EXISTS reviewed_by TEXT DEFAULT ''`);
@@ -3337,6 +3338,26 @@ app.delete('/api/videos/:id/like', auth, async (req, res) => {
   res.json({ likes, liked: false });
 });
 
+// v1.68 : filtre anti-gros mots AUTOMATIQUE (pas seulement le mode protection)
+const BADWORDS_FR = ['merde','putain','salope','connard','connasse','encul','bite','couille','nique','fdp','tg','pd','salop','batard','bâtard','chiant','conard','débile','attardé','mongol'];
+const BADWORDS_EN = ['fuck','shit','bitch','asshole','dick','pussy','whore','slut','bastard','dumbass','retard','nigga','nigger','fag'];
+const BADWORDS_HT = ['kokorat','sanmanman','bouzen','kokobe','malpwòp'];
+const ALL_BADWORDS = [...BADWORDS_FR, ...BADWORDS_EN, ...BADWORDS_HT];
+function containsBadword(text) {
+  const low = ' ' + String(text || '').toLowerCase().replace(/[^\p{L}\p{N} ]/gu, ' ') + ' ';
+  for (const w of ALL_BADWORDS) {
+    if (low.includes(' ' + w + ' ') || low.includes(' ' + w + 's ')) return w;
+  }
+  return null;
+}
+function maskBadwords(text) {
+  let out = String(text || '');
+  for (const w of ALL_BADWORDS) {
+    const re = new RegExp('\\b' + w + 's?\\b', 'gi');
+    out = out.replace(re, m => '*'.repeat(m.length));
+  }
+  return out;
+}
 // ---------- commentaires ----------
 app.get('/api/videos/:id/comments', async (req, res) => {
   const rows = await allRows(
@@ -3361,7 +3382,9 @@ app.get('/api/videos/:id/comments', async (req, res) => {
 
 app.post('/api/videos/:id/comments', auth, uploadMedia.fields([{name:'video',maxCount:1},{name:'audio',maxCount:1}]), async (req, res) => {
   try {
-    const text = String((req.body || {}).text || '').trim().slice(0, 500);
+    let text = String((req.body || {}).text || '').trim().slice(0, 500);
+    // v1.68 : filtre anti-gros mots automatique — masque au lieu de bloquer
+    text = maskBadwords(text);
     const hasAudio=req.files&&req.files.audio&&req.files.audio[0];
     const hasVideo=req.files&&req.files.video&&req.files.video[0];
     if (!text&&!hasAudio&&!hasVideo) return res.status(400).json({ error: 'commentaire vide' });
@@ -3851,6 +3874,62 @@ app.post('/api/comments/:id/video-reply', auth, upload.single('video'), async (r
     res.json({ ok: true, video_id: vid });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
+// v1.68 : classements par pays (top vidéos + top créateurs)
+app.get('/api/rankings/:country', async (req, res) => {
+  try {
+    const country = String(req.params.country || '').toUpperCase().slice(0, 2);
+    if (!/^[A-Z]{2}$/.test(country)) return res.status(400).json({ error: 'pays invalide' });
+    const meId = await optUserId(req);
+    // top vidéos : celles ciblées vers ce pays OU créées par des utilisateurs de ce pays
+    const vids = await allRows(`SELECT v.* FROM videos v LEFT JOIN users u ON u.id=v.user_id
+      WHERE v.hidden=0 AND (v.scheduled_at IS NULL OR v.scheduled_at <= ?)
+      AND (v.target_countries LIKE ? OR u.country=?)
+      ORDER BY v.views DESC LIMIT 20`, now(), '%"' + country + '"%', country);
+    const videos = [];
+    for (const v of vids) {
+      if (!(await canSeeVideo(v, meId))) continue;
+      const j = await videoJSON(v, meId);
+      if (j) videos.push(j);
+      if (videos.length >= 10) break;
+    }
+    // top créateurs du pays (par abonnés)
+    const creators = await allRows(`SELECT u.id, u.username, u.name, u.avatar, u.verified,
+      (SELECT COUNT(*) FROM follows WHERE followed_id=u.id) AS followers,
+      (SELECT COALESCE(SUM(views),0) FROM videos WHERE user_id=u.id AND hidden=0) AS views
+      FROM users u WHERE u.country=? ORDER BY followers DESC LIMIT 10`, country);
+    res.json({ country, videos, creators });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// v1.68 : vrai push système FCM
+app.post('/api/push/fcm-token', auth, async (req, res) => {
+  try {
+    const token = String((req.body || {}).token || '').slice(0, 500);
+    if (!token) return res.status(400).json({ error: 'token requis' });
+    await runSql('UPDATE users SET fcm_token=? WHERE id=?', token, req.userId);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// envoie un push FCM (utilise Firebase Admin SDK si configuré, sinon log)
+let _fcmAdmin = null;
+async function sendFcmPush(userId, title, body, data) {
+  try {
+    const u = await get1('SELECT fcm_token FROM users WHERE id=?', userId);
+    if (!u || !u.fcm_token) return { sent: false, reason: 'no_token' };
+    // Firebase Admin SDK (nécessite GOOGLE_APPLICATION_CREDENTIALS sur Render)
+    if (!_fcmAdmin) {
+      try { _fcmAdmin = require('firebase-admin'); } catch (_) { return { sent: false, reason: 'admin_sdk_missing' }; }
+    }
+    if (_fcmAdmin.apps.length === 0) {
+      _fcmAdmin.initializeApp({ credential: _fcmAdmin.credential.applicationDefault() });
+    }
+    await _fcmAdmin.messaging().send({
+      token: u.fcm_token,
+      notification: { title: String(title).slice(0, 100), body: String(body).slice(0, 200) },
+      data: data || {},
+    });
+    return { sent: true };
+  } catch (e) { return { sent: false, reason: e.message.slice(0, 100) }; }
+}
 // ---------- reposts ----------
 app.post('/api/videos/:id/repost', auth, async (req, res) => {
   try {
