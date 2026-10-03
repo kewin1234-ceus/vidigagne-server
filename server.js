@@ -137,7 +137,10 @@ CREATE TABLE IF NOT EXISTS lives(
   title TEXT NOT NULL DEFAULT '',
   started_at BIGINT NOT NULL,
   ended_at BIGINT,
-  viewers INTEGER NOT NULL DEFAULT 0
+  viewers INTEGER NOT NULL DEFAULT 0,
+  live_type TEXT NOT NULL DEFAULT 'guests',
+  likes INTEGER NOT NULL DEFAULT 0,
+  shares INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS fund_deposits(
   id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
@@ -338,6 +341,16 @@ CREATE TABLE IF NOT EXISTS live_viewers(
   live_id INTEGER NOT NULL,
   user_id INTEGER NOT NULL,
   updated_at BIGINT NOT NULL,
+  PRIMARY KEY(live_id, user_id)
+);
+CREATE TABLE IF NOT EXISTS live_taps(
+  live_id INTEGER NOT NULL,
+  user_id INTEGER NOT NULL,
+  tap_count INTEGER NOT NULL DEFAULT 0,
+  window_start BIGINT NOT NULL,
+  last_tap_at BIGINT NOT NULL DEFAULT 0,
+  intervals TEXT NOT NULL DEFAULT '',
+  blocked_until BIGINT NOT NULL DEFAULT 0,
   PRIMARY KEY(live_id, user_id)
 );
 CREATE TABLE IF NOT EXISTS live_signals(
@@ -628,8 +641,17 @@ CREATE TABLE IF NOT EXISTS family_settings(
   restricted_mode INTEGER NOT NULL DEFAULT 0,
   dm_policy TEXT NOT NULL DEFAULT 'all'
 );`;
-  if (USE_PG) { await pool.query(schema); }
-  else { lite.exec(schema); try { lite.exec(`ALTER TABLE users ADD COLUMN gender TEXT DEFAULT ''`); } catch (e) {} }
+  if (USE_PG) { await pool.query(schema);
+    for (const col of ["ALTER TABLE lives ADD COLUMN IF NOT EXISTS live_type TEXT NOT NULL DEFAULT 'guests'",
+      "ALTER TABLE lives ADD COLUMN IF NOT EXISTS likes INTEGER NOT NULL DEFAULT 0",
+      "ALTER TABLE lives ADD COLUMN IF NOT EXISTS shares INTEGER NOT NULL DEFAULT 0"]) {
+      try { await pool.query(col); } catch (e) {}
+    }
+  }
+  else { lite.exec(schema); try { lite.exec(`ALTER TABLE users ADD COLUMN gender TEXT DEFAULT ''`); } catch (e) {}
+    try { lite.exec(`ALTER TABLE lives ADD COLUMN live_type TEXT NOT NULL DEFAULT 'guests'`); } catch (e) {}
+    try { lite.exec(`ALTER TABLE lives ADD COLUMN likes INTEGER NOT NULL DEFAULT 0`); } catch (e) {}
+    try { lite.exec(`ALTER TABLE lives ADD COLUMN shares INTEGER NOT NULL DEFAULT 0`); } catch (e) {} }
   // migrations : colonnes d'authentification sociale
   if (USE_PG) {
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT`);
@@ -2749,9 +2771,10 @@ app.get('/api/creator/stats', auth, async (req, res) => {
 // ---------- live : démarrer (la liste et la fin sont en version v10 ci-dessous) ----------
 app.post('/api/live/start', auth, async (req, res) => {
   const title = String((req.body || {}).title || '').slice(0, 80);
-  const id = await insertId('INSERT INTO lives(user_id,title,started_at,viewers) VALUES(?,?,?,0)',
-    req.userId, title, now());
-  res.json({ ok: true, id });
+  const liveType = String((req.body || {}).live_type || 'guests') === 'solo' ? 'solo' : 'guests';
+  const id = await insertId('INSERT INTO lives(user_id,title,started_at,viewers,live_type) VALUES(?,?,?,0,?)',
+    req.userId, title, now(), liveType);
+  res.json({ ok: true, id, live_type: liveType });
 });
 // ---------- compte : export et suppression (droits RGPD) ----------
 app.get('/api/account/export', auth, async (req, res) => {
@@ -5063,6 +5086,7 @@ function liveJSON(l, row, viewersCount) {
     viewers_count: viewersCount || 0,
     peak_viewers: Number(l.peak_viewers) || 0, duration_s: Number(l.duration_s) || 0,
     gifts_total: Number(l.gifts_total) || 0, chat_total: Number(l.chat_total) || 0,
+    likes: Number(l.likes) || 0, shares: Number(l.shares) || 0, live_type: l.live_type || 'guests',
   };
 }
 // Feed des lives en cours (pour les cartes LIVE dans "Pour toi")
@@ -5093,6 +5117,49 @@ app.get('/api/live/:id', async (req, res) => {
   if (!l) return res.status(404).json({ error: 'live introuvable' });
   const row = await get1('SELECT username,name,avatar FROM users WHERE id=?', l.user_id);
   res.json({ live: liveJSON(l, row, await liveViewersCount(l.id)) });
+});
+// ---------- v2.01 : tapoter sur le live + anti-bot ----------
+// CORRECTION Kewin 2026-10-03 : AUCUNE limite, AUCUN blocage — auto-clic autorisé.
+// Protection serveur uniquement : le client batche les taps (1 requête / 2s avec {count}).
+// CORRECTION Kewin 2026-10-03 : auto-clic AUTORISÉ — aucun blocage punitif.
+// Le client envoie les taps en BATCH toutes les 2 secondes : 1 requête = N taps.
+// Ça protège le serveur de la surcharge sans jamais punir un utilisateur.
+app.post('/api/live/:id/tap', auth, async (req, res) => {
+  try {
+    const l = await liveById(req.params.id);
+    if (!l) return res.status(404).json({ error: 'live introuvable' });
+    if (l.ended_at) return res.status(403).json({ error: 'live terminé' });
+    let n = parseInt((req.body || {}).count, 10);
+    if (!Number.isFinite(n) || n < 1) n = 1;
+    if (n > 10000) n = 10000; // garde-fou anti-débordement par requête
+    await runSql('UPDATE lives SET likes=likes+? WHERE id=?', n, l.id);
+    const lj = await get1('SELECT likes FROM lives WHERE id=?', l.id);
+    res.json({ ok: true, likes: Number(lj.likes) || 0, added: n });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.get('/api/live/:id/stats', async (req, res) => {
+  try {
+    const l = await liveById(req.params.id);
+    if (!l) return res.status(404).json({ error: 'live introuvable' });
+    res.json({
+      likes: Number(l.likes) || 0,
+      shares: Number(l.shares) || 0,
+      viewers: await liveViewersCount(l.id),
+      gifts_total: Number(l.gifts_total) || 0,
+      chat_total: Number(l.chat_total) || 0,
+      live_type: l.live_type || 'guests'
+    });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.post('/api/live/:id/share', auth, async (req, res) => {
+  try {
+    const l = await liveById(req.params.id);
+    if (!l) return res.status(404).json({ error: 'live introuvable' });
+    if (l.ended_at) return res.status(403).json({ error: 'live terminé' });
+    await runSql('UPDATE lives SET shares=shares+1 WHERE id=?', l.id);
+    const lj = await get1('SELECT shares FROM lives WHERE id=?', l.id);
+    res.json({ ok: true, shares: Number(lj.shares) || 0 });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 app.post('/api/live/:id/chat', auth, async (req, res) => {
   try {
@@ -5188,16 +5255,27 @@ app.post('/api/live/:id/gift', auth, async (req, res) => {
     if (!g) return res.status(400).json({ error: 'cadeau inconnu' });
     const me = await get1('SELECT * FROM users WHERE id=?', req.userId);
     if (!me) return res.status(400).json({ error: 'compte introuvable' });
-    if (Number(l.user_id) === Number(req.userId)) return res.status(400).json({ error: 'impossible' });
+    // destinataire : créateur par défaut, ou un invité accepté (to_user_id)
+    let toUserId = Number(l.user_id);
+    if (req.body && req.body.to_user_id) {
+      toUserId = Number(req.body.to_user_id);
+      if (!toUserId || toUserId === Number(req.userId)) return res.status(400).json({ error: 'impossible' });
+      if (toUserId !== Number(l.user_id)) {
+        const gg = await get1("SELECT user_id FROM live_guests WHERE live_id=? AND user_id=? AND status='accepted'", l.id, toUserId);
+        if (!gg) return res.status(400).json({ error: 'invité introuvable' });
+      }
+    } else if (Number(l.user_id) === Number(req.userId)) {
+      return res.status(400).json({ error: 'impossible' });
+    }
     // débit atomique anti double-envoi (race condition)
     const debited = await runSqlChanges('UPDATE users SET coins=coins-? WHERE id=? AND coins>=?', g.cost, req.userId, g.cost);
     if (!debited) return res.status(400).json({ error: 'pas assez de pièces' });
-    const split = await applyGiftSplit(req.userId, l.user_id, g.cost, g.id, l.id);
+    const split = await applyGiftSplit(req.userId, toUserId, g.cost, g.id, l.id);
     await runSql('INSERT INTO gifts(from_id,to_id,video_id,live_id,gift,cost,created_at) VALUES(?,?,?,?,?,?,?)',
-      req.userId, l.user_id, null, l.id, g.id, g.cost, now());
+      req.userId, toUserId, null, l.id, g.id, g.cost, now());
     await runSql('UPDATE lives SET gifts_total=COALESCE(gifts_total,0)+? WHERE id=?', split.creatorShare, l.id).catch(() => {});
-    await notify(l.user_id, 'gift', req.userId, null, g.id);
-    res.json({ ok: true, coins: me.coins - g.cost });
+    await notify(toUserId, 'gift', req.userId, null, g.id);
+    res.json({ ok: true, coins: me.coins - g.cost, to_user_id: toUserId });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 // ==================== LIVE façon TikTok : invités, feed, join ====================
