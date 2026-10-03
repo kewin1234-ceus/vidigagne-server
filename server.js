@@ -163,6 +163,8 @@ CREATE TABLE IF NOT EXISTS id_verifications(
   doc_back TEXT,
   status TEXT NOT NULL DEFAULT 'pending',
   reviewed_at BIGINT,
+  reviewed_by TEXT DEFAULT '',
+  review_reason TEXT DEFAULT '',
   created_at BIGINT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS video_views(
@@ -591,6 +593,10 @@ CREATE TABLE IF NOT EXISTS family_settings(
     await pool.query(`ALTER TABLE videos ADD COLUMN IF NOT EXISTS phash TEXT DEFAULT ''`);
     await pool.query(`ALTER TABLE videos ADD COLUMN IF NOT EXISTS target_countries TEXT DEFAULT ''`);
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS country TEXT DEFAULT ''`);
+    await pool.query(`ALTER TABLE verification_requests ADD COLUMN IF NOT EXISTS reviewed_by TEXT DEFAULT ''`);
+    await pool.query(`ALTER TABLE verification_requests ADD COLUMN IF NOT EXISTS review_reason TEXT DEFAULT ''`);
+    await pool.query(`ALTER TABLE id_verifications ADD COLUMN IF NOT EXISTS reviewed_by TEXT DEFAULT ''`);
+    await pool.query(`ALTER TABLE id_verifications ADD COLUMN IF NOT EXISTS review_reason TEXT DEFAULT ''`);
     await pool.query(`CREATE TABLE IF NOT EXISTS search_logs(
       id SERIAL PRIMARY KEY, query TEXT NOT NULL, user_id INTEGER,
       created_at BIGINT NOT NULL)`);
@@ -638,6 +644,7 @@ app.post('/api/verification/request', auth, uploadImg.single('id_doc'), async (r
         activity=excluded.activity, id_doc_url=excluded.id_doc_url`,
       req.userId, reason, now(), fullName, category, website, proofLinks, activity, docUrl);
     res.json({ ok: true });
+    runVerificationBot().catch(()=>{}); // le bot examine immédiatement
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 app.get('/api/verification/status', auth, async (req, res) => {
@@ -674,6 +681,110 @@ app.post('/api/admin/verification/:id', async (req, res) => {
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
+// ---------- v1.65 : 🤖 BOT DE VÉRIFICATION ----------
+// Le bot (pas l'admin) examine automatiquement :
+// 1. les demandes de badge vérifié
+// 2. les vérifications d'identité KYC (monétisation)
+// 3. l'expiration des pièces : les pièces gagnées il y a 3 mois ou plus
+//    sont expirées → tout retrait avec des pièces expirées est rejeté à l'immédiat.
+const COIN_EXPIRY_MS = 90 * 24 * 3600 * 1000; // 3 mois
+
+// pièces valides (non expirées) d'un utilisateur — comptabilité FIFO sur le ledger
+async function validCoins(userId) {
+  const rows = await allRows(
+    'SELECT amount, created_at FROM ledger WHERE user_id=? ORDER BY created_at ASC, id ASC', userId);
+  const tnow = now();
+  const queue = []; // crédits [montant, timestamp]
+  for (const r of rows) {
+    const amt = Number(r.amount) || 0;
+    if (amt > 0) {
+      queue.push([amt, Number(r.created_at) || 0]);
+    } else if (amt < 0) {
+      let need = -amt;
+      while (need > 0 && queue.length) {
+        const take = Math.min(queue[0][0], need);
+        queue[0][0] -= take; need -= take;
+        if (queue[0][0] <= 0) queue.shift();
+      }
+    }
+  }
+  // expire les crédits de 3 mois ou plus
+  let valid = 0, expired = 0;
+  for (const [amt, ts] of queue) {
+    if (tnow - ts >= COIN_EXPIRY_MS) expired += amt;
+    else valid += amt;
+  }
+  return { valid: Math.floor(valid), expired: Math.floor(expired) };
+}
+
+// --- bot : badge vérifié ---
+async function botReviewBadge(r) {
+  const fails = [];
+  if (!r.full_name || r.full_name.trim().length < 3) fails.push('nom complet manquant');
+  if (!VERIF_CATEGORIES.includes(String(r.category || '').toLowerCase())) fails.push('catégorie invalide');
+  if (!r.id_doc_url || !/^https?:\/\//.test(r.id_doc_url)) fails.push('pièce d\u2019identité manquante ou illisible');
+  if (!r.website && !r.proof_links) fails.push('aucun site web ni lien de preuve');
+  if (!r.activity || r.activity.trim().length < 20) fails.push('description d\u2019activité trop courte');
+  // critères d'authenticité façon TikTok
+  const u = await get1('SELECT avatar, created_at FROM users WHERE id=?', r.user_id);
+  if (!u || !u.avatar) fails.push('profil incomplet (photo de profil requise)');
+  const nv = await get1('SELECT COUNT(*) AS c FROM videos WHERE user_id=? AND hidden=0', r.user_id);
+  if (!nv || Number(nv.c) < 1) fails.push('aucune vidéo publiée');
+  if (fails.length) return { approved: false, reason: 'Rejeté par le bot : ' + fails.join(' ; ') };
+  return { approved: true, reason: 'Vérifié par le bot : identité + preuves + activité confirmées' };
+}
+
+// --- bot : KYC monétisation ---
+async function botReviewKyc(v) {
+  const fails = [];
+  if (!/^[A-Z]{2}$/.test(String(v.country || ''))) fails.push('pays invalide');
+  if (!v.doc_front || !/^https?:\/\//.test(v.doc_front)) fails.push('photo du document manquante');
+  try {
+    if (!kycAllowedDocs(String(v.country).toUpperCase()).includes(v.doc_type)) fails.push('document non accepté pour ce pays');
+  } catch (_) { fails.push('type de document invalide'); }
+  if (v.expiry) {
+    const expDate = new Date(v.expiry + '-01T00:00:00Z');
+    expDate.setMonth(expDate.getMonth() + 1);
+    if (expDate <= new Date()) fails.push('document expiré');
+  }
+  if (fails.length) return { approved: false, reason: 'Rejeté par le bot : ' + fails.join(' ; ') };
+  return { approved: true, reason: 'Vérifié par le bot : document valide et en cours de validité' };
+}
+
+// --- le bot traite toutes les demandes en attente ---
+async function runVerificationBot() {
+  try {
+    // 1. badges
+    const badges = await allRows(`SELECT * FROM verification_requests WHERE status='pending' LIMIT 50`);
+    for (const r of badges) {
+      try {
+        const verdict = await botReviewBadge(r);
+        await runSql(`UPDATE verification_requests SET status=?, reviewed_at=?, reviewed_by='bot', review_reason=? WHERE id=?`,
+          verdict.approved ? 'approved' : 'rejected', now(), verdict.reason, r.id);
+        if (verdict.approved) {
+          await runSql('UPDATE users SET verified=1 WHERE id=?', r.user_id);
+          await notify(r.user_id, 'system', null, null, '🤖✔️ Ton compte est maintenant vérifié !');
+        } else {
+          await notify(r.user_id, 'system', null, null, '🤖 ' + verdict.reason);
+        }
+      } catch (_) {}
+    }
+    // 2. KYC
+    const kycs = await allRows(`SELECT * FROM id_verifications WHERE status='pending' LIMIT 50`);
+    for (const v of kycs) {
+      try {
+        const verdict = await botReviewKyc(v);
+        await runSql(`UPDATE id_verifications SET status=?, reviewed_at=?, reviewed_by='bot', review_reason=? WHERE id=?`,
+          verdict.approved ? 'approved' : 'rejected', now(), verdict.reason, v.id);
+        const u = await get1('SELECT username FROM users WHERE id=?', v.user_id);
+        await notify(v.user_id, 'system', null, null,
+          verdict.approved ? '🤖✔️ Ton identité est vérifiée — tu peux retirer tes gains !'
+                           : '🤖 ' + verdict.reason);
+      } catch (_) {}
+    }
+  } catch (e) { console.error('bot vérification:', e.message); }
+}
+
 // v1.61 : battles PK entre deux lives
 const PK_DURATION_MS = 5 * 60 * 1000;
 async function activePkForLive(liveId) {
@@ -1744,7 +1855,7 @@ app.post('/api/videos', auth, upload.single('video'), async (req, res) => {
     let ttsRate = Number(b.tts_rate) || 1;
     if (ttsRate < 0.5) ttsRate = 0.5;
     if (ttsRate > 2) ttsRate = 2;
-    const _tc = Array.isArray(b.target_countries) ? b.target_countries.filter(x => /^[A-Z]{2}$/.test(String(x))).slice(0, 10) : [];
+    const _tc = Array.isArray(b.target_countries) ? b.target_countries.filter(x => /^[A-Z]{2}$/.test(String(x))).slice(0, 1) : [];
     const _tcJson = JSON.stringify(_tc);
     const id = await insertId(
       'INSERT INTO videos(user_id,file,description,tags,sound,duration,scheduled_at,visibility,captions,is_replay,live_id,tts_text,tts_voice,tts_rate,target_countries,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
@@ -2105,6 +2216,7 @@ app.post('/api/kyc/submit', auth, uploadImg.fields([{ name: 'doc_front', maxCoun
         req.userId, country, docType, front, back, expiry, now());
     }
     res.json({ ok: true, status: 'pending' });
+    runVerificationBot().catch(()=>{}); // le bot examine immédiatement
   } catch (e) { res.status(500).json({ error: 'échec de l’envoi' }); }
 });
 app.get('/api/kyc/status', auth, async (req, res) => {
@@ -2333,6 +2445,12 @@ app.post('/api/withdraw', auth, async (req, res) => {
     }
     const me = await get1('SELECT * FROM users WHERE id=?', req.userId);
     if (!me) return res.status(400).json({ error: 'compte introuvable' });
+    // 🤖 le bot rejette à l'immédiat les pièces expirées (3 mois ou plus)
+    const vc = await validCoins(req.userId);
+    if (vc.expired > 0 && n > vc.valid)
+      return res.status(400).json({ error: '🤖 ' + vc.expired + ' de tes pièces ont expiré (3 mois ou plus). Seules ' + vc.valid + ' pièces sont retirables.' });
+    if (n > vc.valid)
+      return res.status(400).json({ error: 'pas assez de pièces valides (' + vc.valid + ' disponibles)' });
     const usd = Math.floor(n / 500 * 100) / 100;
     // débit atomique anti double-retrait (race condition)
     const debited = await runSqlChanges('UPDATE users SET coins=coins-? WHERE id=? AND coins>=?', n, req.userId, n);
@@ -2374,6 +2492,11 @@ app.post('/api/referral', auth, async (req, res) => {
     const upd = await get1('SELECT coins FROM users WHERE id=?', req.userId);
     res.json({ ok: true, granted: 50, coins: upd.coins });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// v1.65 : solde de pièces valides vs expirées (3 mois)
+app.get('/api/coins/valid', auth, async (req, res) => {
+  const vc = await validCoins(req.userId);
+  res.json({ valid: vc.valid, expired: vc.expired, expiry_days: 90 });
 });
 app.get('/api/receipts', auth, async (req, res) => {
   const rows = await allRows('SELECT * FROM receipts WHERE user_id=? ORDER BY created_at DESC LIMIT 100', req.userId);
@@ -5298,6 +5421,8 @@ initDb().then(() => {
   setInterval(publishDue, 60000); // vérifie les publications dues toutes les 60 s
   expireSubs();
   setInterval(expireSubs, 86400000); // désactive les abonnements expirés toutes les 24 h
+  setInterval(runVerificationBot, 3600000); // 🤖 bot de vérification toutes les heures
+  runVerificationBot().catch(()=>{}); // + au démarrage
   const server = app.listen(PORT, () => console.log(
     `VidiGagne Server v2 sur http://localhost:${PORT} (db=${USE_PG ? 'postgres' : 'sqlite'}, storage=${USE_CLOUDINARY ? 'cloudinary' : 'local'})`));
   setupLiveWs(server); setupPushWs(server);
