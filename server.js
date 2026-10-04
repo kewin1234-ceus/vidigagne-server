@@ -7239,6 +7239,24 @@ app.get('/api/me/content-prefs', auth, async (req, res) => {
     res.json({ ok: true, prefs: rows });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
+// Endpoints manquants détectés par le bot de test (2026-10-03)
+app.get('/api/me/followers', auth, async (req, res) => {
+  try {
+    const rows = await allRows(
+      'SELECT u.id, u.username, u.avatar FROM follows f JOIN users u ON u.id=f.follower_id WHERE f.followed_id=? ORDER BY f.created_at DESC LIMIT 100',
+      req.userId
+    );
+    res.json({ ok: true, followers: rows });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.get('/api/me/stats', auth, async (req, res) => {
+  try {
+    const fr = await get1('SELECT COUNT(*) AS c FROM follows WHERE followed_id=?', req.userId);
+    const vr = await get1('SELECT COALESCE(SUM(views),0) AS s FROM videos WHERE user_id=?', req.userId);
+    res.json({ ok: true, followers: Number(fr.c) || 0, totalViews: Number(vr.s) || 0, views: Number(vr.s) || 0 });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+
 app.post('/api/me/content-prefs', auth, async (req, res) => {
   try {
     const topic = String((req.body || {}).topic || '').trim().toLowerCase().slice(0, 50);
