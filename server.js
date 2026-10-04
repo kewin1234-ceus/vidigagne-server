@@ -7249,11 +7249,92 @@ app.get('/api/me/followers', auth, async (req, res) => {
     res.json({ ok: true, followers: rows });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
+// Abonnés d'un autre utilisateur (public — les suivis restent privés)
+app.get('/api/users/:username/followers', async (req, res) => {
+  try {
+    const u = await get1('SELECT * FROM users WHERE username=?', String(req.params.username).toLowerCase());
+    if (!u) return res.status(404).json({ error: 'utilisateur introuvable' });
+    const meId = await optUserId(req);
+    if (meId && Number(meId) !== Number(u.id) && await isBlocked(meId, u.id))
+      return res.status(403).json({ error: 'utilisateur bloqué' });
+    const rows = await allRows(
+      'SELECT u.id, u.username, u.avatar FROM follows f JOIN users u ON u.id=f.follower_id WHERE f.followed_id=? ORDER BY f.created_at DESC LIMIT 100',
+      u.id
+    );
+    res.json({ ok: true, followers: rows });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
 app.get('/api/me/stats', auth, async (req, res) => {
   try {
     const fr = await get1('SELECT COUNT(*) AS c FROM follows WHERE followed_id=?', req.userId);
     const vr = await get1('SELECT COALESCE(SUM(views),0) AS s FROM videos WHERE user_id=?', req.userId);
     res.json({ ok: true, followers: Number(fr.c) || 0, totalViews: Number(vr.s) || 0, views: Number(vr.s) || 0 });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+
+// ---------- VIGI : cerveau côté serveur ----------
+// Base de connaissances du robot (français)
+const BOT_KB = [
+ {k:['piece','coin','gagner','argent','gagne'], r:"Pour gagner des pièces 🪙 : regarde des vidéos (+10 par vidéo), regarde une pub récompensée (+20), ou parraine un ami (+50 pour vous deux). Limite : 100 pièces par jour. Il faut un compte pour gagner.", action:null},
+ {k:['retirer','retrait','withdraw','paypal','moncash','natcash'], r:"Tu peux retirer dès 1000 pièces (= 2 $). Va dans Portefeuille → \"Retirer mes $2\" et choisis PayPal, MonCash ou NatCash. Le retrait est traité sous 24-48h.", action:'goWallet'},
+ {k:['parrain','code','ami','inviter'], r:"Pour parrainer : va dans Portefeuille → Parrainage, partage ton code. Quand ton ami entre ton code, vous recevez +50 pièces chacun ! 🎁", action:'goWallet'},
+ {k:['compte','inscription','creer un compte','inscrire','connexion','connecter'], r:"Pour créer un compte : va dans \"Moi\" → \"Créer un compte\". Tu peux t'inscrire par téléphone (SMS), e-mail (code), ou Google. Il faut avoir 13 ans minimum.", action:null},
+ {k:['mot de passe','mdp','password','oublie'], r:"Si tu as oublié ton mot de passe, utilise la connexion par e-mail : tu recevras un code de vérification pour te reconnecter, puis tu pourras définir un nouveau mot de passe dans les paramètres.", action:'goSettings'},
+ {k:['publier','poster','upload','filmer'], r:"Pour publier : tape le bouton + en bas, choisis \"Filmer\" ou \"Choisir une vidéo\". Les vidéos font 10 minutes max, de préférence en vertical 9:16.", action:null},
+ {k:['live','direct','streaming','passer en live'], r:"Pour passer en live : tape le bouton 🔴 LIVE en haut, puis \"Démarrer un live\". Tu peux faire un live solo ou avec jusqu'à 8 invités. Il faut un compte et une bonne connexion.", action:null},
+ {k:['lent','lag','ram','charge pas','chargement','connexion lente','rame'], r:"Je peux essayer de régler la lenteur moi-même ! 🛠️", action:'clearCache', offer:true},
+ {k:['serveur','connexion','injoignable','erreur reseau'], r:"Je vais retester la connexion au serveur. 📶", action:'retryConnection', offer:true},
+ {k:['notification','notif','alerte'], r:"Pour les notifications : va dans Paramètres → Notifications. Tu peux activer/désactiver les alertes.", action:'goSettings'},
+ {k:['supprimer','delete mon compte'], r:"Pour supprimer ton compte : Paramètres → Compte → \"Supprimer mes données\". Attention, c'est irréversible !", action:'goSettings'},
+ {k:['photo','profil','avatar'], r:"Pour changer ta photo de profil : va dans \"Moi\" → tape sur ta photo → \"Choisir depuis la galerie\".", action:null},
+ {k:['bio','biographie'], r:"Pour modifier ta bio : va dans \"Moi\" → \"Modifier ma bio\". Elle s'affiche instantanément.", action:null},
+ {k:['pseudo','nom d\'utilisateur'], r:"Pour changer ton pseudo : va dans \"Moi\" → \"Choisir mon pseudo\" (lettres, chiffres, . _ — 2 à 24 caractères).", action:null},
+ {k:['suivre','abonn','follow'], r:"Pour suivre un créateur : va sur son profil et tape \"Suivre\". Pour voir ses abonnés, tape sur son nombre d'Abonnés.", action:null},
+ {k:['message','dm','discuter'], r:"Pour envoyer un message : va sur le profil de la personne et tape \"💬 Message\".", action:null},
+ {k:['monetisation','gains createur','revenus'], r:"Les créateurs éligibles (1000 abonnés + 50 000 vues) reçoivent 50% des revenus pubs. Va dans Portefeuille → Monétisation.", action:'goWallet'},
+ {k:['50/50','moitie'], r:"Le 50/50 : tu reçois la moitié des revenus publicitaires réels. Pas de gains fictifs ! ⚖️", action:null},
+ {k:['langue','creole','francais'], r:"Pour changer de langue : Paramètres → Langue. 42 langues dont le créole haïtien ! 🇭🇹", action:'goSettings'},
+ {k:['bonjour','salut','hello','bonsoir','coucou'], r:"Salut ! 👋 Je suis Vigi, l'assistant VidiGagne. Dis-moi ton problème et je vais t'aider. Tu peux aussi m'envoyer jusqu'à 3 captures d'écran avec 📷.", action:null},
+ {k:['merci','thanks','genial','super'], r:"De rien, avec plaisir ! 😊 Autre chose ?", action:null},
+ {k:['bug','erreur','probleme','casse','plante','bloque','marche pas'], r:"Désolé pour ce problème ! 😟 Décris-moi ce qui se passe exactement, et envoie-moi une capture d'écran avec 📷 — ça m'aidera beaucoup.", action:null, askShot:true},
+];
+function botBrain(text){
+  const t = ' ' + text.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'') + ' ';
+  let best = null, bestScore = 0;
+  for (const e of BOT_KB){
+    let score = 0;
+    for (const kw of e.k){
+      const k = kw.normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase();
+      if (t.includes(k)) score += k.length;
+    }
+    if (score > bestScore){ bestScore = score; best = e; }
+  }
+  if (bestScore > 2) return best;
+  return {r:"Hmm, je ne suis pas sûr de comprendre. 🤔 Peux-tu me donner plus de détails ? Et si tu as une capture d'écran, envoie-la moi avec 📷.", action:null, askShot:true};
+}
+// Chat avec Vigi — le cerveau est sur le serveur, internet requis
+app.post('/api/bot/chat', auth, async (req, res) => {
+  try {
+    const text = String((req.body || {}).text || '').slice(0, 2000);
+    if (!text) return res.status(400).json({ error: 'texte requis' });
+    const result = botBrain(text);
+    // Log pour suivi
+    await runSql('CREATE TABLE IF NOT EXISTS bot_messages(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, text TEXT, reply TEXT, created_at INTEGER)').catch(()=>{});
+    await runSql('INSERT INTO bot_messages(user_id,text,reply,created_at) VALUES(?,?,?,?)',
+      req.userId, text, result.r, now()).catch(()=>{});
+    res.json({ ok: true, reply: result.r, action: result.action || null, offer: !!result.offer, askShot: !!result.askShot });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// Reçoit les captures d'écran du robot (max 3, stockées pour l'équipe)
+app.post('/api/bot/screenshot', auth, async (req, res) => {
+  try {
+    const images = ((req.body || {}).images || []).slice(0, 3).map(s => String(s).slice(0, 500000));
+    const text = String((req.body || {}).text || '').slice(0, 2000);
+    if (!images.length) return res.status(400).json({ error: 'image requise' });
+    await runSql('CREATE TABLE IF NOT EXISTS bot_screenshots(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, images TEXT, text TEXT, created_at INTEGER)').catch(()=>{});
+    await runSql('INSERT INTO bot_screenshots(user_id,images,text,created_at) VALUES(?,?,?,?)',
+      req.userId, JSON.stringify(images), text, now());
+    res.json({ ok: true, received: images.length });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 
