@@ -852,24 +852,6 @@ app.post('/api/admin/verification/:id', async (req, res) => {
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
-// v1.66 : 🤖 le bot supprime à la publication tout hashtag mentionnant une plateforme concurrente
-const BANNED_PLATFORM_TAGS = new Set(("tiktok,tik_tok,tiktoker,tiktokeuse,tiktokfrance,tiktokviral,tiktokdance," +
-  "tiktokchallenge,doutok,douyin,facebook,fb,facebooks,youtube,youtu,youtuber,youtubeuse,instagram,insta,ig," +
-  "snapchat,snap,twitter,tweet,tweets,x,whatsapp,telegram,twitch,twitchtv,reddit,pinterest,linkedin,threads," +
-  "discord,kwai,triller,likee,dubsmash,vimeo,dailymotion,periscope,vine,musically,musicaly,reels,shorts,story").split(','));
-// un hashtag est interdit s'il EST ou CONTIENT un nom de plateforme (ex: #tiktokfrance)
-function stripBannedTags(text) {
-  let removed = [];
-  const clean = String(text || '').replace(/#([\p{L}\p{N}_]+)/gu, (m, tag) => {
-    const t = tag.toLowerCase();
-    for (const b of BANNED_PLATFORM_TAGS) {
-      if (t === b || t.includes(b) || b.includes(t) && t.length > 2) { removed.push('#' + tag); return ''; }
-    }
-    return m;
-  });
-  return { clean: clean.replace(/\s{2,}/g, ' ').trim(), removed: [...new Set(removed)] };
-}
-
 // v1.67 : sons originaux rémunérés — +2 pièces au créateur du son à chaque utilisation
 app.post('/api/sounds/:id/use', auth, async (req, res) => {
   try {
@@ -1118,6 +1100,17 @@ app.get('/api/pk/pending', auth, async (req, res) => {
     const out = [];
     for (const b of rows) out.push(await pkPublic(b));
     res.json({ pending: out });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// v2.31 : le challenger annule son défi en attente
+app.post('/api/pk/:battleId/cancel', auth, async (req, res) => {
+  try {
+    const b = await get1('SELECT * FROM pk_battles WHERE id=?', req.params.battleId);
+    if (!b || b.status !== 'pending') return res.status(404).json({ error: 'défi introuvable' });
+    if (Number(b.user_a_id) !== Number(req.userId)) return res.status(403).json({ error: 'non autorisé' });
+    await runSql(`UPDATE pk_battles SET status='cancelled' WHERE id=?`, b.id);
+    await notify(b.user_b_id, 'system', req.userId, null, '⚔️ Défi PK annulé.');
+    res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 app.post('/api/pk/:battleId/end', auth, async (req, res) => {
@@ -1486,6 +1479,9 @@ app.get('/api/search/insights', async (req, res) => {
   await mig('videos', 'location', `TEXT NOT NULL DEFAULT ''`);
   await mig('videos', 'effect', `TEXT NOT NULL DEFAULT ''`);
   await mig('videos', 'is_private', `INTEGER NOT NULL DEFAULT 0`);
+  // FIX 2026-10-04 (bot chain-profile-full) : la colonne users.is_private n'existait pas —
+  // PATCH /api/auth/me {is_private} plantait (no such column) et le masquage privé ne marchait pas
+  await mig('users', 'is_private', `INTEGER NOT NULL DEFAULT 0`);
   await mig('videos', 'visibility', `TEXT NOT NULL DEFAULT 'public'`);
   await mig('users', 'last_seen', `BIGINT NOT NULL DEFAULT 0`);
   await mig('users', 'activity_status', `TEXT NOT NULL DEFAULT 'public'`);
@@ -2614,6 +2610,25 @@ function cleanCaptions(raw) {
   return '[]';
 }
 
+
+// v1.66 : 🤖 le bot supprime à la publication tout hashtag mentionnant une plateforme concurrente
+const BANNED_PLATFORM_TAGS = new Set(("tiktok,tik_tok,tiktoker,tiktokeuse,tiktokfrance,tiktokviral,tiktokdance," +
+  "tiktokchallenge,doutok,douyin,facebook,fb,facebooks,youtube,youtu,youtuber,youtubeuse,instagram,insta,ig," +
+  "snapchat,snap,twitter,tweet,tweets,x,whatsapp,telegram,twitch,twitchtv,reddit,pinterest,linkedin,threads," +
+  "discord,kwai,triller,likee,dubsmash,vimeo,dailymotion,periscope,vine,musically,musicaly,reels,shorts,story").split(','));
+// un hashtag est interdit s'il EST ou CONTIENT un nom de plateforme (ex: #tiktokfrance)
+function stripBannedTags(text) {
+  let removed = [];
+  const clean = String(text || '').replace(/#([\p{L}\p{N}_]+)/gu, (m, tag) => {
+    const t = tag.toLowerCase();
+    for (const b of BANNED_PLATFORM_TAGS) {
+      if (t === b || t.includes(b) || b.includes(t) && t.length > 2) { removed.push('#' + tag); return ''; }
+    }
+    return m;
+  });
+  return { clean: clean.replace(/\s{2,}/g, ' ').trim(), removed: [...new Set(removed)] };
+}
+
 app.post('/api/videos', auth, upload.single('video'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'aucune vidéo reçue' });
@@ -2686,7 +2701,7 @@ app.post('/api/videos', auth, upload.single('video'), async (req, res) => {
       }
     } catch (_) {}
     res.json({ video: await videoJSON(v, req.userId), pending_review: !!badW });
-  } catch (e) { res.status(500).json({ error: 'échec du téléversement' }); }
+  } catch (e) { res.status(500).json({ error: "échec du téléversement" }); }
 });
 
 // ---------- v12 : publication photo (carrousel, max 10 images) ----------
