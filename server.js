@@ -7323,6 +7323,13 @@ const BOT_KB = [
 ];
 function botBrain(text){
   const t = ' ' + text.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'') + ' ';
+  // v2.25 : réponses oui/non à une action proposée
+  if (/^\s*(oui|yes|ok|d'accord|vas-y|fais-le)\s*[.!]?\s*$/.test(t.trim())) {
+    return {r:"Parfait ! 👍 Je m'en occupe. Dis-moi si ça a réglé ton problème.", action:'confirmYes', offer:false};
+  }
+  if (/^\s*(non|no|pas|annule|stop)\s*[.!]?\s*$/.test(t.trim())) {
+    return {r:"Pas de souci ! 👍 Dis-moi comment je peux t'aider autrement.", action:'confirmNo', offer:false};
+  }
   let best = null, bestScore = 0;
   for (const e of BOT_KB){
     let score = 0;
@@ -7341,8 +7348,8 @@ app.post('/api/bot/chat', auth, async (req, res) => {
     const text = String((req.body || {}).text || '').slice(0, 2000);
     if (!text) return res.status(400).json({ error: 'texte requis' });
     const result = botBrain(text);
-    // Log pour suivi
-    await runSql('CREATE TABLE IF NOT EXISTS bot_messages(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, text TEXT, reply TEXT, created_at INTEGER)').catch(()=>{});
+    // Log pour suivi (v2.25 : syntaxe compatible Postgres)
+    await runSql('CREATE TABLE IF NOT EXISTS bot_messages(id ' + (USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT') + ', user_id INTEGER, text TEXT, reply TEXT, created_at BIGINT)').catch(()=>{});
     await runSql('INSERT INTO bot_messages(user_id,text,reply,created_at) VALUES(?,?,?,?)',
       req.userId, text, result.r, now()).catch(()=>{});
     res.json({ ok: true, reply: result.r, action: result.action || null, offer: !!result.offer, askShot: !!result.askShot });
@@ -7354,7 +7361,7 @@ app.post('/api/bot/screenshot', auth, async (req, res) => {
     const images = ((req.body || {}).images || []).slice(0, 3).map(s => String(s).slice(0, 500000));
     const text = String((req.body || {}).text || '').slice(0, 2000);
     if (!images.length) return res.status(400).json({ error: 'image requise' });
-    await runSql('CREATE TABLE IF NOT EXISTS bot_screenshots(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, images TEXT, text TEXT, created_at INTEGER)').catch(()=>{});
+    await runSql('CREATE TABLE IF NOT EXISTS bot_screenshots(id ' + (USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT') + ', user_id INTEGER, images TEXT, text TEXT, created_at BIGINT)').catch(()=>{});
     await runSql('INSERT INTO bot_screenshots(user_id,images,text,created_at) VALUES(?,?,?,?)',
       req.userId, JSON.stringify(images), text, now());
     res.json({ ok: true, received: images.length });
