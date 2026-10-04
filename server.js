@@ -2594,10 +2594,11 @@ app.post('/api/videos', auth, upload.single('video'), async (req, res) => {
     let scheduledAt = null;
     const schRaw = Number(b.scheduled_at);
     if (b.scheduled_at && schRaw > now()) scheduledAt = schRaw;
-    // visibilité : public | subscribers (abonnés payants) | private
+    // visibilité : public | subscribers (abonnés payants) | private | friends
     let visibility = String(b.visibility || 'public');
     if (visibility === 'subscribers_only') visibility = 'subscribers'; // valeur envoyée par l'app
-    if (!['public', 'subscribers', 'private'].includes(visibility)) visibility = 'public';
+    // FIX 2026-10-04 (rupture #1): 'friends' accepté, valeurs inconnues → 'private' (sécurisé) au lieu de 'public'
+    if (!['public', 'subscribers', 'private', 'friends'].includes(visibility)) visibility = 'private';
     const captions = b.captions ? cleanCaptions(b.captions) : '[]';
     // m6 : durée max 10 minutes vérifiée côté serveur (pas seulement dans l'appli)
     const duration = Number(b.duration) || 0;
