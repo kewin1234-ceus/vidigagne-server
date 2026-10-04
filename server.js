@@ -279,6 +279,13 @@ CREATE TABLE IF NOT EXISTS notifications(
   is_read INTEGER NOT NULL DEFAULT 0,
   created_at BIGINT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS activities(
+  id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+  user_id INTEGER NOT NULL,
+  icon TEXT NOT NULL DEFAULT '',
+  text TEXT NOT NULL DEFAULT '',
+  created_at BIGINT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS notif_user_idx ON notifications(user_id, created_at);
 CREATE TABLE IF NOT EXISTS reports(
   id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
@@ -4304,6 +4311,22 @@ app.post('/api/notifications/read', auth, async (req, res) => {
     const id = Number((req.body || {}).id) || 0;
     if (id) await runSql('UPDATE notifications SET is_read=1 WHERE id=? AND user_id=?', id, req.userId);
     else await runSql('UPDATE notifications SET is_read=1 WHERE user_id=?', req.userId);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// v2.24 : historique d'activité sur le serveur (pas seulement local)
+app.get('/api/activities', auth, async (req, res) => {
+  try {
+    const rows = await allRows('SELECT * FROM activities WHERE user_id=? ORDER BY created_at DESC LIMIT 50', req.userId);
+    res.json({ activities: rows.map(function(r){ return {i: r.icon, t: r.text, ts: Number(r.created_at)}; }) });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.post('/api/activities', auth, async (req, res) => {
+  try {
+    const icon = String((req.body || {}).icon || '').slice(0, 10);
+    const text = String((req.body || {}).text || '').slice(0, 500);
+    if (!text) return res.status(400).json({ error: 'texte requis' });
+    await runSql('INSERT INTO activities(user_id, icon, text, created_at) VALUES(?,?,?,?)', req.userId, icon, text, Date.now());
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
