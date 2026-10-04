@@ -2106,6 +2106,17 @@ function visFilter(alias, meId) {
 // vrai si meId peut voir la vidéo v (objet ligne videos)
 async function canSeeVideo(v, meId) {
   const vis = v.visibility || 'public';
+  // FIX 2026-10-04 (rupture #3b): compte privé → seuls le propriétaire et ses abonnés voient les vidéos
+  if (Number(v.user_id) !== Number(meId)) {
+    try {
+      const owner = await get1('SELECT is_private FROM users WHERE id=?', v.user_id);
+      if (owner && Number(owner.is_private)) {
+        if (!meId) return false;
+        const f = await get1('SELECT 1 FROM follows WHERE follower_id=? AND followed_id=?', meId, v.user_id);
+        if (!f) return false;
+      }
+    } catch (e) {}
+  }
   if (vis === 'public') return true;
   if (!meId) return false;
   if (Number(v.user_id) === Number(meId)) return true;
@@ -2132,6 +2143,7 @@ async function touchHistory(userId, videoId) {
 function pubUser(u) {
   // v1.54 : JAMAIS de données personnelles ici (prénom/nom/naissance = privées, voir privUser)
   return { id: u.id, username: u.username, name: u.name, avatar: u.avatar, bio: u.bio, verified: !!u.verified,
+    is_private: !!u.is_private,
     sub_enabled: Number(u.sub_enabled) || 0, sub_price: Number(u.sub_price) || 0, ref_code: u.ref_code || '' };
 }
 // Données personnelles : uniquement pour le propriétaire du compte (/api/auth/me)
@@ -2453,11 +2465,13 @@ async function consumeVerifiedToken(vtoken) {
 }
 
 app.patch('/api/auth/me', auth, async (req, res) => {
-  const { name, avatar, bio, first_name, last_name, birthdate, gender, sub_enabled, sub_price, country } = req.body || {};
+  const { name, avatar, bio, first_name, last_name, birthdate, gender, sub_enabled, sub_price, country, is_private, username } = req.body || {};
   const _gender = ['male', 'female', 'other'].includes(String(gender || '')) ? String(gender) : null;
+  // FIX 2026-10-04 (rupture #2): avatar accepte les data URLs (photo galerie) jusqu'à 3 Mo, pas juste 8 caractères
+  const _avatar = avatar ? String(avatar).slice(0, 3 * 1024 * 1024) : null;
   await runSql('UPDATE users SET name=COALESCE(?,name), avatar=COALESCE(?,avatar), bio=COALESCE(?,bio), first_name=COALESCE(?,first_name), last_name=COALESCE(?,last_name), birthdate=COALESCE(?,birthdate), gender=COALESCE(?,gender), country=COALESCE(?,country) WHERE id=?',
     name ? String(name).slice(0, 40) : null,
-    avatar ? String(avatar).slice(0, 8) : null,
+    _avatar,
     bio ? String(bio).slice(0, 150) : null,
     first_name !== undefined ? String(first_name).trim().slice(0, 40) : null,
     last_name !== undefined ? String(last_name).trim().slice(0, 40) : null,
@@ -2470,8 +2484,30 @@ app.patch('/api/auth/me', auth, async (req, res) => {
     const sp = Math.max(0, Math.min(100000, Math.floor(Number(sub_price) || 0)));
     await runSql('UPDATE users SET sub_enabled=?, sub_price=? WHERE id=?', se, sp, req.userId);
   }
+  // FIX 2026-10-04 (rupture #3): compte privé/public
+  if (is_private !== undefined) {
+    await runSql('UPDATE users SET is_private=? WHERE id=?', is_private ? 1 : 0, req.userId);
+  }
+  // FIX 2026-10-04 (rupture #4): changement de pseudo (unique, format validé)
+  let usernameChanged = null;
+  if (username !== undefined && username !== null) {
+    const un = String(username).toLowerCase().trim();
+    if (/^[a-z0-9._]{2,24}$/.test(un)) {
+      const existing = await get1('SELECT id FROM users WHERE username=?', un);
+      if (!existing || Number(existing.id) === Number(req.userId)) {
+        await runSql('UPDATE users SET username=? WHERE id=?', un, req.userId);
+        usernameChanged = un;
+      } else {
+        return res.status(409).json({ error: 'pseudo déjà pris' });
+      }
+    } else {
+      return res.status(400).json({ error: 'pseudo invalide' });
+    }
+  }
   const u = await get1('SELECT * FROM users WHERE id=?', req.userId);
-  res.json({ user: privUser(u) });
+  const out = { user: privUser(u) };
+  if (usernameChanged) out.usernameChanged = usernameChanged;
+  res.json(out);
 });
 
 // ---------- vidéos ----------
@@ -4051,6 +4087,14 @@ app.post('/api/videos/:id/comments', auth, uploadMedia.fields([{name:'video',max
       `SELECT c.*, u.username, u.name, u.avatar FROM comments c
        JOIN users u ON u.id=c.user_id WHERE c.id=?`, id);
     await notify(v.user_id, 'comment', req.userId, v.id, text.slice(0, 100));
+    // FIX 2026-10-04 (rupture #5): notifier l'auteur du commentaire parent en cas de réponse
+    if (replyTo) {
+      try {
+        const parentC = await get1('SELECT user_id FROM comments WHERE id=?', replyTo);
+        if (parentC && Number(parentC.user_id) !== Number(req.userId) && Number(parentC.user_id) !== Number(v.user_id))
+          await notify(parentC.user_id, 'reply', req.userId, v.id, text.slice(0, 100));
+      } catch (_) {}
+    }
     notifyMentions(text, req.userId, v.id); // v1.84 : notifie les @mentionnés
     res.json({ comment: c });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
@@ -4860,6 +4904,16 @@ app.get('/api/users/:username', async (req, res) => {
     const meId = await optUserId(req);
     if (meId && Number(meId) !== Number(u.id) && await isBlocked(meId, u.id))
       return res.status(403).json({ error: 'utilisateur bloqué' });
+    // FIX 2026-10-04 (rupture #3b): compte privé → seuls les abonnés voient le profil complet
+    let isFollower = false;
+    if (Number(u.is_private) && meId && Number(meId) !== Number(u.id)) {
+      const f = await get1('SELECT 1 FROM follows WHERE follower_id=? AND followed_id=?', meId, u.id);
+      isFollower = !!f;
+      if (!isFollower) {
+        const followers = Number((await get1('SELECT COUNT(*) AS c FROM follows WHERE followed_id=?', u.id)).c);
+        return res.json({ user: pubUser(u), followers, following: 0, total_likes: 0, videos: [], private: true });
+      }
+    }
     const vids = await allRows(
       'SELECT * FROM videos WHERE user_id=? AND hidden=0 AND (scheduled_at IS NULL OR scheduled_at <= ?) ORDER BY created_at DESC', u.id, now());
     const followers = Number((await get1('SELECT COUNT(*) AS c FROM follows WHERE followed_id=?', u.id)).c);
