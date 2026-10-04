@@ -690,7 +690,8 @@ CREATE TABLE IF NOT EXISTS family_settings(
   dm_policy TEXT NOT NULL DEFAULT 'all'
 );`;
   if (USE_PG) { await pool.query(schema);
-    for (const col of ["ALTER TABLE lives ADD COLUMN IF NOT EXISTS live_type TEXT NOT NULL DEFAULT 'guests'",
+    for (const col of ["ALTER TABLE withdrawals ADD COLUMN IF NOT EXISTS decided_at BIGINT",
+      "ALTER TABLE lives ADD COLUMN IF NOT EXISTS live_type TEXT NOT NULL DEFAULT 'guests'",
       "ALTER TABLE lives ADD COLUMN IF NOT EXISTS likes INTEGER NOT NULL DEFAULT 0",
       "ALTER TABLE lives ADD COLUMN IF NOT EXISTS shares INTEGER NOT NULL DEFAULT 0",
       "ALTER TABLE lives ADD COLUMN IF NOT EXISTS max_guests INTEGER NOT NULL DEFAULT 8",
@@ -4311,6 +4312,51 @@ app.post('/api/admin/users/:id/verify', async (req, res) => {
     await runSql('UPDATE users SET verified=? WHERE id=?', v, u.id);
     const upd = await get1('SELECT * FROM users WHERE id=?', u.id);
     res.json({ user: pubUser(upd) });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+
+// ---------- retraits : validation admin (2026-10-04) ----------
+// protégé comme /api/fund/deposit : en-tête x-admin-token=<redacted>
+function checkAdmin(req, res) {
+  const t = req.headers['x-admin-token'];
+  if (!process.env.ADMIN_TOKEN || t !== process.env.ADMIN_TOKEN) { res.status(403).json({ error: 'non autorisé' }); return false; }
+  return true;
+}
+app.get('/api/admin/withdrawals', async (req, res) => {
+  try {
+    if (!checkAdmin(req, res)) return;
+    const rows = await allRows(
+      "SELECT w.*, u.username FROM withdrawals w LEFT JOIN users u ON u.id=w.user_id WHERE w.status='pending' ORDER BY w.created_at ASC"
+    );
+    res.json({ withdrawals: rows });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.post('/api/admin/withdrawals/:id/approve', async (req, res) => {
+  try {
+    if (!checkAdmin(req, res)) return;
+    const w = await get1('SELECT * FROM withdrawals WHERE id=?', req.params.id);
+    if (!w) return res.status(404).json({ error: 'retrait introuvable' });
+    if (w.status !== 'pending') return res.status(400).json({ error: 'déjà traité (' + w.status + ')' });
+    const t = now();
+    await runSql('UPDATE withdrawals SET status=?, decided_at=? WHERE id=?', 'paid', t, w.id);
+    await runSql('UPDATE receipts SET status=? WHERE withdrawal_id=?', 'paid', w.id);
+    res.json({ ok: true, id: w.id, status: 'paid' });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.post('/api/admin/withdrawals/:id/reject', async (req, res) => {
+  try {
+    if (!checkAdmin(req, res)) return;
+    const w = await get1('SELECT * FROM withdrawals WHERE id=?', req.params.id);
+    if (!w) return res.status(404).json({ error: 'retrait introuvable' });
+    if (w.status !== 'pending') return res.status(400).json({ error: 'déjà traité (' + w.status + ')' });
+    const t = now();
+    // REMBOURSEMENT CRITIQUE : les pièces retournent à l'utilisateur
+    await runSql('UPDATE users SET coins=coins+? WHERE id=?', w.coins, w.user_id);
+    await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
+      w.user_id, w.coins, 'remboursement retrait #' + w.id + ' rejeté', t);
+    await runSql('UPDATE withdrawals SET status=?, decided_at=? WHERE id=?', 'rejected', t, w.id);
+    await runSql('UPDATE receipts SET status=? WHERE withdrawal_id=?', 'rejected', w.id);
+    res.json({ ok: true, id: w.id, status: 'rejected', refunded: w.coins });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 
