@@ -7350,6 +7350,8 @@ app.post('/api/bot/chat', auth, async (req, res) => {
     const result = botBrain(text);
     // Log pour suivi (v2.25 : syntaxe compatible Postgres)
     await runSql('CREATE TABLE IF NOT EXISTS bot_messages(id ' + (USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT') + ', user_id INTEGER, text TEXT, reply TEXT, created_at BIGINT)').catch(()=>{});
+    // Log pour suivi
+    await runSql('CREATE TABLE IF NOT EXISTS bot_messages(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, text TEXT, reply TEXT, created_at INTEGER)').catch(()=>{});
     await runSql('INSERT INTO bot_messages(user_id,text,reply,created_at) VALUES(?,?,?,?)',
       req.userId, text, result.r, now()).catch(()=>{});
     res.json({ ok: true, reply: result.r, action: result.action || null, offer: !!result.offer, askShot: !!result.askShot });
@@ -7362,6 +7364,7 @@ app.post('/api/bot/screenshot', auth, async (req, res) => {
     const text = String((req.body || {}).text || '').slice(0, 2000);
     if (!images.length) return res.status(400).json({ error: 'image requise' });
     await runSql('CREATE TABLE IF NOT EXISTS bot_screenshots(id ' + (USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT') + ', user_id INTEGER, images TEXT, text TEXT, created_at BIGINT)').catch(()=>{});
+    await runSql('CREATE TABLE IF NOT EXISTS bot_screenshots(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, images TEXT, text TEXT, created_at INTEGER)').catch(()=>{});
     await runSql('INSERT INTO bot_screenshots(user_id,images,text,created_at) VALUES(?,?,?,?)',
       req.userId, JSON.stringify(images), text, now());
     res.json({ ok: true, received: images.length });
