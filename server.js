@@ -2400,8 +2400,9 @@ async function issueVerifyCode(identifier, kind) {
   return out;
 }
 app.get('/api/diag/smtp-test', async (req, res) => {
+  if (!checkAdmin(req, res)) return;
   const m = mailer();
-  if (!m) return res.json({ ok: false, reason: 'mailer null — variables SMTP manquantes', hasHost: !!process.env.SMTP_HOST, hasUser: !!process.env.SMTP_USER, hasPass: !!process.env.SMTP_PASS });
+  if (!m) return res.json({ ok: false, reason: 'mailer null — variables SMTP manquantes' });
   try {
     await m.verify();
     res.json({ ok: true, message: 'connexion SMTP vérifiée' });
@@ -5268,90 +5269,6 @@ app.get('/', (req, res) => res.type('html').send(`<!DOCTYPE html><html lang="fr"
 <ul><li>📱 Application Android (bientôt sur Google Play)</li><li>💰 1000 pièces = 2&nbsp;$ de retrait minimum</li><li>🌍 Disponible dans tous les pays</li></ul>
 <p><a href="/privacy">Règles de confidentialité</a></p>
 <footer>VidiGagne — contact : ceuskewin1234@gmail.com</footer></body></html>`));
-app.get('/privacy', (req, res) => res.type('html').send(`<!DOCTYPE html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>VidiGagne — Politique de confidentialité</title>${PAGE_STYLE}</head><body>
-<h1>Politique de confidentialité — VidiGagne</h1>
-<p><em>Dernière mise à jour : 2 octobre 2026.</em></p>
-<p>VidiGagne (« nous ») est une application de partage de vidéos courtes. La protection de tes données personnelles et ta sécurité sont au cœur de notre service. Cette politique explique quelles données nous collectons, pourquoi, avec qui nous les partageons, et les droits dont tu disposes — sur le modèle des standards des grandes plateformes vidéo.</p>
-
-<h2>1. Les données que nous collectons</h2>
-<h3>1.1. Données que tu nous fournis</h3>
-<ul>
-<li><strong>Informations de compte :</strong> pseudo (unique), nom affiché, adresse e-mail et/ou numéro de téléphone si tu choisis ces modes d'inscription, mot de passe (stocké sous forme chiffrée, jamais en clair).</li>
-<li><strong>Connexion via un tiers :</strong> si tu te connectes avec Google, Facebook ou Apple, nous recevons les informations de base que ce service accepte de partager (nom, adresse e-mail, photo de profil).</li>
-<li><strong>Profil :</strong> photo de profil, biographie et tout autre élément que tu choisis d'afficher publiquement.</li>
-<li><strong>Contenu :</strong> vidéos que tu publies, descriptions, hashtags, sons associés, commentaires, stories, messages du chat des lives, playlists et cadeaux virtuels.</li>
-<li><strong>Gains et retraits :</strong> solde de pièces, historique des gains, et — uniquement si tu demandes un retrait — la méthode choisie (MonCash, NatCash) et le numéro de téléphone nécessaire au paiement.</li>
-<li><strong>Signalements :</strong> contenu des signalements que tu nous adresses pour la modération.</li>
-</ul>
-<h3>1.2. Données collectées automatiquement</h3>
-<ul>
-<li><strong>Utilisation :</strong> vidéos regardées, likes, abonnements, recherches et interactions, afin de personnaliser ton fil « Pour toi ».</li>
-<li><strong>Données techniques :</strong> adresse IP, type d'appareil et de système d'exploitation, identifiants techniques nécessaires au fonctionnement et à la sécurité du service.</li>
-<li><strong>Journaux :</strong> dates de connexion et actions liées à la sécurité du compte.</li>
-</ul>
-<p>Nous ne collectons pas ta localisation GPS précise. Nous n'accédons à tes contacts, ta galerie ou ton micro que si tu nous l'autorises explicitement pour une fonctionnalité précise (ex. : choisir une vidéo, enregistrer une voix off).</p>
-
-<h2>2. Comment nous utilisons tes données</h2>
-<ul>
-<li>Fournir et faire fonctionner l'application : comptes, diffusion des vidéos, commentaires, lives, stories.</li>
-<li>Personnaliser ton expérience : recommandations du fil « Pour toi » basées sur tes interactions.</li>
-<li>Gérer ton solde de pièces, les cadeaux et les demandes de retrait.</li>
-<li>Assurer la sécurité : détecter les fraudes, les faux comptes et les abus ; modérer les contenus signalés.</li>
-<li>Améliorer le service et corriger les erreurs techniques.</li>
-<li>Respecter nos obligations légales.</li>
-</ul>
-<p><strong>Nous ne vendons jamais tes données personnelles.</strong></p>
-
-<h2>3. Avec qui nous partageons tes données</h2>
-<ul>
-<li><strong>Autres utilisateurs :</strong> ton pseudo, ta photo, ta bio, tes vidéos publiques, tes commentaires et tes likes publics sont visibles par tous les utilisateurs de l'application. Réfléchis avant de publier.</li>
-<li><strong>Prestataires techniques</strong> (uniquement ce qui est nécessaire au service) :
-  <ul>
-  <li>Neon / AWS — base de données (hébergée aux États-Unis) ;</li>
-  <li>Cloudinary — hébergement des vidéos ;</li>
-  <li>Render — serveurs applicatifs ;</li>
-  <li>Firebase / Google — vérification des numéros de téléphone et connexion Google.</li>
-  </ul></li>
-<li><strong>Autorités :</strong> uniquement si la loi l'exige ou pour protéger la sécurité des utilisateurs.</li>
-</ul>
-<p>Nous ne partageons pas tes données avec des annonceurs : VidiGagne n'affiche pas de publicité ciblée.</p>
-
-<h2>4. Tes droits et tes choix</h2>
-<p>Tu disposes à tout moment des droits suivants, directement depuis l'application :</p>
-<ul>
-<li><strong>Accès et rectification :</strong> consulte et modifie ton profil (Profil → Paramètres).</li>
-<li><strong>Export :</strong> télécharge une copie de tes données (Profil → Paramètres → « Télécharger mes données »).</li>
-<li><strong>Suppression :</strong> supprime définitivement ton compte et l'ensemble de tes données (Profil → Paramètres → « Supprimer mon compte »). Les stories sont de toute façon supprimées automatiquement 24 h après leur publication.</li>
-<li><strong>Contenu :</strong> tu peux supprimer tes vidéos et commentaires à tout moment.</li>
-</ul>
-
-<h2>5. Sécurité de tes données</h2>
-<ul>
-<li>Les mots de passe sont chiffrés et ne sont jamais stockés en clair.</li>
-<li>Toutes les communications entre l'application et nos serveurs sont chiffrées (HTTPS).</li>
-<li>L'accès aux systèmes est strictement limité et journalisé.</li>
-<li>Des plafonds anti-fraude protègent ton solde de pièces.</li>
-</ul>
-<p>Aucun système n'est infaillible : protège ton mot de passe et ne le partage avec personne.</p>
-
-<h2>6. Conservation des données</h2>
-<p>Nous conservons tes données aussi longtemps que ton compte est actif et que c'est nécessaire pour fournir le service. Les stories sont supprimées automatiquement après 24 heures. Lorsque tu supprimes ton compte, tes données personnelles, tes vidéos et tes fichiers sont définitivement effacés de nos systèmes.</p>
-
-<h2>7. Mineurs</h2>
-<p>VidiGagne est réservé aux personnes âgées d'au moins <strong>13 ans</strong>. Nous ne collectons pas sciemment de données d'enfants de moins de 13 ans ; si tu penses qu'un enfant de moins de 13 ans utilise l'application, contacte-nous pour que nous supprimions son compte.</p>
-
-<h2>8. Transferts internationaux</h2>
-<p>Tes données sont hébergées aux États-Unis par nos prestataires (Neon/AWS, Cloudinary, Render). En utilisant VidiGagne depuis un autre pays, tu acceptes ce transfert, encadré par les contrats de nos prestataires.</p>
-
-<h2>9. Modifications de cette politique</h2>
-<p>Si nous modifions cette politique de façon importante, nous t'en informerons dans l'application avant son entrée en vigueur. La date de mise à jour figure en haut de cette page.</p>
-
-<h2>10. Nous contacter</h2>
-<p>Pour toute question sur tes données personnelles, la sécurité de ton compte ou l'exercice de tes droits :<br>
-<strong>ceuskewin1234@gmail.com</strong><br>
-ou depuis l'application : Profil → Paramètres.</p>
-
-<footer>VidiGagne — Ta sécurité d'abord.</footer></body></html>`));
 
 app.get('/api/health', (req, res) => res.json({
   ok: true, name: 'VidiGagne Server v2', time: now(),
@@ -6099,13 +6016,6 @@ app.get('/api/sounds/:id', async (req, res) => {
   const videos = [];
   for (const v of vids) { if (await canSeeVideo(v, meId)) { const j = await videoJSON(v, meId); if (j) videos.push(j); } }
   res.json({ sound: soundJSON(s, meId, !!fav, Number(fc.c)), videos });
-});
-app.post('/api/sounds/:id/use', auth, async (req, res) => {
-  const s = await get1('SELECT * FROM sounds WHERE id=?', req.params.id);
-  if (!s) return res.status(404).json({ error: 'son introuvable' });
-  await runSql('UPDATE sounds SET use_count=use_count+1 WHERE id=?', s.id);
-  const u = await get1('SELECT * FROM sounds WHERE id=?', s.id);
-  res.json({ sound: soundJSON(u) });
 });
 app.post('/api/sounds/:id/fav', auth, async (req, res) => {
   const s = await get1('SELECT * FROM sounds WHERE id=?', req.params.id);
