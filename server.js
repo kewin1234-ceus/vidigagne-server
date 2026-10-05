@@ -8283,6 +8283,9 @@ app.get('/api/appeals/mine', authSoft, async (req, res) => {
         sanctions.push({
           report_id: sr.id, label: sanctionLabel(sr), action: sr.action,
           target_type: sr.target_type, target_id: sr.target_id,
+          // FIX UX 2026-10-05 (parcours modération) : le motif était absent → l'utilisateur
+          // sanctionné ne comprenait pas pourquoi. Maintenant affiché dans le panneau.
+          reason: sr.reason || '',
           created_at: Number(sr.created_at),
           appeal_id: ap ? ap.id : null, appeal_status: ap ? ap.status : null,
         });
