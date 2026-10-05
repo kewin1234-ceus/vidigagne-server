@@ -1822,6 +1822,10 @@ app.get('/api/search/insights', async (req, res) => {
   await mig('users', 'notif_lives', `INTEGER NOT NULL DEFAULT 1`);
   // v2.34 : alertes de connexion (login_alert) + mémoire de la dernière IP de connexion
   await mig('users', 'notif_loginalert', `INTEGER NOT NULL DEFAULT 1`);
+  // v2.41 (bots chain-notif-quiet / chain-notif-priority) : heures silencieuses (0-23, NULL=désactivé) + tri par priorité des notifs
+  await mig('users', 'quiet_start', `INTEGER`);
+  await mig('users', 'quiet_end', `INTEGER`);
+  await mig('users', 'notif_priority', `INTEGER NOT NULL DEFAULT 1`);
   await mig('users', 'last_login_ip', `TEXT NOT NULL DEFAULT ''`);
   await mig('users', 'dm_privacy', `TEXT NOT NULL DEFAULT 'everyone'`);
   // PARITÉ TIKTOK 2026-10-04 : politiques duo/collage par compte + PIN mode restreint + flag sensible
@@ -1848,6 +1852,11 @@ app.get('/api/search/insights', async (req, res) => {
   try {
     const _ubt = `CREATE TABLE IF NOT EXISTS user_badges(id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'}, user_id INTEGER NOT NULL, badge TEXT NOT NULL, awarded_at BIGINT NOT NULL, UNIQUE(user_id, badge))`;
     if (USE_PG) await pool.query(_ubt); else lite.exec(_ubt);
+  } catch (e) {}
+  // v2.41 : compteur de clics sur les liens du profil (bots profil avancés)
+  try {
+    const _lct = `CREATE TABLE IF NOT EXISTS link_clicks(user_id INTEGER NOT NULL, url TEXT NOT NULL, clicks INTEGER NOT NULL DEFAULT 0, updated_at BIGINT NOT NULL, UNIQUE(user_id, url))`;
+    if (USE_PG) await pool.query(_lct); else lite.exec(_lct);
   } catch (e) {}
   try {
     const _sht = `CREATE TABLE IF NOT EXISTS suggestion_hidden(user_id INTEGER NOT NULL, hidden_id INTEGER NOT NULL, created_at BIGINT NOT NULL, PRIMARY KEY(user_id, hidden_id))`;
@@ -2518,12 +2527,27 @@ async function notify(userId, type, actorId, videoId, text, commentId) {
   try {
     if (!userId || Number(userId) === Number(actorId)) return;
     // v1.84 : vérifie les préférences de notification du destinataire
+    let prefs = null;
     try {
-      const prefs = await get1('SELECT notif_likes,notif_comments,notif_follows,notif_mentions,notif_lives,notif_loginalert FROM users WHERE id=?', userId);
+      prefs = await get1('SELECT notif_likes,notif_comments,notif_follows,notif_mentions,notif_lives,notif_loginalert,quiet_start,quiet_end FROM users WHERE id=?', userId);
       if (prefs) {
         const prefMap = { like: 'notif_likes', comment: 'notif_comments', follow: 'notif_follows', follow_request: 'notif_follows', follow_accepted: 'notif_follows', mention: 'notif_mentions', live: 'notif_lives', login_alert: 'notif_loginalert' };
         const col = prefMap[type];
         if (col && Number(prefs[col]) === 0) return; // désactivé par l'utilisateur
+      }
+    } catch (_) {}
+    // v2.41 : heures silencieuses — la notif est STOCKÉE en base (is_read=0) mais le
+    // push instantané (WebSocket in-app + FCM) est supprimé si l'heure UTC actuelle
+    // est dans la plage [quiet_start, quiet_end[ (plage pouvant chevaucher minuit).
+    let inQuiet = false;
+    try {
+      const qs = prefs ? prefs.quiet_start : null, qe = prefs ? prefs.quiet_end : null;
+      if (qs !== null && qs !== undefined && qe !== null && qe !== undefined) {
+        const s = Number(qs), e = Number(qe);
+        if (Number.isInteger(s) && Number.isInteger(e) && s >= 0 && s <= 23 && e >= 0 && e <= 23 && s !== e) {
+          const h = new Date().getUTCHours();
+          inQuiet = s < e ? (h >= s && h < e) : (h >= s || h < e);
+        }
       }
     } catch (_) {}
     const id = await insertId('INSERT INTO notifications(user_id,type,actor_id,video_id,comment_id,text,is_read,created_at) VALUES(?,?,?,?,?,?,0,?)',
@@ -4934,6 +4958,10 @@ app.get('/api/feed', async (req, res) => {
     let meId = null;
     if (m) { const t = await get1('SELECT user_id FROM tokens WHERE token=?', m[1]); if (t) meId = t.user_id; }
     const mode = req.query.mode === 'following' && meId ? 'following' : 'foryou';
+    // PAGINATION 2026-10-04 : ?page=N (1-based). has_more renvoyé pour le scroll infini.
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const off = (page - 1);
+    let pageSize = 50, has_more = false;
     let rows;
     // FIX 2026-10-04 (bot chain-profile-stats) : `restricted` n'était défini que dans
     // scoreForYou → ReferenceError → /api/feed renvoyait 500 systématiquement
@@ -4954,8 +4982,9 @@ app.get('/api/feed', async (req, res) => {
       sql += vf.clause; params.push(...vf.params);
       // PARITÉ TIKTOK 2026-10-04 : mode restreint → le contenu sensible est filtré du feed
       if (restricted) { sql += ' AND v.sensitive=0'; }
-      sql += ' ORDER BY v.created_at DESC LIMIT 50';
+      sql += ' ORDER BY v.created_at DESC LIMIT 50 OFFSET ' + (off * 50);
       rows = await allRows(sql, ...params);
+      has_more = rows.length >= 50;
       // v2.35 : les reposts des comptes suivis apparaissent dans le fil « Suivis » (avec attribution)
       try {
         const rp = ['SELECT v.*, r.user_id AS reposter_id, r.created_at AS reposted_at FROM reposts r',
@@ -4967,7 +4996,7 @@ app.get('/api/feed', async (req, res) => {
         rp.push(blockFilter('r')); rpar.push(meId, meId);
         const rvf = visFilter('v', meId); rp.push(rvf.clause); rpar.push(...rvf.params);
         if (restricted) { rp.push('AND v.sensitive=0'); }
-        rp.push('ORDER BY r.created_at DESC LIMIT 50');
+        rp.push('ORDER BY r.created_at DESC LIMIT 50 OFFSET ' + (off * 50));
         const rpRows = await allRows(rp.join(' '), ...rpar);
         if (rpRows.length) {
           const seen = new Set(rows.map(x => x.id));
@@ -4991,11 +5020,15 @@ app.get('/api/feed', async (req, res) => {
       if (restricted) { sql += ' AND videos.sensitive=0'; }
       if (meId) {
         // v12 : utilisateurs connectés → score personnalisé « Pour toi »
-        sql += ' ORDER BY created_at DESC LIMIT 200';
-        rows = await scoreForYou(await allRows(sql, ...params), meId);
+        pageSize = 200;
+        sql += ' ORDER BY created_at DESC LIMIT 200 OFFSET ' + (off * 200);
+        const rawRows = await allRows(sql, ...params);
+        has_more = rawRows.length >= 200;
+        rows = await scoreForYou(rawRows, meId);
       } else {
-        sql += ' ORDER BY created_at DESC LIMIT 50';
+        sql += ' ORDER BY created_at DESC LIMIT 50 OFFSET ' + (off * 50);
         rows = await allRows(sql, ...params);
+        has_more = rows.length >= 50;
       }
     }
     const videos = [];
@@ -5009,14 +5042,16 @@ app.get('/api/feed', async (req, res) => {
       }
       videos.push(j);
     }
-    res.json({ mode, videos });
+    res.json({ mode, videos, page, has_more });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 
 // mes vidéos, y compris celles programmées (avec leur scheduled_at)
 app.get('/api/videos/mine', auth, async (req, res) => {
   try {
-    const rows = await allRows('SELECT * FROM videos WHERE user_id=? ORDER BY created_at DESC', req.userId);
+    // PAGINATION 2026-10-04 : ?page=N (30/page)
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const rows = await allRows('SELECT * FROM videos WHERE user_id=? ORDER BY created_at DESC LIMIT 30 OFFSET ' + ((page - 1) * 30), req.userId);
     const videos = [];
     for (const v of rows) {
       const j = await videoJSON(v, req.userId);
@@ -5024,7 +5059,7 @@ app.get('/api/videos/mine', auth, async (req, res) => {
       j.scheduled_at = v.scheduled_at ? Number(v.scheduled_at) : null;
       videos.push(j);
     }
-    res.json({ videos });
+    res.json({ videos, page, has_more: rows.length >= 30 });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 // v1.57 : statistiques détaillées d'une vidéo (propriétaire uniquement) — style TikTok Studio
@@ -5361,11 +5396,13 @@ function commentSpamReason(text) {
 }
 // ---------- commentaires ----------
 app.get('/api/videos/:id/comments', async (req, res) => {
+  // PAGINATION 2026-10-04 : ?page=N (50/page, ordre chronologique)
+  const page = Math.max(1, parseInt(req.query.page, 10) || 1);
   const rows = await allRows(
     `SELECT c.*, u.username, u.name, u.avatar FROM comments c
      JOIN users u ON u.id=c.user_id
      WHERE c.video_id=? AND (c.review_status IS NULL OR c.review_status<>'pending')
-     ORDER BY c.created_at ASC LIMIT 200`, req.params.id);
+     ORDER BY c.created_at ASC LIMIT 50 OFFSET ` + ((page - 1) * 50), req.params.id);
   // v12 : exclut les commentaires contenant un mot-clé filtré par le propriétaire
   let kws = [];
   try {
@@ -5387,7 +5424,7 @@ app.get('/api/videos/:id/comments', async (req, res) => {
       filtered.forEach(c => { c.liked = ls.has(Number(c.id)) ? 1 : 0; });
     } else filtered.forEach(c => { c.liked = 0; });
   } catch (e) { filtered.forEach(c => { c.liked = 0; }); }
-  res.json({ comments: filtered });
+  res.json({ comments: filtered, page, has_more: rows.length >= 50 });
 });
 
 app.post('/api/videos/:id/comments', auth, uploadMedia.fields([{name:'video',maxCount:1},{name:'audio',maxCount:1}]), async (req, res) => {
@@ -5515,8 +5552,10 @@ app.post('/api/conversations', auth, async (req, res) => {
 // liste de mes conversations
 app.get('/api/conversations', auth, async (req, res) => {
   try {
+    // PAGINATION 2026-10-04 : ?page=N (20/page)
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
     const rows = await allRows(
-      'SELECT * FROM conversations WHERE user1_id=? OR user2_id=? ORDER BY updated_at DESC',
+      'SELECT * FROM conversations WHERE user1_id=? OR user2_id=? ORDER BY updated_at DESC LIMIT 20 OFFSET ' + ((page - 1) * 20),
       req.userId, req.userId);
     const out = [];
     for (const c of rows) {
@@ -5537,7 +5576,7 @@ app.get('/api/conversations', auth, async (req, res) => {
         unread: unread,
       });
     }
-    res.json({ conversations: out });
+    res.json({ conversations: out, page, has_more: rows.length >= 20 });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 // messages d'une conversation (50 derniers, ou avant ?before=)
@@ -5900,7 +5939,9 @@ app.get('/api/admin/devices/flagged', async (req, res) => {
 // ---------- notifications ----------
 app.get('/api/notifications', auth, async (req, res) => {
   try {
-    const rows = await allRows('SELECT * FROM notifications WHERE user_id=? ORDER BY created_at DESC LIMIT 20', req.userId);
+    // PAGINATION 2026-10-04 : ?page=N (20/page)
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const rows = await allRows('SELECT * FROM notifications WHERE user_id=? ORDER BY created_at DESC LIMIT 20 OFFSET ' + ((page - 1) * 20), req.userId);
     const out = [];
     for (const n of rows) {
       const actor = n.actor_id ? await get1('SELECT * FROM users WHERE id=?', n.actor_id) : null;
@@ -5913,7 +5954,7 @@ app.get('/api/notifications', auth, async (req, res) => {
         video: vid ? { id: vid.id, thumb: fileUrl(vid.file) } : null,
       });
     }
-    res.json({ notifications: out });
+    res.json({ notifications: out, page, has_more: rows.length >= 20 });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 // v1.56 : notifications non lues pour le poller natif (push serveur, pas seulement local)
@@ -5945,8 +5986,10 @@ app.post('/api/notifications/read', auth, async (req, res) => {
 // v2.24 : historique d'activité sur le serveur (pas seulement local)
 app.get('/api/activities', auth, async (req, res) => {
   try {
-    const rows = await allRows('SELECT * FROM activities WHERE user_id=? ORDER BY created_at DESC LIMIT 50', req.userId);
-    res.json({ activities: rows.map(function(r){ return {i: r.icon, t: r.text, ts: Number(r.created_at)}; }) });
+    // PAGINATION 2026-10-04 : ?page=N (50/page)
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const rows = await allRows('SELECT * FROM activities WHERE user_id=? ORDER BY created_at DESC LIMIT 50 OFFSET ' + ((page - 1) * 50), req.userId);
+    res.json({ activities: rows.map(function(r){ return {i: r.icon, t: r.text, ts: Number(r.created_at)}; }), page, has_more: rows.length >= 50 });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 app.post('/api/activities', auth, async (req, res) => {
@@ -6658,7 +6701,9 @@ app.delete('/api/videos/:id/hide', auth, async (req, res) => {
 // ---------- historique de visionnage ----------
 app.get('/api/history', auth, async (req, res) => {
   try {
-    const rows = await allRows('SELECT video_id, watched_at FROM watch_history WHERE user_id=? ORDER BY watched_at DESC LIMIT 30', req.userId);
+    // PAGINATION 2026-10-04 : ?page=N (30/page)
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const rows = await allRows('SELECT video_id, watched_at FROM watch_history WHERE user_id=? ORDER BY watched_at DESC LIMIT 30 OFFSET ' + ((page - 1) * 30), req.userId);
     const out = [];
     for (const r of rows) {
       const v = await get1('SELECT * FROM videos WHERE id=? AND hidden=0', r.video_id);
@@ -6668,7 +6713,7 @@ app.get('/api/history', auth, async (req, res) => {
       j.watched_at = Number(r.watched_at);
       out.push(j);
     }
-    res.json({ history: out });
+    res.json({ history: out, page, has_more: rows.length >= 30 });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 
@@ -6760,6 +6805,17 @@ app.get('/api/me/badges', auth, async (req, res) => {
     generous: { icon: '🎁', name: 'Généreux', desc: '100 cadeaux envoyés' },
   };
   res.json({ badges: rows.map(r => Object.assign({ badge: r.badge, awarded_at: r.awarded_at }, defs[r.badge] || { icon: '🏅', name: r.badge, desc: '' })) });
+});
+
+// v2.41 : compteur de clics sur les liens du profil (bot chain-profile-links)
+app.post('/api/links/click', auth, async (req, res) => {
+  const url = String((req.body || {}).url || '').slice(0, 200);
+  if (!url) return res.status(400).json({ error: 'url requise' });
+  const t = now();
+  await insertIgnore('INSERT OR IGNORE INTO link_clicks(user_id,url,clicks,updated_at) VALUES(?,?,0,?)', req.userId, url, t);
+  await runSql('UPDATE link_clicks SET clicks=clicks+1, updated_at=? WHERE user_id=? AND url=?', t, req.userId, url);
+  const row = await get1('SELECT clicks FROM link_clicks WHERE user_id=? AND url=?', req.userId, url);
+  res.json({ ok: true, clicks: row ? Number(row.clicks) : 0 });
 });
 
 app.delete('/api/follow/:username', auth, async (req, res) => {
@@ -7137,6 +7193,9 @@ app.get('/api/search', async (req, res) => {
     const rawQ = String(req.query.q || '').trim().toLowerCase().slice(0, 100);
     const q = '%' + rawQ + '%';
     const meId = await optUserId(req);
+    // PAGINATION 2026-10-04 : ?page=N (20/page pour users et vidéos)
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const sqOff = (page - 1) * 20;
     // v1.63 : journalise les recherches pour les insights créateurs
     if (rawQ.length >= 2) {
       runSql('INSERT INTO search_logs(query,user_id,created_at) VALUES(?,?,?)',
@@ -7145,7 +7204,7 @@ app.get('/api/search', async (req, res) => {
       runSql('DELETE FROM search_logs WHERE created_at<?', now() - 30 * 86400000).catch(() => {});
     }
     const users = await allRows(
-      'SELECT id,username,name,avatar FROM users WHERE username LIKE ? OR name LIKE ? LIMIT 20', q, q);
+      'SELECT id,username,name,avatar FROM users WHERE username LIKE ? OR name LIKE ? LIMIT 20 OFFSET ' + sqOff, q, q);
     const vf = visFilter('videos', meId);
     // v2.37 : filtres de recherche (sort=recent|popular, min_duration, max_duration en secondes)
     const sort = String(req.query.sort || 'recent');
@@ -7157,10 +7216,10 @@ app.get('/api/search', async (req, res) => {
     if (minD > 0) { durClause += ' AND duration>=?'; durParams.push(minD); }
     if (maxD > 0) { durClause += ' AND duration<=?'; durParams.push(maxD); }
     const vids = await allRows(
-      'SELECT * FROM videos WHERE (LOWER(description) LIKE ? OR LOWER(tags) LIKE ?) AND (scheduled_at IS NULL OR scheduled_at <= ?) AND hidden=0' + durClause + vf.clause + ' ' + orderBy + ' LIMIT 20', q, q, now(), ...durParams, ...vf.params);
+      'SELECT * FROM videos WHERE (LOWER(description) LIKE ? OR LOWER(tags) LIKE ?) AND (scheduled_at IS NULL OR scheduled_at <= ?) AND hidden=0' + durClause + vf.clause + ' ' + orderBy + ' LIMIT 20 OFFSET ' + sqOff, q, q, now(), ...durParams, ...vf.params);
     const videos = [];
     for (const v of vids) { const j = await videoJSON(v, null); if (j) videos.push(j); }
-    res.json({ users, videos });
+    res.json({ users, videos, page, has_more: vids.length >= 20 || users.length >= 20 });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 
@@ -7791,7 +7850,9 @@ app.get('/api/live/:id/stats', async (req, res) => {
       shares: Number(l.shares) || 0,
       viewers: await liveViewersCount(l.id),
       chat_total: Number(l.chat_total) || 0,
-      live_type: l.live_type || 'guests'
+      live_type: l.live_type || 'guests',
+      peak_viewers: Number(l.peak_viewers) || 0,
+      gifts_total: Number(l.gifts_total) || 0
     });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
@@ -8063,7 +8124,12 @@ app.post('/api/live/:id/guest-invite', auth, async (req, res) => {
     const l = await liveById(req.params.id);
     if (!l) return res.status(404).json({ error: 'live introuvable' });
     if (Number(l.user_id) !== Number(req.userId)) return res.status(403).json({ error: 'réservé à l\'hôte' });
-    const guestId = Number((req.body || {}).user_id);
+    // v2.38+ : accepte user_id OU username (ex. 'robot2')
+    let guestId = Number((req.body || {}).user_id);
+    if (!guestId) {
+      const un = String((req.body || {}).username || '').trim().replace(/^@/, '');
+      if (un) { const uu = await get1('SELECT id FROM users WHERE username=?', un); if (uu) guestId = Number(uu.id); }
+    }
     if (!guestId || guestId === Number(req.userId)) return res.status(400).json({ error: 'user_id invalide' });
     const u = await get1('SELECT username, avatar FROM users WHERE id=?', guestId);
     if (!u) return res.status(404).json({ error: 'utilisateur introuvable' });
@@ -9303,11 +9369,11 @@ app.post('/api/videos/:id/promote', auth, async (req, res) => {
       req.userId, -budget, 'promotion vidéo #' + v.id, now());
     const id = await insertId(
       `INSERT INTO video_promos(video_id,user_id,budget_coins,spent_coins,impressions,clicks,target,status,created_at)
-       VALUES(?,?,?,?,0,0,?,?,'active',?)`,
-      v.id, req.userId, budget, 0, target, now());
+       VALUES(?,?,?,0,0,0,?,'active',?)`,
+      v.id, req.userId, budget, target, now());
     const bal = await get1('SELECT coins FROM users WHERE id=?', req.userId);
     res.json({ ok: true, promo_id: id, coins: bal ? Number(bal.coins) : 0 });
-  } catch (e) { res.status(500).json({ error: 'échec de la promotion', _dbg: String(e && e.message || e).slice(0, 200) }); }
+  } catch (e) { res.status(500).json({ error: 'échec de la promotion' }); }
 });
 // Simule une impression ou un clic sur une vidéo promue (débite le budget).
 // POST /api/videos/:id/promo/event {type: 'impression'|'click'}
