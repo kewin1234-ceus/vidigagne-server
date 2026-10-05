@@ -20,6 +20,13 @@ let pool = null;   // pg (Postgres)
 let lite = null;   // node:sqlite (repli local)
 function pgQ(sql) { let i = 0; return sql.replace(/\?/g, () => '$' + (++i)); }
 
+// v1.63 : demande de badge vérifié — critères VidiGagne :
+// artiste, marque, entreprise, créateur, personnalité... doit prouver son identité
+// (pièce d'identité) + son activité (site web / marque représentée / liens).
+// FIX v2.42 : la constante était déclarée DANS initDb() → botReviewBadge (niveau module)
+// crashait avec "VERIF_CATEGORIES is not defined" et les décisions auto badge ne partaient jamais.
+const VERIF_CATEGORIES = ['artiste', 'marque', 'entreprise', 'createur', 'personnalite', 'media', 'autre'];
+
 async function initDb() {
   if (USE_PG) {
     const { Pool } = require('pg');
@@ -1018,10 +1025,7 @@ CREATE TABLE IF NOT EXISTS abuse_flags(
   } // FIX 2026-10-04 : le if (USE_PG) des migrations n'était jamais fermé — les routes
   // ci-dessous (vérification, battles PK, appels, sons, transcription, insights) n'étaient
   // enregistrées que sur Postgres (404 en SQLite local)
-// v1.63 : demande de badge vérifié — critères VidiGagne :
-// artiste, marque, entreprise, créateur, personnalité... doit prouver son identité
-// (pièce d'identité) + son activité (site web / marque représentée / liens).
-const VERIF_CATEGORIES = ['artiste', 'marque', 'entreprise', 'createur', 'personnalite', 'media', 'autre'];
+  // (constante VERIF_CATEGORIES désormais au niveau module — voir FIX v2.42 en tête de fichier)
 app.post('/api/verification/request', auth, uploadImg.single('id_doc'), async (req, res) => {
   try {
     const u = await get1('SELECT verified FROM users WHERE id=?', req.userId);
@@ -2414,6 +2418,9 @@ async function runVerificationBot() {
           [verdict.approved ? 'approved' : 'rejected', now(), verdict.reason, r.id]);
         if (verdict.approved) {
           await botWriteRetry('UPDATE users SET verified=1 WHERE id=?', [r.user_id]);
+          // v2.42 : le bot insère aussi la ligne user_badges (comme l'endpoint admin) —
+          // sinon le badge « ✓ Vérifié » n'apparaît pas sur le profil
+          await insertIgnore('INSERT OR IGNORE INTO user_badges(user_id,badge,awarded_at) VALUES(?,?,?)', r.user_id, 'verified', now());
           await notify(r.user_id, 'system', null, null, '🤖✔️ Ton compte est maintenant vérifié !');
         } else {
           await notify(r.user_id, 'system', null, null, '🤖 ' + verdict.reason);
@@ -8681,7 +8688,8 @@ app.get('/api/live/:id/signal', auth, async (req, res) => {
         l.id, since, l.user_id, l.user_id);
     } else {
       // un viewer récupère les signaux du diffuseur (offre/réponse/candidats, pour lui ou diffusés)
-      rows = await allRows("SELECT * FROM live_signals WHERE live_id=? AND id>? AND ((from_user_id=? AND (to_user_id IS NULL OR to_user_id=?) AND kind IN ('offer','answer','candidate')) OR (to_user_id=? AND kind IN ('guest_accept','guest_refuse','guest_invite','guest_invite_accept','guest_invite_refuse'))) ORDER BY id ASC LIMIT 50",
+      // v2.38 : inclut aussi les signaux 'effect' (filtres en direct) diffusés à tous
+      rows = await allRows("SELECT * FROM live_signals WHERE live_id=? AND id>? AND ((from_user_id=? AND (to_user_id IS NULL OR to_user_id=?) AND kind IN ('offer','answer','candidate','effect')) OR (to_user_id=? AND kind IN ('guest_accept','guest_refuse','guest_invite','guest_invite_accept','guest_invite_refuse'))) ORDER BY id ASC LIMIT 50",
         l.id, since, l.user_id, req.userId, req.userId);
     }
     res.json({ signals: rows.map(s => ({ id: s.id, kind: s.kind, from: s.from_user_id, payload: s.payload })) });
