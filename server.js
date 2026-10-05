@@ -2915,7 +2915,7 @@ async function fraudAlert(type, userId, ip, detail) {
     await runSql('INSERT INTO fraud_alerts(type,user_id,ip,detail,created_at) VALUES(?,?,?,?,?)',
       String(type).slice(0, 40), userId || null, ipS, String(detail || '').slice(0, 500), t);
     return true;
-  } catch (e) { return false; }
+  } catch (e) { try { console.error('FADBG_ERR', String(e && e.message).slice(0, 160)); } catch (_) {} return false; }
 }
 // Vrai si l'utilisateur est sur un device flagged avec ≥5 comptes distincts → gains bloqués
 // (seuil 5 : en dessous, simple détection sans blocage — faux positifs possibles : famille, revente).
