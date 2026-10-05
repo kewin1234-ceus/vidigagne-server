@@ -31,6 +31,9 @@ async function initDb() {
     const DATA = path.join(__dirname, 'data');
     fs.mkdirSync(DATA, { recursive: true });
     lite = new DatabaseSync(path.join(DATA, 'vidigagne.db'));
+    // v2.31 : WAL + busy_timeout — la base locale est ouverte par 2 serveurs (3000/3100)
+    // + les helpers de test ; sans WAL, "database is locked" faisait crasher les requêtes.
+    try { lite.exec('PRAGMA journal_mode=WAL'); lite.exec('PRAGMA busy_timeout=5000'); } catch (_) {}
   }
   const schema = `
 CREATE TABLE IF NOT EXISTS users(
@@ -274,6 +277,7 @@ CREATE TABLE IF NOT EXISTS notifications(
   type TEXT NOT NULL,
   actor_id INTEGER,
   video_id INTEGER,
+  comment_id INTEGER,
   text TEXT NOT NULL DEFAULT '',
   title TEXT NOT NULL DEFAULT '',
   is_read INTEGER NOT NULL DEFAULT 0,
@@ -699,6 +703,8 @@ CREATE TABLE IF NOT EXISTS family_settings(
       "ALTER TABLE lives ADD COLUMN IF NOT EXISTS peak_viewers INTEGER NOT NULL DEFAULT 0",
       "ALTER TABLE lives ADD COLUMN IF NOT EXISTS gifts_total INTEGER NOT NULL DEFAULT 0",
       "ALTER TABLE lives ADD COLUMN IF NOT EXISTS chat_total INTEGER NOT NULL DEFAULT 0",
+      "ALTER TABLE videos ADD COLUMN IF NOT EXISTS shares INTEGER NOT NULL DEFAULT 0",
+      "ALTER TABLE videos ADD COLUMN IF NOT EXISTS downloads INTEGER NOT NULL DEFAULT 0",
       "ALTER TABLE live_summaries ADD COLUMN IF NOT EXISTS withdrawn_usd REAL NOT NULL DEFAULT 0",
       "ALTER TABLE live_summaries ADD COLUMN IF NOT EXISTS exchanged_usd REAL NOT NULL DEFAULT 0"]) {
       try { await pool.query(col); } catch (e) {}
@@ -715,7 +721,25 @@ CREATE TABLE IF NOT EXISTS family_settings(
     try { lite.exec(`ALTER TABLE lives ADD COLUMN chat_total INTEGER NOT NULL DEFAULT 0`); } catch (e) {}
     try { lite.exec(`ALTER TABLE live_summaries ADD COLUMN withdrawn_usd REAL NOT NULL DEFAULT 0`); } catch (e) {}
     try { lite.exec(`ALTER TABLE live_summaries ADD COLUMN exchanged_usd REAL NOT NULL DEFAULT 0`); } catch (e) {}
-    try { lite.exec(`ALTER TABLE withdrawals ADD COLUMN decided_at BIGINT`); } catch (e) {} }
+    try { lite.exec(`ALTER TABLE videos ADD COLUMN shares INTEGER NOT NULL DEFAULT 0`); } catch (e) {}
+    try { lite.exec(`ALTER TABLE videos ADD COLUMN downloads INTEGER NOT NULL DEFAULT 0`); } catch (e) {}
+    try { lite.exec(`ALTER TABLE withdrawals ADD COLUMN decided_at BIGINT`); } catch (e) {}
+    // FIX 2026-10-04 : parité SQLite — tables/colonnes monétisation+défis (n'existaient que sur Postgres → 500 en local)
+    try { lite.exec(`CREATE TABLE IF NOT EXISTS challenges(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, description TEXT NOT NULL,
+      bonus_coins INTEGER NOT NULL, goal_type TEXT NOT NULL, goal_value INTEGER NOT NULL,
+      start_at BIGINT NOT NULL, end_at BIGINT NOT NULL, active INTEGER DEFAULT 1)`); } catch (e) {}
+    try { lite.exec(`CREATE TABLE IF NOT EXISTS challenge_claims(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, challenge_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+      claimed_at BIGINT NOT NULL, UNIQUE(challenge_id, user_id))`); } catch (e) {}
+    try { lite.exec(`CREATE TABLE IF NOT EXISTS ad_impressions(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, video_id INTEGER NOT NULL, creator_id INTEGER NOT NULL,
+      ad_type TEXT NOT NULL DEFAULT 'interstitial', created_at BIGINT NOT NULL)`); } catch (e) {}
+    try { lite.exec(`ALTER TABLE videos ADD COLUMN ad_impressions INTEGER DEFAULT 0`); } catch (e) {}
+    try { lite.exec(`ALTER TABLE videos ADD COLUMN ad_revenue_usd REAL DEFAULT 0`); } catch (e) {}
+    try { lite.exec(`ALTER TABLE videos ADD COLUMN monetized_views INTEGER DEFAULT 0`); } catch (e) {}
+    try { lite.exec(`ALTER TABLE videos ADD COLUMN demonetized INTEGER DEFAULT 0`); } catch (e) {}
+    try { lite.exec(`ALTER TABLE videos ADD COLUMN monetization_enabled INTEGER DEFAULT 1`); } catch (e) {} }
   // migrations : colonnes d'authentification sociale
   if (USE_PG) {
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT`);
@@ -739,6 +763,7 @@ CREATE TABLE IF NOT EXISTS family_settings(
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS campaign_notifs INTEGER DEFAULT 1`);
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS tz TEXT DEFAULT 'America/Port-au-Prince'`);
     await pool.query(`ALTER TABLE notifications ADD COLUMN IF NOT EXISTS title TEXT DEFAULT ''`);
+    await pool.query(`ALTER TABLE notifications ADD COLUMN IF NOT EXISTS comment_id INTEGER`); // v2.31 : notifs mention/réponse → commentaire exact
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS bio TEXT DEFAULT ''`);
     await pool.query(`ALTER TABLE verification_requests ADD COLUMN IF NOT EXISTS reviewed_by TEXT DEFAULT ''`);
     await pool.query(`ALTER TABLE verification_requests ADD COLUMN IF NOT EXISTS review_reason TEXT DEFAULT ''`);
@@ -784,7 +809,10 @@ CREATE TABLE IF NOT EXISTS family_settings(
       user_a_id INTEGER NOT NULL, user_b_id INTEGER NOT NULL,
       status TEXT NOT NULL DEFAULT 'pending', score_a INTEGER NOT NULL DEFAULT 0,
       score_b INTEGER NOT NULL DEFAULT 0, winner_id INTEGER,
-      created_at BIGINT NOT NULL, starts_at BIGINT, ends_at BIGINT)`); // v1.60 : badges vérifiés demandables
+      created_at BIGINT NOT NULL, starts_at BIGINT, ends_at BIGINT)`);
+  } // FIX 2026-10-04 : le if (USE_PG) des migrations n'était jamais fermé — les routes
+  // ci-dessous (vérification, battles PK, appels, sons, transcription, insights) n'étaient
+  // enregistrées que sur Postgres (404 en SQLite local)
 // v1.63 : demande de badge vérifié — critères VidiGagne :
 // artiste, marque, entreprise, créateur, personnalité... doit prouver son identité
 // (pièce d'identité) + son activité (site web / marque représentée / liens).
@@ -1017,11 +1045,15 @@ app.post('/api/ads/impression', auth, async (req, res) => {
 app.get('/api/monetization/status', auth, async (req, res) => {
   try {
     const elig = await monetizationEligibility(req.userId);
-    const vids = await allRows(`SELECT id, description, views, likes, ad_impressions, ad_revenue_usd,
+    // FIX 2026-10-04 : pas de colonne videos.likes (les likes vivent dans la table likes) — comptés par vidéo
+    const vids = await allRows(`SELECT id, description, views, ad_impressions, ad_revenue_usd,
       monetized_views, demonetized, duration, created_at FROM videos
       WHERE user_id=? AND hidden=0 ORDER BY created_at DESC LIMIT 100`, req.userId);
     const vq = [];
-    for (const v of vids) vq.push({ ...v, quality: await videoQualityScore(v) });
+    for (const v of vids) {
+      const lc = await get1('SELECT COUNT(*) AS c FROM likes WHERE video_id=?', v.id);
+      vq.push({ ...v, likes: Number(lc.c) || 0, quality: await videoQualityScore(v) });
+    }
     const totalEarned = vq.reduce((s, v) => s + (Number(v.ad_revenue_usd) || 0), 0);
     const totalImp = vq.reduce((s, v) => s + (Number(v.ad_impressions) || 0), 0);
     res.json({ ...elig, total_earned_usd: +totalEarned.toFixed(4), total_impressions: totalImp, videos: vq });
@@ -1348,6 +1380,7 @@ app.get('/api/search/insights', async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 // v1.58 : recherche par image
+  if (USE_PG) { // FIX 2026-10-04 : ré-ouvert ici (voir fermeture au-dessus)
     await pool.query(`CREATE TABLE IF NOT EXISTS verification_requests(
       id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL UNIQUE, status TEXT NOT NULL DEFAULT 'pending',
       reason TEXT NOT NULL DEFAULT '', created_at BIGINT NOT NULL, reviewed_at BIGINT)`);
@@ -1359,6 +1392,8 @@ app.get('/api/search/insights', async (req, res) => {
     await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS users_google_uidx ON users(google_id)`);
     await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS users_phone_uidx ON users(phone)`);
     await pool.query(`CREATE TABLE IF NOT EXISTS oauth_sessions(session TEXT PRIMARY KEY, token TEXT NOT NULL, user_id INTEGER NOT NULL, created_at BIGINT NOT NULL)`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS password_resets(email TEXT NOT NULL, code TEXT NOT NULL, expires_at BIGINT NOT NULL, created_at BIGINT NOT NULL)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS password_resets_email_idx ON password_resets(email)`);
   } else {
     const cols = lite.prepare(`PRAGMA table_info(users)`).all().map(c => c.name);
     for (const c of ['email', 'google_id', 'phone']) {
@@ -1372,6 +1407,7 @@ app.get('/api/search/insights', async (req, res) => {
     if (!cols.includes('tz')) lite.exec(`ALTER TABLE users ADD COLUMN tz TEXT DEFAULT 'America/Port-au-Prince'`);
     const ncols = lite.prepare(`PRAGMA table_info(notifications)`).all().map(c => c.name);
     if (!ncols.includes('title')) lite.exec(`ALTER TABLE notifications ADD COLUMN title TEXT DEFAULT ''`);
+    if (!ncols.includes('comment_id')) lite.exec(`ALTER TABLE notifications ADD COLUMN comment_id INTEGER`); // v2.31
     // v1.57 : messages vocaux
     for (const t of ['messages', 'group_messages']) {
       const mc = lite.prepare(`PRAGMA table_info(${t})`).all().map(c => c.name);
@@ -1418,6 +1454,8 @@ app.get('/api/search/insights', async (req, res) => {
     lite.exec(`CREATE UNIQUE INDEX IF NOT EXISTS users_google_uidx ON users(google_id)`);
     lite.exec(`CREATE UNIQUE INDEX IF NOT EXISTS users_phone_uidx ON users(phone)`);
     lite.exec(`CREATE TABLE IF NOT EXISTS oauth_sessions(session TEXT PRIMARY KEY, token TEXT NOT NULL, user_id INTEGER NOT NULL, created_at BIGINT NOT NULL)`);
+    lite.exec(`CREATE TABLE IF NOT EXISTS password_resets(email TEXT NOT NULL, code TEXT NOT NULL, expires_at BIGINT NOT NULL, created_at BIGINT NOT NULL)`);
+    lite.exec(`CREATE INDEX IF NOT EXISTS password_resets_email_idx ON password_resets(email)`);
   }
   // backfill : code parrain unique pour les comptes existants qui n'en ont pas
   try {
@@ -1472,12 +1510,18 @@ app.get('/api/search/insights', async (req, res) => {
   // statut d'activité, mode restreint, préférences notifications, effets, lieux
   await mig('videos', 'duet_of', `INTEGER NOT NULL DEFAULT 0`);
   await mig('videos', 'stitch_of', `INTEGER NOT NULL DEFAULT 0`);
+  // FIX 2026-10-04 : colonnes réponse-vidéo manquantes côté SQLite (n'existaient que dans le chemin Postgres)
+  await mig('videos', 'reply_to_comment_id', `INTEGER NOT NULL DEFAULT 0`);
+  await mig('comments', 'video_reply_id', `INTEGER NOT NULL DEFAULT 0`);
   await mig('videos', 'allow_duet', `INTEGER NOT NULL DEFAULT 1`);
   await mig('videos', 'allow_stitch', `INTEGER NOT NULL DEFAULT 1`);
   await mig('videos', 'allow_download', `INTEGER NOT NULL DEFAULT 1`);
   await mig('videos', 'allow_comments', `INTEGER NOT NULL DEFAULT 1`);
   await mig('videos', 'location', `TEXT NOT NULL DEFAULT ''`);
   await mig('videos', 'effect', `TEXT NOT NULL DEFAULT ''`);
+  await mig('videos', 'sound_id', `INTEGER NOT NULL DEFAULT 0`);
+  await mig('effects', 'category', `TEXT NOT NULL DEFAULT ''`);
+  await mig('effects', 'css', `TEXT NOT NULL DEFAULT ''`);
   await mig('videos', 'is_private', `INTEGER NOT NULL DEFAULT 0`);
   // FIX 2026-10-04 (bot chain-profile-full) : la colonne users.is_private n'existait pas —
   // PATCH /api/auth/me {is_private} plantait (no such column) et le masquage privé ne marchait pas
@@ -1492,7 +1536,11 @@ app.get('/api/search/insights', async (req, res) => {
   await mig('users', 'notif_mentions', `INTEGER NOT NULL DEFAULT 1`);
   await mig('users', 'notif_lives', `INTEGER NOT NULL DEFAULT 1`);
   await mig('users', 'dm_privacy', `TEXT NOT NULL DEFAULT 'everyone'`);
-  await mig('users', 'comment_privacy', `TEXT NOT NULL DEFAULT 'everyone'`);
+  // PARITÉ TIKTOK 2026-10-04 : politiques duo/collage par compte + PIN mode restreint + flag sensible
+  await mig('users', 'duet_policy', `TEXT NOT NULL DEFAULT 'everyone'`);
+  await mig('users', 'stitch_policy', `TEXT NOT NULL DEFAULT 'everyone'`);
+  await mig('users', 'restricted_pin', `TEXT NOT NULL DEFAULT ''`);
+  await mig('videos', 'sensitive', `INTEGER NOT NULL DEFAULT 0`);  await mig('users', 'comment_privacy', `TEXT NOT NULL DEFAULT 'everyone'`);
   await mig('users', 'mention_privacy', `TEXT NOT NULL DEFAULT 'everyone'`);
   await mig('users', 'download_privacy', `TEXT NOT NULL DEFAULT 'everyone'`);
   await mig('users', 'liked_visibility', `TEXT NOT NULL DEFAULT 'me'`);
@@ -1524,6 +1572,9 @@ app.get('/api/search/insights', async (req, res) => {
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_drafts_user ON video_drafts(user_id)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_msgreq_to ON message_requests(to_user_id, status)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_effects_name ON effects(name)`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS effect_favs(
+      id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL, effect_id INTEGER NOT NULL,
+      created_at BIGINT NOT NULL, UNIQUE(user_id, effect_id))`);
   } else {
     lite.exec(`CREATE TABLE IF NOT EXISTS video_pins(
       id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, video_id INTEGER NOT NULL,
@@ -1546,6 +1597,9 @@ app.get('/api/search/insights', async (req, res) => {
     lite.exec(`CREATE TABLE IF NOT EXISTS effects(
       id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, icon_url TEXT NOT NULL DEFAULT '',
       use_count INTEGER NOT NULL DEFAULT 0, created_at BIGINT NOT NULL)`);
+    lite.exec(`CREATE TABLE IF NOT EXISTS effect_favs(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, effect_id INTEGER NOT NULL,
+      created_at BIGINT NOT NULL, UNIQUE(user_id, effect_id))`);
   }
   // Tables Q&A
   if (USE_PG) {
@@ -1803,7 +1857,7 @@ async function botReviewBadge(r) {
 async function botReviewKyc(v) {
   const fails = [];
   if (!/^[A-Z]{2}$/.test(String(v.country || ''))) fails.push('pays invalide');
-  if (!v.doc_front || !/^https?:\/\//.test(v.doc_front)) fails.push('photo du document manquante');
+  if (!v.doc_front) fails.push('photo du document manquante'); // FIX 2026-10-04 : sans Cloudinary, storeImage renvoie un nom de fichier local (pas une URL https) — c'est bien une photo stockée
   try {
     if (!kycAllowedDocs(String(v.country).toUpperCase()).includes(v.doc_type)) fails.push('document non accepté pour ce pays');
   } catch (_) { fails.push('type de document invalide'); }
@@ -2028,7 +2082,8 @@ async function optUserId(req) {
 // notifie un utilisateur (jamais soi-même)
 // v1.60 : sockets push instantané (userId -> ws)
 const pushSockets = new Map();
-async function notify(userId, type, actorId, videoId, text) {
+// v2.31 : commentId optionnel (notifs mention / réponse → commentaire exact)
+async function notify(userId, type, actorId, videoId, text, commentId) {
   try {
     if (!userId || Number(userId) === Number(actorId)) return;
     // v1.84 : vérifie les préférences de notification du destinataire
@@ -2040,8 +2095,8 @@ async function notify(userId, type, actorId, videoId, text) {
         if (col && Number(prefs[col]) === 0) return; // désactivé par l'utilisateur
       }
     } catch (_) {}
-    const id = await insertId('INSERT INTO notifications(user_id,type,actor_id,video_id,text,is_read,created_at) VALUES(?,?,?,?,?,0,?)',
-      userId, type, actorId || null, videoId || null, String(text || '').slice(0, 200), now());
+    const id = await insertId('INSERT INTO notifications(user_id,type,actor_id,video_id,comment_id,text,is_read,created_at) VALUES(?,?,?,?,?,?,0,?)',
+      userId, type, actorId || null, videoId || null, commentId || null, String(text || '').slice(0, 200), now());
     let actorName = '';
     try { if (actorId) { const a = await get1('SELECT username FROM users WHERE id=?', actorId); if (a) actorName = a.username; } } catch (_) {}
     // push instantané si le destinataire est connecté en WebSocket
@@ -2054,7 +2109,7 @@ async function notify(userId, type, actorId, videoId, text) {
     // v1.84 : tentative de push FCM (fonctionne même app fermée)
     try {
       const titles = { like: 'Nouveau J\u2019aime', comment: 'Nouveau commentaire', follow: 'Nouvel abonné',
-        mention: 'Mention', live: 'En direct', repost: 'Repost', default: 'VidiGagne' };
+        mention: 'Mention', live: 'En direct', repost: 'Repost', gift: '🎁 Cadeau reçu', default: 'VidiGagne' };
       const title = (actorName ? actorName + ' — ' : '') + (titles[type] || titles.default);
       sendFcmPush(userId, title, String(text || '').slice(0, 200),
         { type, notif_id: String(id), actor: actorName }).catch(() => {});
@@ -2181,7 +2236,7 @@ async function videoJSON(v, meId) {
   const mediaUrl = seriesLocked ? null : fileUrl(v.file);
   const mediaPhotos = seriesLocked ? [] : photos;
   return {
-    id: v.id, desc: v.description, tags: v.tags, sound: v.sound || '', duration: Number(v.duration) || 0,
+    id: v.id, desc: v.description, tags: v.tags, sound: v.sound || '', sound_id: Number(v.sound_id) || 0, duration: Number(v.duration) || 0,
     url: mediaUrl, visibility: v.visibility || 'public', subscribed,
     media_type: v.media_type || 'video', photos: mediaPhotos, captions,
     target_countries: v.target_countries || '[]',
@@ -2300,6 +2355,53 @@ app.get('/api/auth/me', auth, async (req, res) => {
 app.post('/api/auth/logout', auth, async (req, res) => {
   try {
     await runSql('DELETE FROM tokens WHERE token=?', req.token);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+
+// ---------- mot de passe oublié : code e-mail à 6 chiffres (10 min) ----------
+const _forgotAttempts = new Map();
+function forgotRateLimited(email) {
+  const k = 'fg|' + email, t = Date.now();
+  let a = _forgotAttempts.get(k) || [];
+  a = a.filter(x => t - x < 15 * 60 * 1000);
+  if (a.length >= 5) return true;
+  a.push(t); _forgotAttempts.set(k, a);
+  if (_forgotAttempts.size > 5000) _forgotAttempts.clear();
+  return false;
+}
+app.post('/api/auth/forgot-password', async (req, res) => {
+  try {
+    const email = String((req.body || {}).email || '').trim().toLowerCase();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))
+      return res.status(400).json({ error: 'e-mail invalide' });
+    if (forgotRateLimited(email))
+      return res.status(429).json({ error: 'trop de tentatives, réessaie dans 15 minutes' });
+    const u = await get1('SELECT id FROM users WHERE email=?', email);
+    if (u) {
+      const code = String(Math.floor(100000 + Math.random() * 900000));
+      await runSql('DELETE FROM password_resets WHERE email=?', email);
+      await runSql('INSERT INTO password_resets(email,code,expires_at,created_at) VALUES(?,?,?,?)',
+        email, code, now() + 10 * 60 * 1000, now());
+    }
+    // message générique dans tous les cas (anti-énumération de comptes)
+    res.json({ ok: true, message: 'Si un compte existe avec cet e-mail, un code vient d\u2019être envoyé.' });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.post('/api/auth/reset-password', async (req, res) => {
+  try {
+    const email = String((req.body || {}).email || '').trim().toLowerCase();
+    const code = String((req.body || {}).code || '').trim();
+    const np = String((req.body || {}).new_password || '');
+    if (np.length < 8) return res.status(400).json({ error: 'mot de passe : 8 caractères minimum' });
+    const row = await get1('SELECT * FROM password_resets WHERE email=? AND code=?', email, code);
+    if (!row || Number(row.expires_at) < now())
+      return res.status(400).json({ error: 'code invalide ou expiré' });
+    const u = await get1('SELECT id FROM users WHERE email=?', email);
+    if (!u) return res.status(400).json({ error: 'code invalide ou expiré' });
+    const salt = crypto.randomBytes(16).toString('hex');
+    await runSql('UPDATE users SET pass_hash=?, pass_salt=? WHERE id=?', hashPass(np, salt), salt, u.id);
+    await runSql('DELETE FROM password_resets WHERE email=?', email);
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
@@ -2469,9 +2571,11 @@ app.patch('/api/auth/me', auth, async (req, res) => {
   // FIX 2026-10-04 (rupture #2): avatar accepte les data URLs (photo galerie) jusqu'à 3 Mo, pas juste 8 caractères
   const _avatar = avatar ? String(avatar).slice(0, 3 * 1024 * 1024) : null;
   await runSql('UPDATE users SET name=COALESCE(?,name), avatar=COALESCE(?,avatar), bio=COALESCE(?,bio), first_name=COALESCE(?,first_name), last_name=COALESCE(?,last_name), birthdate=COALESCE(?,birthdate), gender=COALESCE(?,gender), country=COALESCE(?,country) WHERE id=?',
-    name ? String(name).slice(0, 40) : null,
+    name !== undefined && name !== null ? String(name).slice(0, 40) : null,
     _avatar,
-    bio ? String(bio).slice(0, 150) : null,
+    // FIX 2026-10-04 (bot chain-bio-pseudo) : une bio envoyée vide ('') doit EFFACER
+    // la bio (avant : '' → null → COALESCE gardait l'ancienne → divergence local/serveur)
+    bio !== undefined && bio !== null ? String(bio).slice(0, 150) : null,
     first_name !== undefined ? String(first_name).trim().slice(0, 40) : null,
     last_name !== undefined ? String(last_name).trim().slice(0, 40) : null,
     /^\d{4}-\d{2}-\d{2}$/.test(birthdate || '') ? birthdate : null,
@@ -2665,13 +2769,29 @@ app.post('/api/videos', auth, upload.single('video'), async (req, res) => {
     let ttsRate = Number(b.tts_rate) || 1;
     if (ttsRate < 0.5) ttsRate = 0.5;
     if (ttsRate > 2) ttsRate = 2;
-    const _tc = Array.isArray(b.target_countries) ? b.target_countries.filter(x => /^[A-Z]{2}$/.test(String(x))).slice(0, 1) : [];
+    // FIX 2026-10-04 : l'app envoie target_countries en chaîne JSON via multipart (pas un tableau)
+    let _tcRaw = b.target_countries;
+    if (typeof _tcRaw === 'string') { try { _tcRaw = JSON.parse(_tcRaw); } catch (_) { _tcRaw = []; } }
+    const _tc = Array.isArray(_tcRaw) ? _tcRaw.filter(x => /^[A-Z]{2}$/.test(String(x))).slice(0, 1) : [];
     const _tcJson = JSON.stringify(_tc);
+    // FIX 2026-10-04 : stitch_of envoyé par l'app (collage) — validé contre allow_stitch de l'original
+    let _stitchOf = Math.floor(Number(b.stitch_of)) || 0;
+    if (_stitchOf) { const _so = await get1('SELECT allow_stitch FROM videos WHERE id=?', _stitchOf); if (!_so || !Number(_so.allow_stitch)) _stitchOf = 0; }
+    // FIX 2026-10-04 (parité TikTok) : l'app envoie sound='srv:<id>' quand le son vient
+    // du catalogue serveur — on résout le titre + on stocke sound_id pour que la page
+    // du son liste la vidéo et que le disque 💿 du feed ouvre la vraie page du son.
+    let _sndVal = String(b.sound || '').slice(0, 120), _sndId = 0;
+    const _sm = _sndVal.match(/^srv:(\d+)$/);
+    if (_sm) {
+      const _s = await get1('SELECT id,title FROM sounds WHERE id=?', Number(_sm[1]));
+      if (_s) { _sndId = _s.id; _sndVal = String(_s.title).slice(0, 120); } else _sndVal = '';
+    }
+    const _effVal = String(b.effect || '').slice(0, 80);
     const id = await insertId(
-      'INSERT INTO videos(user_id,file,description,tags,sound,duration,scheduled_at,visibility,captions,is_replay,live_id,tts_text,tts_voice,tts_rate,target_countries,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+      'INSERT INTO videos(user_id,file,description,tags,sound,sound_id,effect,duration,scheduled_at,visibility,captions,is_replay,live_id,tts_text,tts_voice,tts_rate,target_countries,stitch_of,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
       req.userId, fname, descText, String(b.tags || '').slice(0, 300),
-      String(b.sound || '').slice(0, 120), duration, scheduledAt, visibility, captions,
-      isReplay, liveId, ttsText, ttsVoice, ttsRate, _tcJson, now());
+      _sndVal, _sndId, _effVal, duration, scheduledAt, visibility, captions,
+      isReplay, liveId, ttsText, ttsVoice, ttsRate, _tcJson, _stitchOf, now());
     if (_bannedRemoved.length) {
       try { await notify(req.userId, 'system', null, null,
         '🤖 Hashtags supprimés : ' + _bannedRemoved.join(' ') + ' (plateformes concurrentes interdites)'); } catch (_) {}
@@ -2745,7 +2865,9 @@ app.post('/api/stories', auth, uploadStory.fields([{ name: 'video', maxCount: 1 
     if (!file) return res.status(400).json({ error: 'aucune vidéo/image reçue' });
     if (!(await checkQuota(req.userId, file.size || 0)))
       return res.status(413).json({ error: 'quota de stockage atteint (2 Go)' });
-    const fname = await storeVideo(file);
+    // v2.35 FIX : les stories image étaient rejetées par storeVideo (contenu non vidéo)
+    const isImg = /^image\//.test(file.mimetype || '');
+    const fname = isImg ? await storeImage(file, 'vidigagne/stories') : await storeVideo(file);
     const t = now();
     const privacy = ['public', 'friends'].includes(String(req.body.privacy)) ? String(req.body.privacy) : 'public';
     const text = String(req.body.text || '').slice(0, 200);
@@ -2803,7 +2925,7 @@ app.post('/api/gifts', auth, async (req, res) => {
     await applyGiftSplit(req.userId, dest.id, g.cost, g.id, null);
     await runSql('INSERT INTO gifts(from_id,to_id,video_id,gift,cost,created_at) VALUES(?,?,?,?,?,?)',
       req.userId, dest.id, video_id || null, g.id, g.cost, now());
-    await notify(dest.id, 'gift', req.userId, video_id || null, g.id);
+    await notify(dest.id, 'gift', req.userId, video_id || null, g.emoji + ' ' + g.name + ' (+' + g.cost + ')'); // v2.31 : montant inclus
     const balG = await get1('SELECT coins FROM users WHERE id=?', req.userId);
     res.json({ ok: true, coins: balG ? balG.coins : 0 });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
@@ -2838,6 +2960,54 @@ app.post('/api/playlists/:id/items', auth, async (req, res) => {
       pl.id, +(req.body || {}).video_id, Number((mx && mx.m) || 0) + 1);
   } catch (e) {}
   res.json({ ok: true });
+});
+// v2.35 : gestion des playlists (renommer / supprimer / retirer une vidéo / réordonner)
+app.patch('/api/playlists/:id', auth, async (req, res) => {
+  const pl = await get1('SELECT * FROM playlists WHERE id=? AND user_id=?', req.params.id, req.userId);
+  if (!pl) return res.status(404).json({ error: 'introuvable' });
+  const name = String((req.body || {}).name || '').trim().slice(0, 60);
+  if (!name) return res.status(400).json({ error: 'nom requis' });
+  await runSql('UPDATE playlists SET name=? WHERE id=?', name, pl.id);
+  res.json({ ok: true });
+});
+app.delete('/api/playlists/:id', auth, async (req, res) => {
+  const pl = await get1('SELECT * FROM playlists WHERE id=? AND user_id=?', req.params.id, req.userId);
+  if (!pl) return res.status(404).json({ error: 'introuvable' });
+  await runSql('DELETE FROM playlist_items WHERE playlist_id=?', pl.id);
+  await runSql('DELETE FROM playlists WHERE id=?', pl.id);
+  res.json({ ok: true });
+});
+app.delete('/api/playlists/:id/items/:video_id', auth, async (req, res) => {
+  const pl = await get1('SELECT * FROM playlists WHERE id=? AND user_id=?', req.params.id, req.userId);
+  if (!pl) return res.status(404).json({ error: 'introuvable' });
+  const it = await get1('SELECT pos FROM playlist_items WHERE playlist_id=? AND video_id=?', pl.id, req.params.video_id);
+  if (!it) return res.status(404).json({ error: 'vidéo absente' });
+  await runSql('DELETE FROM playlist_items WHERE playlist_id=? AND video_id=?', pl.id, req.params.video_id);
+  await runSql('UPDATE playlist_items SET pos=pos-1 WHERE playlist_id=? AND pos>?', pl.id, it.pos);
+  res.json({ ok: true });
+});
+app.post('/api/playlists/:id/reorder', auth, async (req, res) => {
+  const pl = await get1('SELECT * FROM playlists WHERE id=? AND user_id=?', req.params.id, req.userId);
+  if (!pl) return res.status(404).json({ error: 'introuvable' });
+  const order = (req.body || {}).order;
+  if (!Array.isArray(order) || !order.length) return res.status(400).json({ error: 'ordre requis' });
+  let pos = 1;
+  for (const vid of order) {
+    await runSql('UPDATE playlist_items SET pos=? WHERE playlist_id=? AND video_id=?', pos++, pl.id, Number(vid));
+  }
+  res.json({ ok: true });
+});
+// v2.35 : playlists publiques d'un utilisateur (profil créateur)
+app.get('/api/users/:username/playlists', async (req, res) => {
+  const u = await get1('SELECT * FROM users WHERE username=?', String(req.params.username).toLowerCase());
+  if (!u) return res.status(404).json({ error: 'utilisateur introuvable' });
+  const pls = await allRows('SELECT * FROM playlists WHERE user_id=? ORDER BY created_at DESC', u.id);
+  const out = [];
+  for (const pl of pls) {
+    const c = await get1('SELECT COUNT(*) AS n FROM playlist_items WHERE playlist_id=?', pl.id);
+    out.push({ id: pl.id, name: pl.name, count: Number((c && c.n) || 0), created_at: Number(pl.created_at) });
+  }
+  res.json({ playlists: out });
 });
 // ---------- hashtags / tendances ----------
 function extractTags(text) {
@@ -2887,8 +3057,31 @@ app.post('/api/comments/:id/pin', auth, async (req, res) => {
     const v = await get1('SELECT * FROM videos WHERE id=?', c.video_id);
     if (!v || Number(v.user_id) !== Number(req.userId))
       return res.status(403).json({ error: 'réservé au créateur' });
+    // parité TikTok : bascule épingler/désépingler, un seul épinglé par vidéo
+    if (Number(c.pinned)) {
+      await runSql('UPDATE comments SET pinned=0 WHERE id=?', c.id);
+      return res.json({ ok: true, pinned: false });
+    }
     await runSql('UPDATE comments SET pinned=0 WHERE video_id=?', c.video_id);
     await runSql('UPDATE comments SET pinned=1 WHERE id=?', c.id);
+    res.json({ ok: true, pinned: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// parité TikTok : supprimer un commentaire (son auteur ou le créateur de la vidéo)
+app.delete('/api/comments/:id', auth, async (req, res) => {
+  try {
+    const c = await get1('SELECT * FROM comments WHERE id=?', req.params.id);
+    if (!c) return res.status(404).json({ error: 'introuvable' });
+    const v = await get1('SELECT user_id FROM videos WHERE id=?', c.video_id);
+    const isAuthor = Number(c.user_id) === Number(req.userId);
+    const isOwner = v && Number(v.user_id) === Number(req.userId);
+    if (!isAuthor && !isOwner) return res.status(403).json({ error: 'non autorisé' });
+    // supprime les réponses (et leurs likes) puis le commentaire
+    const kids = await allRows('SELECT id FROM comments WHERE reply_to=?', c.id);
+    for (const k of kids) await runSql('DELETE FROM comment_likes WHERE comment_id=?', k.id);
+    await runSql('DELETE FROM comments WHERE reply_to=?', c.id);
+    await runSql('DELETE FROM comment_likes WHERE comment_id=?', c.id);
+    await runSql('DELETE FROM comments WHERE id=?', c.id);
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
@@ -3783,6 +3976,10 @@ app.get('/api/feed', async (req, res) => {
     if (m) { const t = await get1('SELECT user_id FROM tokens WHERE token=?', m[1]); if (t) meId = t.user_id; }
     const mode = req.query.mode === 'following' && meId ? 'following' : 'foryou';
     let rows;
+    // FIX 2026-10-04 (bot chain-profile-stats) : `restricted` n'était défini que dans
+    // scoreForYou → ReferenceError → /api/feed renvoyait 500 systématiquement
+    let restricted = false;
+    if (meId) { try { const mu = await get1('SELECT restricted_mode FROM users WHERE id=?', meId); restricted = !!(mu && Number(mu.restricted_mode) === 1); } catch (e) {} }
     // les vidéos programmées (scheduled_at futur), masquées (modération) ou "pas intéressé" sont exclues ;
     // les vidéos d'utilisateurs bloqués (dans les deux sens) aussi
     const blockFilter = alias => ` AND NOT EXISTS (SELECT 1 FROM blocks b WHERE (b.user_id=? AND b.blocked_id=${alias}.user_id) OR (b.user_id=${alias}.user_id AND b.blocked_id=?))`;
@@ -3796,8 +3993,30 @@ app.get('/api/feed', async (req, res) => {
       params.push(meId, meId);
       const vf = visFilter('v', meId);
       sql += vf.clause; params.push(...vf.params);
+      // PARITÉ TIKTOK 2026-10-04 : mode restreint → le contenu sensible est filtré du feed
+      if (restricted) { sql += ' AND v.sensitive=0'; }
       sql += ' ORDER BY v.created_at DESC LIMIT 50';
       rows = await allRows(sql, ...params);
+      // v2.35 : les reposts des comptes suivis apparaissent dans le fil « Suivis » (avec attribution)
+      try {
+        const rp = ['SELECT v.*, r.user_id AS reposter_id, r.created_at AS reposted_at FROM reposts r',
+          'JOIN videos v ON v.id=r.video_id JOIN follows f ON f.followed_id=r.user_id',
+          'WHERE f.follower_id=? AND (v.scheduled_at IS NULL OR v.scheduled_at <= ?) AND v.hidden=0',
+          'AND NOT EXISTS (SELECT 1 FROM hidden_videos hv WHERE hv.user_id=? AND hv.video_id=v.id)'];
+        const rpar = [meId, now(), meId];
+        rp.push(blockFilter('v')); rpar.push(meId, meId);
+        rp.push(blockFilter('r')); rpar.push(meId, meId);
+        const rvf = visFilter('v', meId); rp.push(rvf.clause); rpar.push(...rvf.params);
+        if (restricted) { rp.push('AND v.sensitive=0'); }
+        rp.push('ORDER BY r.created_at DESC LIMIT 50');
+        const rpRows = await allRows(rp.join(' '), ...rpar);
+        if (rpRows.length) {
+          const seen = new Set(rows.map(x => x.id));
+          for (const r of rpRows) if (!seen.has(r.id)) { seen.add(r.id); rows.push(r); }
+          rows.sort((a, b) => Number(b.reposted_at || b.created_at) - Number(a.reposted_at || a.created_at));
+          rows = rows.slice(0, 60);
+        }
+      } catch (e) { /* le fil suivi reste disponible même si l'injection reposts échoue */ }
     } else {
       let sql = 'SELECT * FROM videos WHERE (scheduled_at IS NULL OR scheduled_at <= ?) AND hidden=0';
       const params = [now()];
@@ -3809,6 +4028,8 @@ app.get('/api/feed', async (req, res) => {
       }
       const vf = visFilter('videos', meId);
       sql += vf.clause; params.push(...vf.params);
+      // PARITÉ TIKTOK 2026-10-04 : mode restreint → le contenu sensible est filtré du feed
+      if (restricted) { sql += ' AND videos.sensitive=0'; }
       if (meId) {
         // v12 : utilisateurs connectés → score personnalisé « Pour toi »
         sql += ' ORDER BY created_at DESC LIMIT 200';
@@ -3819,7 +4040,16 @@ app.get('/api/feed', async (req, res) => {
       }
     }
     const videos = [];
-    for (const v of rows) { const j = await videoJSON(v, meId); if (j) videos.push(j); }
+    for (const v of rows) {
+      const j = await videoJSON(v, meId);
+      if (!j) continue;
+      // v2.35 : attribution du repost (fil « Suivis »)
+      if (v.reposter_id && Number(v.reposter_id) !== Number(meId)) {
+        const ru = await get1('SELECT id, username, name FROM users WHERE id=?', v.reposter_id);
+        if (ru) j.reposted_by = { id: ru.id, username: ru.username, name: ru.name };
+      }
+      videos.push(j);
+    }
     res.json({ mode, videos });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
@@ -3866,6 +4096,31 @@ app.get('/api/videos/:id/stats', auth, async (req, res) => {
       'SELECT COUNT(*) AS c FROM follows WHERE followed_id=? AND created_at>=?', v.user_id, Number(v.created_at))).c || 0;
     res.json({ stats: { views, likes, comments, shares, watch_events: watchN,
       avg_watch_s: avgWatchS, completion_pct: completionPct, per_day: perDay, new_follows: newFollows } });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// PARITÉ TIKTOK 2026-10-04 : format attendu par openVideoAnalytics() côté app
+app.get('/api/videos/:id/analytics', auth, async (req, res) => {
+  try {
+    const vid = Number(req.params.id);
+    const v = await get1('SELECT * FROM videos WHERE id=?', vid);
+    if (!v) return res.status(404).json({ error: 'vidéo introuvable' });
+    if (Number(v.user_id) !== Number(req.userId))
+      return res.status(403).json({ error: 'réservé au créateur' });
+    const views = (await get1('SELECT COUNT(*) AS c FROM video_views WHERE video_id=?', vid)).c || 0;
+    const likes = (await get1('SELECT COUNT(*) AS c FROM likes WHERE video_id=?', vid)).c || 0;
+    const comments = (await get1('SELECT COUNT(*) AS c FROM comments WHERE video_id=?', vid)).c || 0;
+    const shares = Number(v.shares) || 0;
+    const w = await get1('SELECT AVG(watch_ms) AS avg_ms FROM watch_events WHERE video_id=?', vid);
+    const avgS = Math.round((Number((w && w.avg_ms) || 0)) / 1000);
+    const avg_watch = avgS >= 60 ? Math.floor(avgS / 60) + 'm ' + (avgS % 60) + 's' : avgS + ' s';
+    let top_country = '—';
+    try {
+      const tc = await get1(`SELECT UPPER(u.country) AS c, COUNT(*) AS n FROM video_views vv
+        JOIN users u ON u.id=vv.viewer_id WHERE vv.video_id=? AND u.country IS NOT NULL AND u.country<>''
+        GROUP BY c ORDER BY n DESC LIMIT 1`, vid);
+      if (tc && tc.c) top_country = tc.c;
+    } catch (e) {}
+    res.json({ views, likes, comments, shares, avg_watch, top_country });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 app.get('/api/videos/:id', async (req, res) => {
@@ -4023,6 +4278,26 @@ app.delete('/api/videos/:id/like', auth, async (req, res) => {
   res.json({ likes, liked: false });
 });
 
+// v2.36 : compteurs partages / téléchargements d'une vidéo (incrémentés par l'app au partage/téléchargement)
+app.post('/api/videos/:id/share', auth, async (req, res) => {
+  try {
+    const v = await get1('SELECT * FROM videos WHERE id=?', req.params.id);
+    if (!v) return res.status(404).json({ error: 'vidéo introuvable' });
+    await runSql('UPDATE videos SET shares=COALESCE(shares,0)+1 WHERE id=?', v.id);
+    const vj = await get1('SELECT shares FROM videos WHERE id=?', v.id);
+    res.json({ ok: true, shares: Number(vj.shares) || 0 });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.post('/api/videos/:id/download', auth, async (req, res) => {
+  try {
+    const v = await get1('SELECT * FROM videos WHERE id=?', req.params.id);
+    if (!v) return res.status(404).json({ error: 'vidéo introuvable' });
+    await runSql('UPDATE videos SET downloads=COALESCE(downloads,0)+1 WHERE id=?', v.id);
+    const vj = await get1('SELECT downloads FROM videos WHERE id=?', v.id);
+    res.json({ ok: true, downloads: Number(vj.downloads) || 0 });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+
 // v1.68 : filtre anti-gros mots AUTOMATIQUE (pas seulement le mode protection)
 const BADWORDS_FR = ['merde','putain','salope','connard','connasse','encul','bite','couille','nique','fdp','tg','pd','salop','batard','bâtard','chiant','conard','débile','attardé','mongol'];
 const BADWORDS_EN = ['fuck','shit','bitch','asshole','dick','pussy','whore','slut','bastard','dumbass','retard','nigga','nigger','fag'];
@@ -4043,6 +4318,24 @@ function maskBadwords(text) {
   }
   return out;
 }
+// parité TikTok (2026-10-04) : filtre anti-spam des commentaires — liens + répétitions
+// Retourne la raison du blocage, ou null si le texte est acceptable.
+function commentSpamReason(text) {
+  const t = String(text || '');
+  if (/(https?:\/\/|www\.)/i.test(t)) return 'les liens sont interdits dans les commentaires';
+  if (/(.)\1{5,}/.test(t)) return 'caractères répétés détectés';
+  const words = t.toLowerCase().split(/\s+/).filter(Boolean);
+  let run = 1;
+  for (let i = 1; i < words.length; i++) {
+    if (words[i] === words[i - 1]) { run++; if (run >= 4) return 'répétitions détectées'; }
+    else run = 1;
+  }
+  if (t.length >= 30) {
+    const uniq = new Set(t.toLowerCase().replace(/\s/g, '').split(''));
+    if (uniq.size <= 3) return 'texte répétitif détecté';
+  }
+  return null;
+}
 // ---------- commentaires ----------
 app.get('/api/videos/:id/comments', async (req, res) => {
   const rows = await allRows(
@@ -4062,6 +4355,15 @@ app.get('/api/videos/:id/comments', async (req, res) => {
   const filtered = kws.length
     ? rows.filter(c => !kws.some(k => String(c.text || '').toLowerCase().includes(k)))
     : rows;
+  // parité TikTok : état "aimé" du lecteur connecté sur chaque commentaire
+  try {
+    const meId = await optUserId(req);
+    if (meId) {
+      const lr = await allRows('SELECT comment_id FROM comment_likes WHERE user_id=?', meId);
+      const ls = new Set(lr.map(r => Number(r.comment_id)));
+      filtered.forEach(c => { c.liked = ls.has(Number(c.id)) ? 1 : 0; });
+    } else filtered.forEach(c => { c.liked = 0; });
+  } catch (e) { filtered.forEach(c => { c.liked = 0; }); }
   res.json({ comments: filtered });
 });
 
@@ -4075,11 +4377,31 @@ app.post('/api/videos/:id/comments', auth, uploadMedia.fields([{name:'video',max
     if (!text&&!hasAudio&&!hasVideo) return res.status(400).json({ error: 'commentaire vide' });
     const v = await get1('SELECT * FROM videos WHERE id=?', req.params.id);
     if (!v) return res.status(404).json({ error: 'vidéo introuvable' });
-    // v12 : filtres de commentaires du propriétaire (insensible à la casse)
-    const owner = await get1('SELECT comment_keywords FROM users WHERE id=?', v.user_id);
+    if (Number(v.allow_comments) === 0)
+      return res.status(403).json({ error: 'commentaires désactivés sur cette vidéo' });
+    // parité TikTok : "Qui peut commenter" du créateur (everyone/followers/friends/nobody)
+    const owner = await get1('SELECT comment_keywords, comment_privacy FROM users WHERE id=?', v.user_id);
+    const cpol = (owner && owner.comment_privacy) || 'everyone';
+    if (Number(v.user_id) !== Number(req.userId)) {
+      if (cpol === 'nobody')
+        return res.status(403).json({ error: 'l\'auteur a désactivé les commentaires' });
+      if (cpol === 'followers') {
+        const f = await get1('SELECT 1 FROM follows WHERE follower_id=? AND followed_id=?', req.userId, v.user_id);
+        if (!f) return res.status(403).json({ error: 'commentaires réservés aux abonnés' });
+      }
+      if (cpol === 'friends') {
+        const f1 = await get1('SELECT 1 FROM follows WHERE follower_id=? AND followed_id=?', req.userId, v.user_id);
+        const f2 = await get1('SELECT 1 FROM follows WHERE follower_id=? AND followed_id=?', v.user_id, req.userId);
+        if (!f1 || !f2) return res.status(403).json({ error: 'commentaires réservés aux amis' });
+      }
+    }
+    // filtre anti-spam (liens, répétitions)
+    const spamR = commentSpamReason(text);
+    if (spamR) return res.status(400).json({ error: 'spam : ' + spamR });
+    // v12 : mots muets du propriétaire — le commentaire est accepté mais masqué à la lecture
+    // (retirer le mot le rend visible à nouveau)
     const kws = parseKeywords(owner && owner.comment_keywords);
-    if (kws.length && kws.some(k => text.toLowerCase().includes(k)))
-      return res.status(400).json({ error: 'comment_blocked' });
+    const kwHidden = kws.length > 0 && kws.some(k => text.toLowerCase().includes(k));
     // réponse vidéo optionnelle (même stockage que l'upload de vidéo)
     let videoUrl = null;
     if (hasVideo) videoUrl = fileUrl(await storeVideo(req.files.video[0]));
@@ -4104,17 +4426,17 @@ app.post('/api/videos/:id/comments', auth, uploadMedia.fields([{name:'video',max
     const c = await get1(
       `SELECT c.*, u.username, u.name, u.avatar FROM comments c
        JOIN users u ON u.id=c.user_id WHERE c.id=?`, id);
-    await notify(v.user_id, 'comment', req.userId, v.id, text.slice(0, 100));
+    await notify(v.user_id, 'comment', req.userId, v.id, text.slice(0, 100), id); // v2.31 : comment_id → ouvre le commentaire exact
     // FIX 2026-10-04 (rupture #5): notifier l'auteur du commentaire parent en cas de réponse
     if (replyTo) {
       try {
         const parentC = await get1('SELECT user_id FROM comments WHERE id=?', replyTo);
         if (parentC && Number(parentC.user_id) !== Number(req.userId) && Number(parentC.user_id) !== Number(v.user_id))
-          await notify(parentC.user_id, 'reply', req.userId, v.id, text.slice(0, 100));
+          await notify(parentC.user_id, 'reply', req.userId, v.id, text.slice(0, 100), id); // v2.31 : id de la réponse → ouvre le fil
       } catch (_) {}
     }
-    notifyMentions(text, req.userId, v.id); // v1.84 : notifie les @mentionnés
-    res.json({ comment: c });
+    notifyMentions(text, req.userId, v.id, id); // v1.84 : notifie les @mentionnés
+    res.json({ comment: c, filtered: !!kwHidden });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 
@@ -4387,7 +4709,8 @@ app.get('/api/notifications', auth, async (req, res) => {
       const actor = n.actor_id ? await get1('SELECT * FROM users WHERE id=?', n.actor_id) : null;
       const vid = n.video_id ? await get1('SELECT * FROM videos WHERE id=?', n.video_id) : null;
       out.push({
-        id: n.id, type: n.type, text: n.text || '', is_read: !!n.is_read,
+        id: n.id, type: n.type, text: n.text || '', title: n.title || '', is_read: !!n.is_read,
+        comment_id: n.comment_id || null, // v2.31 : ouvre le commentaire exact (mention / réponse)
         created_at: Number(n.created_at),
         actor: actor ? pubUser(actor) : null,
         video: vid ? { id: vid.id, thumb: fileUrl(vid.file) } : null,
@@ -4442,6 +4765,27 @@ app.get('/api/notifications/unread-count', auth, async (req, res) => {
   try {
     const c = await get1('SELECT COUNT(*) AS c FROM notifications WHERE user_id=? AND is_read=0', req.userId);
     res.json({ unread: Number(c.c) });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// v2.31 : annonce admin → notification 'system' pour TOUS les utilisateurs (insert direct : pas de FCM de masse, pas de filtre prefs)
+app.post('/api/admin/announce', async (req, res) => {
+  try {
+    const t = req.headers['x-admin-token'];
+    if (!process.env.ADMIN_TOKEN || t !== process.env.ADMIN_TOKEN) return res.status(403).json({ error: 'non autorisé' });
+    const title = String((req.body || {}).title || '').slice(0, 100);
+    const text = String((req.body || {}).text || '').slice(0, 200);
+    if (!text) return res.status(400).json({ error: 'texte requis' });
+    const users = await allRows('SELECT id FROM users');
+    const ts = now();
+    let n = 0;
+    for (const u of users) {
+      try {
+        await insertId('INSERT INTO notifications(user_id,type,actor_id,video_id,comment_id,title,text,is_read,created_at) VALUES(?,?,NULL,NULL,NULL,?,?,0,?)',
+          u.id, 'system', title, text, ts);
+        n++;
+      } catch (_) {}
+    }
+    res.json({ ok: true, sent: n });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 
@@ -4609,7 +4953,7 @@ app.post('/api/comments/:id/video-reply', auth, upload.single('video'), async (r
       return res.status(403).json({ error: 'seul le créateur peut répondre en vidéo' });
     if (!req.file) return res.status(400).json({ error: 'vidéo requise' });
     // upload via le même pipeline que /api/videos (simplifié : stocke et crée la vidéo)
-    const fname = 'vidigagne/videos/' + Date.now() + '_' + Math.random().toString(36).slice(2, 8) + '.mp4';
+    const fname = 'v' + Date.now() + '_' + Math.random().toString(36).slice(2, 8) + '.mp4';
     let fileUrl = '';
     if (USE_CLOUDINARY && cloudinary) {
       const up = await new Promise((resolve, reject) => {
@@ -4619,7 +4963,7 @@ app.post('/api/comments/:id/video-reply', auth, upload.single('video'), async (r
         st.end(req.file.buffer);
       });
       fileUrl = up.secure_url;
-    } else { fileUrl = fname; }
+    } else { fs.renameSync(req.file.path, path.join(UP, fname)); fileUrl = fname; }
     const descText = '🎬 Réponse à @' + (c.username || 'commentaire');
     const vid = await insertId(
       `INSERT INTO videos(user_id,file,description,visibility,reply_to_comment_id,created_at)
@@ -5726,7 +6070,7 @@ app.post('/api/live/:id/gift', auth, async (req, res) => {
     await runSql('INSERT INTO gifts(from_id,to_id,video_id,live_id,gift,cost,created_at) VALUES(?,?,?,?,?,?,?)',
       req.userId, toUserId, null, l.id, g.id, g.cost, now());
     await runSql('UPDATE lives SET gifts_total=COALESCE(gifts_total,0)+? WHERE id=?', split.creatorShare, l.id).catch(() => {});
-    await notify(toUserId, 'gift', req.userId, null, g.id);
+    await notify(toUserId, 'gift', req.userId, null, g.emoji + ' ' + g.name + ' (+' + g.cost + ')'); // v2.31 : montant inclus
     res.json({ ok: true, coins: me.coins - g.cost, to_user_id: toUserId });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
@@ -6163,6 +6507,11 @@ app.get('/api/shop/categories', async (req, res) => {
 });
 
 // ---------- boutique : devenir vendeur / profil vendeur ----------
+app.get('/api/shop/seller', auth, async (req, res) => {
+  const u = await get1('SELECT seller_name, seller_bio, seller_verified FROM users WHERE id=?', req.userId);
+  if (!u || !u.seller_name) return res.status(404).json({ error: 'pas encore vendeur' });
+  res.json({ seller: { name: u.seller_name, bio: u.seller_bio || '', verified: !!u.seller_verified } });
+});
 app.post('/api/shop/seller', auth, async (req, res) => {
   const name = String((req.body || {}).name || '').trim().slice(0, 60);
   const bio = String((req.body || {}).bio || '').trim().slice(0, 200);
@@ -7123,11 +7472,75 @@ app.get('/api/users/:username/pinned', async (req, res) => {
 });
 
 // ---------- duos et collages ----------
+// PARITÉ TIKTOK 2026-10-04 : politique par compte (everyone/friends/none) en plus du flag par vidéo
+async function areFriends(a, b) {
+  if (!a || !b || Number(a) === Number(b)) return true;
+  const x = await get1('SELECT 1 FROM follows WHERE follower_id=? AND followed_id=?', a, b);
+  const y = await get1('SELECT 1 FROM follows WHERE follower_id=? AND followed_id=?', b, a);
+  return !!(x && y);
+}
+async function checkReusePolicy(meId, ownerId, kind) {
+  // kind: 'duet' | 'stitch' → true si autorisé
+  if (Number(meId) === Number(ownerId)) return true;
+  let u = null;
+  try { u = await get1(`SELECT ${kind}_policy FROM users WHERE id=?`, ownerId); } catch (e) {}
+  const p = (u && u[`${kind}_policy`]) || 'everyone';
+  if (p === 'none') return false;
+  if (p === 'friends') return await areFriends(meId, ownerId);
+  return true; // everyone
+}
+const VALID_POLICIES = ['everyone', 'friends', 'none'];
+app.get('/api/me/privacy', auth, async (req, res) => {
+  try {
+    const u = await get1('SELECT duet_policy, stitch_policy, comment_privacy FROM users WHERE id=?', req.userId);
+    res.json({ ok: true, duet_policy: (u && u.duet_policy) || 'everyone', stitch_policy: (u && u.stitch_policy) || 'everyone', comment_privacy: (u && u.comment_privacy) || 'everyone' });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.post('/api/me/privacy', auth, async (req, res) => {
+  try {
+    const b = req.body || {};
+    const sets = [], vals = [];
+    if (b.duet_policy !== undefined) {
+      if (!VALID_POLICIES.includes(b.duet_policy)) return res.status(400).json({ error: 'politique invalide' });
+      sets.push('duet_policy=?'); vals.push(b.duet_policy);
+    }
+    if (b.stitch_policy !== undefined) {
+      if (!VALID_POLICIES.includes(b.stitch_policy)) return res.status(400).json({ error: 'politique invalide' });
+      sets.push('stitch_policy=?'); vals.push(b.stitch_policy);
+    }
+    // parité TikTok (2026-10-04) : préférences de confidentialité fusionnées ICI —
+    // Express ne route que vers le premier handler déclaré, l'ancien doublon plus bas était inerte
+    // (comment_privacy et autres n'étaient jamais persistés)
+    const allowed = { dm_privacy: ['everyone', 'friends', 'nobody'], comment_privacy: ['everyone', 'followers', 'friends', 'nobody'],
+      mention_privacy: ['everyone', 'friends', 'nobody'], download_privacy: ['everyone', 'friends', 'nobody'],
+      liked_visibility: ['everyone', 'friends', 'me'], following_visibility: ['everyone', 'friends', 'me'],
+      activity_status: ['public', 'friends', 'nobody'] };
+    for (const k of Object.keys(allowed)) {
+      if (b[k] !== undefined && allowed[k].includes(b[k])) { sets.push(k + '=?'); vals.push(b[k]); }
+    }
+    if (sets.length) { vals.push(req.userId); await runSql(`UPDATE users SET ${sets.join(',')} WHERE id=?`, ...vals); }
+    const u = await get1('SELECT duet_policy, stitch_policy FROM users WHERE id=?', req.userId);
+    res.json({ ok: true, duet_policy: u.duet_policy, stitch_policy: u.stitch_policy });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// compatibilité : l'app <v2.31 appelait /api/me/reuse (binaire) — mappé sur les politiques
+app.post('/api/me/reuse', auth, async (req, res) => {
+  try {
+    const b = req.body || {};
+    const sets = [], vals = [];
+    if (b.allowDuet !== undefined) { sets.push('duet_policy=?'); vals.push(b.allowDuet ? 'everyone' : 'none'); }
+    if (b.allowStitch !== undefined) { sets.push('stitch_policy=?'); vals.push(b.allowStitch ? 'everyone' : 'none'); }
+    if (sets.length) { vals.push(req.userId); await runSql(`UPDATE users SET ${sets.join(',')} WHERE id=?`, ...vals); }
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
 app.post('/api/videos/:id/duet', auth, async (req, res) => {
   try {
     const orig = await get1('SELECT * FROM videos WHERE id=?', req.params.id);
     if (!orig) return res.status(404).json({ error: 'vidéo introuvable' });
     if (!Number(orig.allow_duet)) return res.status(403).json({ error: 'duos non autorisés sur cette vidéo' });
+    if (!(await checkReusePolicy(req.userId, orig.user_id, 'duet')))
+      return res.status(403).json({ error: 'le créateur n’autorise pas les duos' });
     res.json({ ok: true, original: { id: orig.id, url: orig.url, user_id: orig.user_id } });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
@@ -7136,6 +7549,8 @@ app.post('/api/videos/:id/stitch', auth, async (req, res) => {
     const orig = await get1('SELECT * FROM videos WHERE id=?', req.params.id);
     if (!orig) return res.status(404).json({ error: 'vidéo introuvable' });
     if (!Number(orig.allow_stitch)) return res.status(403).json({ error: 'collages non autorisés sur cette vidéo' });
+    if (!(await checkReusePolicy(req.userId, orig.user_id, 'stitch')))
+      return res.status(403).json({ error: 'le créateur n’autorise pas les collages' });
     res.json({ ok: true, original: { id: orig.id, url: orig.url, user_id: orig.user_id, duration: orig.duration } });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
@@ -7146,10 +7561,11 @@ app.post('/api/videos/:id/permissions', auth, async (req, res) => {
     if (!v) return res.status(404).json({ error: 'vidéo introuvable' });
     if (Number(v.user_id) !== Number(req.userId)) return res.status(403).json({ error: 'non autorisé' });
     const b = req.body || {};
-    const cols = ['allow_duet', 'allow_stitch', 'allow_download', 'allow_comments', 'visibility', 'location'];
+    const cols = ['allow_duet', 'allow_stitch', 'allow_download', 'allow_comments', 'visibility', 'location', 'sensitive'];
     const sets = [], vals = [];
     if (b.allow_duet !== undefined) { sets.push('allow_duet=?'); vals.push(b.allow_duet ? 1 : 0); }
     if (b.allow_stitch !== undefined) { sets.push('allow_stitch=?'); vals.push(b.allow_stitch ? 1 : 0); }
+    if (b.sensitive !== undefined) { sets.push('sensitive=?'); vals.push(b.sensitive ? 1 : 0); }
     if (b.allow_download !== undefined) { sets.push('allow_download=?'); vals.push(b.allow_download ? 1 : 0); }
     if (b.allow_comments !== undefined) { sets.push('allow_comments=?'); vals.push(b.allow_comments ? 1 : 0); }
     if (b.visibility && ['public', 'friends', 'private'].includes(b.visibility)) { sets.push('visibility=?'); vals.push(b.visibility); }
@@ -7241,10 +7657,38 @@ app.get('/api/users/:username/online', async (req, res) => {
 });
 
 // ---------- mode restreint ----------
+// PARITÉ TIKTOK 2026-10-04 : code PIN requis pour désactiver (sans PIN, impossible de désactiver)
+const pinHash = pin => crypto.createHash('sha256').update('vgpin:' + String(pin)).digest('hex');
+app.get('/api/me/restricted', auth, async (req, res) => {
+  try {
+    const u = await get1('SELECT restricted_mode, restricted_pin FROM users WHERE id=?', req.userId);
+    res.json({ ok: true, enabled: !!(u && Number(u.restricted_mode)), has_pin: !!(u && u.restricted_pin) });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
 app.post('/api/me/restricted', auth, async (req, res) => {
   try {
-    await runSql('UPDATE users SET restricted_mode=? WHERE id=?', (req.body || {}).enabled ? 1 : 0, req.userId);
-    res.json({ ok: true });
+    const b = req.body || {};
+    const enabled = !!b.enabled;
+    const u = await get1('SELECT restricted_pin FROM users WHERE id=?', req.userId);
+    const hasPin = !!(u && u.restricted_pin);
+    const pin = String(b.pin || '').trim();
+    if (enabled) {
+      // activation : définit le PIN s'il est fourni (4 à 6 chiffres) ; conserve l'ancien sinon
+      if (pin) {
+        if (!/^\d{4,6}$/.test(pin)) return res.status(400).json({ error: 'code PIN : 4 à 6 chiffres' });
+        await runSql('UPDATE users SET restricted_mode=1, restricted_pin=? WHERE id=?', pinHash(pin), req.userId);
+      } else {
+        await runSql('UPDATE users SET restricted_mode=1 WHERE id=?', req.userId);
+      }
+      return res.json({ ok: true, enabled: true });
+    }
+    // désactivation : PIN obligatoire si un PIN est défini
+    if (hasPin) {
+      if (!pin) return res.status(403).json({ error: 'pin_required' });
+      if (pinHash(pin) !== u.restricted_pin) return res.status(403).json({ error: 'pin_incorrect' });
+    }
+    await runSql('UPDATE users SET restricted_mode=0 WHERE id=?', req.userId);
+    res.json({ ok: true, enabled: false });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 
@@ -7260,22 +7704,6 @@ app.post('/api/me/notif-prefs', auth, async (req, res) => {
     const b = req.body || {}, sets = [], vals = [];
     for (const k of ['notif_likes', 'notif_comments', 'notif_follows', 'notif_mentions', 'notif_lives']) {
       if (b[k] !== undefined) { sets.push(k + '=?'); vals.push(b[k] ? 1 : 0); }
-    }
-    if (sets.length) { vals.push(req.userId); await runSql(`UPDATE users SET ${sets.join(',')} WHERE id=?`, ...vals); }
-    res.json({ ok: true });
-  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
-});
-
-// ---------- préférences de confidentialité (façon TikTok) ----------
-app.post('/api/me/privacy', auth, async (req, res) => {
-  try {
-    const b = req.body || {}, sets = [], vals = [];
-    const allowed = { dm_privacy: ['everyone', 'friends', 'nobody'], comment_privacy: ['everyone', 'friends', 'nobody'],
-      mention_privacy: ['everyone', 'friends', 'nobody'], download_privacy: ['everyone', 'friends', 'nobody'],
-      liked_visibility: ['everyone', 'friends', 'me'], following_visibility: ['everyone', 'friends', 'me'],
-      activity_status: ['public', 'friends', 'nobody'] };
-    for (const k of Object.keys(allowed)) {
-      if (b[k] !== undefined && allowed[k].includes(b[k])) { sets.push(k + '=?'); vals.push(b[k]); }
     }
     if (sets.length) { vals.push(req.userId); await runSql(`UPDATE users SET ${sets.join(',')} WHERE id=?`, ...vals); }
     res.json({ ok: true });
@@ -7319,6 +7747,30 @@ app.get('/api/me/stats', auth, async (req, res) => {
     const fr = await get1('SELECT COUNT(*) AS c FROM follows WHERE followed_id=?', req.userId);
     const vr = await get1('SELECT COALESCE(SUM(views),0) AS s FROM videos WHERE user_id=?', req.userId);
     res.json({ ok: true, followers: Number(fr.c) || 0, totalViews: Number(vr.s) || 0, views: Number(vr.s) || 0 });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// PARITÉ TIKTOK 2026-10-04 : analytics profil 7/28 jours, données réelles (jamais de fausses données)
+app.get('/api/me/analytics', auth, async (req, res) => {
+  try {
+    const days = req.query.days === '28' ? 28 : 7;
+    const dayMs = 86400000, t0 = now() - days * dayMs, perDay = [];
+    let tViews = 0, tLikes = 0, tFollows = 0, tShares = 0;
+    for (let d = 0; d < days; d++) {
+      const a = t0 + d * dayMs, b = a + dayMs;
+      const vw = (await get1(`SELECT COUNT(*) AS c FROM video_views vv JOIN videos v ON v.id=vv.video_id
+        WHERE v.user_id=? AND vv.created_at>=? AND vv.created_at<?`, req.userId, a, b)).c || 0;
+      const lk = (await get1(`SELECT COUNT(*) AS c FROM likes l JOIN videos v ON v.id=l.video_id
+        WHERE v.user_id=? AND l.created_at>=? AND l.created_at<?`, req.userId, a, b)).c || 0;
+      const fo = (await get1('SELECT COUNT(*) AS c FROM follows WHERE followed_id=? AND created_at>=? AND created_at<?',
+        req.userId, a, b)).c || 0;
+      tViews += vw; tLikes += lk; tFollows += fo;
+      perDay.push({ day: new Date(a).toISOString().slice(0, 10), views: vw, likes: lk, new_followers: fo });
+    }
+    const sh = await get1('SELECT COALESCE(SUM(shares),0) AS s FROM videos WHERE user_id=?', req.userId);
+    tShares = Number((sh && sh.s) || 0);
+    const fr = await get1('SELECT COUNT(*) AS c FROM follows WHERE followed_id=?', req.userId);
+    res.json({ ok: true, days, totals: { views: tViews, likes: tLikes, new_followers: tFollows, shares: tShares,
+      followers: Number((fr && fr.c) || 0) }, per_day: perDay });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 
@@ -7433,6 +7885,96 @@ app.post('/api/effects', auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 
+function effectJSON(e, meId, isFav, favCount) {
+  return { id: e.id, name: e.name, icon: e.icon_url || '', category: e.category || '',
+    css: e.css || '', use_count: Number(e.use_count) || 0,
+    fav_count: favCount == null ? undefined : Number(favCount),
+    is_fav: !!isFav, created_at: Number(e.created_at) };
+}
+app.get('/api/effects/search', async (req, res) => {
+  try {
+    const q = '%' + String(req.query.q || '').toLowerCase() + '%';
+    const rows = await allRows('SELECT * FROM effects WHERE LOWER(name) LIKE ? OR LOWER(category) LIKE ? ORDER BY use_count DESC LIMIT 20', q, q);
+    res.json({ ok: true, effects: rows.map(e => effectJSON(e)) });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.get('/api/effects/favs/mine', auth, async (req, res) => {
+  try {
+    const rows = await allRows('SELECT e.* FROM effect_favs f JOIN effects e ON e.id=f.effect_id WHERE f.user_id=? ORDER BY f.created_at DESC LIMIT 50', req.userId);
+    res.json({ ok: true, effects: rows.map(e => effectJSON(e, req.userId, true)) });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.get('/api/effects/:id', async (req, res) => {
+  try {
+    const e = await get1('SELECT * FROM effects WHERE id=?', req.params.id);
+    if (!e) return res.status(404).json({ error: 'effet introuvable' });
+    const meId = await optUserId(req);
+    const fav = meId ? await get1('SELECT 1 FROM effect_favs WHERE user_id=? AND effect_id=?', meId, e.id) : null;
+    const fc = await get1('SELECT COUNT(*) AS c FROM effect_favs WHERE effect_id=?', e.id);
+    const rows = await allRows('SELECT * FROM videos WHERE effect=? AND hidden=0 ORDER BY created_at DESC LIMIT 30', e.name);
+    const videos = [];
+    for (const v of rows) { if (await canSeeVideo(v, meId)) { const j = await videoJSON(v, meId); if (j) videos.push(j); } }
+    res.json({ ok: true, effect: effectJSON(e, meId, !!fav, Number(fc.c)), videos });
+  } catch (e2) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.post('/api/effects/:id/use', async (req, res) => {
+  try {
+    const e = await get1('SELECT id FROM effects WHERE id=?', req.params.id);
+    if (!e) return res.status(404).json({ error: 'effet introuvable' });
+    await runSql('UPDATE effects SET use_count=use_count+1 WHERE id=?', e.id);
+    res.json({ ok: true });
+  } catch (e2) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.post('/api/effects/:id/fav', auth, async (req, res) => {
+  try {
+    const e = await get1('SELECT id FROM effects WHERE id=?', req.params.id);
+    if (!e) return res.status(404).json({ error: 'effet introuvable' });
+    await insertIgnore('INSERT OR IGNORE INTO effect_favs(user_id,effect_id,created_at) VALUES(?,?,?)', req.userId, e.id, now());
+    res.json({ ok: true });
+  } catch (e2) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.delete('/api/effects/:id/fav', auth, async (req, res) => {
+  try {
+    await runSql('DELETE FROM effect_favs WHERE user_id=? AND effect_id=?', req.userId, req.params.id);
+    res.json({ ok: true });
+  } catch (e2) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+
+// catalogue d'effets maison (100% hors-ligne : filtres CSS appliqués côté app)
+const EFFECT_CATALOG = [
+  ['Éclat doré','✨','Beauté','saturate(1.35) contrast(1.03) brightness(1.09)'],
+  ['Peau douce','🧴','Beauté','blur(0.6px) brightness(1.08) saturate(1.15)'],
+  ['Glow','💫','Beauté','brightness(1.14) saturate(1.3) contrast(0.96)'],
+  ['Teint frais','🌸','Beauté','sepia(0.18) saturate(1.45) brightness(1.06)'],
+  ['N&B cinéma','🎬','Couleur','grayscale(1) contrast(1.12) brightness(1.02)'],
+  ['Sépia rétro','📼','Couleur','sepia(0.85) contrast(0.95) brightness(0.98)'],
+  ['Vif','🔥','Couleur','saturate(1.9) contrast(1.12)'],
+  ['Pastel','🍬','Couleur','saturate(0.75) brightness(1.12) contrast(0.92)'],
+  ['Froid polaire','❄️','Couleur','saturate(1.2) hue-rotate(18deg) brightness(1.03)'],
+  ['Chaud désert','🏜️','Couleur','sepia(0.45) saturate(1.7) brightness(1.02)'],
+  ['Nuit néon','🌃','Ambiance','saturate(1.6) contrast(1.25) brightness(0.92) hue-rotate(-12deg)'],
+  ['Golden hour','🌅','Ambiance','sepia(0.35) saturate(1.6) contrast(1.05) brightness(1.05)'],
+  ['Rêve flou','☁️','Ambiance','blur(1.2px) brightness(1.12) saturate(1.1)'],
+  ['Vintage 70s','🕺','Ambiance','sepia(0.55) contrast(1.1) saturate(1.25) brightness(0.97)'],
+  ['Cyberpunk','🤖','Ambiance','hue-rotate(140deg) saturate(1.8) contrast(1.15)'],
+  ['Noir profond','🌑','Ambiance','grayscale(0.9) brightness(0.82) contrast(1.2)'],
+  ['Miroir','🪞','Fun','saturate(1.4) contrast(1.1)'],
+  ['Pop art','🎨','Fun','saturate(2.2) contrast(1.35)'],
+  ['Inversé','🔄','Fun','invert(1) hue-rotate(180deg)'],
+  ['Douceur lait','🥛','Fun','brightness(1.2) saturate(0.85) contrast(0.9)'],
+];
+async function seedEffects() {
+  try {
+    const c = await get1('SELECT COUNT(*) AS n FROM effects');
+    if (c && Number(c.n) > 0) return;
+    for (const [name, icon, cat, css] of EFFECT_CATALOG) {
+      await runSql('INSERT INTO effects(name,icon_url,category,css,created_at) VALUES(?,?,?,?,?)',
+        name, icon, cat, css, now());
+    }
+    console.log('effets catalogue seedés:', EFFECT_CATALOG.length);
+  } catch (e) { console.log('seed effets ignoré:', e.message); }
+}
+
 // ---------- pages dédiées : lieux ----------
 app.get('/api/places/:name/videos', async (req, res) => {
   try {
@@ -7442,7 +7984,7 @@ app.get('/api/places/:name/videos', async (req, res) => {
 });
 
 // ---------- mentions : notifie les @mentionnés dans un commentaire ----------
-async function notifyMentions(text, actorId, videoId) {
+async function notifyMentions(text, actorId, videoId, commentId) {
   try {
     const mentions = String(text || '').match(/@([a-zA-Z0-9._]{2,20})/g) || [];
     const seen = new Set();
@@ -7451,7 +7993,8 @@ async function notifyMentions(text, actorId, videoId) {
       if (seen.has(uname)) continue; seen.add(uname);
       const u = await get1('SELECT id FROM users WHERE LOWER(username)=?', uname);
       if (u && Number(u.id) !== Number(actorId)) {
-        await notify(u.id, 'mention', actorId, videoId, '@' + uname + ' vous a mentionné');
+        // v2.31 : texte = le commentaire lui-même (l'app compose "@acteur vous a mentionné"), + comment_id
+        await notify(u.id, 'mention', actorId, videoId, String(text || '').slice(0, 100), commentId || null);
       }
     }
   } catch (_) {}
@@ -7476,6 +8019,7 @@ app.get('/api/videos/mine/private', auth, async (req, res) => {
 });
 
 initDb().then(() => {
+  seedEffects().catch(()=>{});
   publishDue();
   setInterval(publishDue, 60000); // vérifie les publications dues toutes les 60 s
   expireSubs();
