@@ -11324,14 +11324,17 @@ app.post('/api/shop/refunds/:id/decide', authOrAdmin, async (req, res) => {
     const rf = await get1('SELECT * FROM shop_refunds WHERE id=?', Number(req.params.id));
     if (!rf) return res.status(404).json({ error: 'demande introuvable' });
     if (rf.status !== 'pending') return res.status(400).json({ error: 'déjà traitée' });
-    // FIX sécu 2026-10-05 (failles vague 2 F2) : 2 décisions parallèles passaient le check
-    // 'pending' → acheteur crédité 2 fois (TOCTOU). Claim atomique : un seul gagne.
-    const claimed = await runSqlChanges("UPDATE shop_refunds SET status='processing' WHERE id=? AND status='pending'", rf.id);
-    if (!claimed) return res.status(400).json({ error: 'déjà traitée' });
+    // FIX non-régression 2026-10-05 : le contrôle d'autorisation DOIT passer AVANT le claim
+    // atomique — sinon une tentative non autorisée (403) laissait la demande bloquée en
+    // 'processing' pour toujours, et le vendeur légitime recevait ensuite 400 « déjà traitée ».
     // seul le vendeur concerné ou un admin peut décider (B3 : x-admin-token accepté)
     const isAdmin = req.admin === true;
     if (Number(rf.seller_id) !== Number(req.userId) && !isAdmin)
       return res.status(403).json({ error: 'non autorisé' });
+    // FIX sécu 2026-10-05 (failles vague 2 F2) : 2 décisions parallèles passaient le check
+    // 'pending' → acheteur crédité 2 fois (TOCTOU). Claim atomique : un seul gagne.
+    const claimed = await runSqlChanges("UPDATE shop_refunds SET status='processing' WHERE id=? AND status='pending'", rf.id);
+    if (!claimed) return res.status(400).json({ error: 'déjà traitée' });
     if (approve) {
       const order = await get1('SELECT * FROM orders WHERE id=?', rf.order_id);
       const total = Number(order.total_coins);
