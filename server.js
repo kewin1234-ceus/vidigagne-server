@@ -2715,6 +2715,20 @@ async function withUserLock(userId, fn) {
   try { return await fn(); }
   finally { release(); if (_userLocks.get(key) === cur) _userLocks.delete(key); }
 }
+// FIX race 2026-10-05 (creusage profond #3) : verrou générique par clé — pour les races
+// ENTRE utilisateurs (ex : 2 inscriptions simultanées au même tournoi PK), où
+// withUserLock(userId) ne suffit pas. Même pattern, clé arbitraire.
+const _keyLocks = new Map();
+async function withKeyLock(key, fn) {
+  const prev = _keyLocks.get(key) || Promise.resolve();
+  let release;
+  const gate = new Promise(r => { release = r; });
+  const cur = prev.then(() => gate);
+  _keyLocks.set(key, cur);
+  await prev;
+  try { return await fn(); }
+  finally { release(); if (_keyLocks.get(key) === cur) _keyLocks.delete(key); }
+}
 
 // ---------- crochet de test « race » (Équipe 8/10 — concurrence, 2026-10-05) ----------
 // Simule l'entrelacement Postgres en local : node:sqlite est synchrone et sérialise
@@ -4344,9 +4358,13 @@ app.get('/api/leaderboard', auth, async (req, res) => {
     if (myRank === null) {
       const me = await get1('SELECT COALESCE(SUM(CASE WHEN amount>0 THEN amount ELSE 0 END),0) AS e FROM ledger WHERE user_id=? AND created_at>=?', req.userId, weekAgo);
       myEarned = me ? me.e : 0;
+      // FIX 2026-10-05 (creusage profond #5) : ex æquo incohérent — COUNT(earned>moi)+1
+      // donnait rang=1 à un 21e ex æquo alors que le top-20 affiche des rangs séquentiels.
+      // Rang = vraie position séquentielle (ordre : gains DESC, id ASC), cohérente avec le top.
       const above = await get1(
-        `SELECT COUNT(*) AS n FROM (SELECT u.id FROM users u LEFT JOIN ledger l ON l.user_id=u.id AND l.created_at>=?
-         GROUP BY u.id HAVING COALESCE(SUM(CASE WHEN l.amount>0 THEN l.amount ELSE 0 END),0) > ?) x`, weekAgo, myEarned);
+        `SELECT COUNT(*) AS n FROM (SELECT u.id, COALESCE(SUM(CASE WHEN l.amount>0 THEN l.amount ELSE 0 END),0) AS earned
+          FROM users u LEFT JOIN ledger l ON l.user_id=u.id AND l.created_at>=?
+          GROUP BY u.id HAVING earned > ? OR (earned = ? AND u.id < ?)) x`, weekAgo, myEarned, myEarned, req.userId);
       myRank = (above ? Number(above.n) : 0) + 1;
     }
     res.json({ top: top.map((r, i) => ({ rank: i + 1, username: r.username, earned: r.earned })), me: { rank: myRank, earned: myEarned } });
@@ -9915,35 +9933,43 @@ app.post('/api/pk/tournament', auth, async (req, res) => {
 });
 app.post('/api/pk/tournament/:id/join', auth, async (req, res) => {
   try {
-    const t = await get1('SELECT * FROM pk_tournaments WHERE id=?', req.params.id);
-    if (!t) return res.status(404).json({ error: 'tournoi introuvable' });
-    // B8 (2026-10-05) : distinguer « tournoi complet » (4 joueurs) de « tournoi fermé ».
-    // Un tournoi PLEIN répond 400 « complet » (même si le statut est passé à 'running'
-    // dès le 4e joueur) ; un tournoi non plein mais non 'open' répond 403 « fermé ».
-    const pc = await get1(
-      `SELECT COUNT(*) AS c FROM (SELECT player1_id AS p FROM pk_matches WHERE tournament_id=?
-        UNION SELECT player2_id FROM pk_matches WHERE tournament_id=? AND player2_id IS NOT NULL)`,
-      req.params.id, req.params.id);
-    if (pc && Number(pc.c) >= 4) return res.status(400).json({ error: 'tournoi complet' });
-    if (t.status !== 'open') return res.status(403).json({ error: 'tournoi fermé' });
-    const existing = await get1('SELECT id FROM pk_matches WHERE tournament_id=? AND (player1_id=? OR player2_id=?)',
-      req.params.id, req.userId, req.userId);
-    if (existing) return res.status(400).json({ error: 'déjà inscrit' });
-    // remplir les places : semi1.p2, semi2.p1, semi2.p2
-    const m1 = await get1("SELECT * FROM pk_matches WHERE tournament_id=? AND round='semi1'", req.params.id);
-    const m2 = await get1("SELECT * FROM pk_matches WHERE tournament_id=? AND round='semi2'", req.params.id);
-    if (m1 && !m1.player2_id) {
-      await runSql('UPDATE pk_matches SET player2_id=?, status=? WHERE id=?', req.userId, 'ready', m1.id);
-    } else if (!m2) {
-      await runSql("INSERT INTO pk_matches(tournament_id,round,player1_id,status,created_at) VALUES(?,'semi2',?,'waiting',?)",
-        req.params.id, req.userId, now());
-    } else if (!m2.player2_id) {
-      await runSql('UPDATE pk_matches SET player2_id=?, status=? WHERE id=?', req.userId, 'ready', m2.id);
-      await runSql('UPDATE pk_tournaments SET status=? WHERE id=?', 'running', req.params.id);
-    } else {
-      return res.status(400).json({ error: 'tournoi complet (4 joueurs)' });
-    }
-    res.json({ ok: true });
+    // FIX race 2026-10-05 (creusage profond #3) : 2 inscriptions simultanées passaient le
+    // comptage → 5e joueur dans un tournoi à 4, ou 2 joueurs sur la même place (fantôme).
+    // Verrou PAR TOURNOI (la race est entre utilisateurs différents).
+    const out = await withKeyLock('pk:' + req.params.id, async () => {
+      const t = await get1('SELECT * FROM pk_tournaments WHERE id=?', req.params.id);
+      if (!t) return { error: 'tournoi introuvable', code: 404 };
+      // B8 (2026-10-05) : distinguer « tournoi complet » (4 joueurs) de « tournoi fermé ».
+      // Un tournoi PLEIN répond 400 « complet » (même si le statut est passé à 'running'
+      // dès le 4e joueur) ; un tournoi non plein mais non 'open' répond 403 « fermé ».
+      const pc = await get1(
+        `SELECT COUNT(*) AS c FROM (SELECT player1_id AS p FROM pk_matches WHERE tournament_id=?
+          UNION SELECT player2_id FROM pk_matches WHERE tournament_id=? AND player2_id IS NOT NULL)`,
+        req.params.id, req.params.id);
+      if (pc && Number(pc.c) >= 4) return { error: 'tournoi complet', code: 400 };
+      if (t.status !== 'open') return { error: 'tournoi fermé', code: 403 };
+      const existing = await get1('SELECT id FROM pk_matches WHERE tournament_id=? AND (player1_id=? OR player2_id=?)',
+        req.params.id, req.userId, req.userId);
+      if (existing) return { error: 'déjà inscrit', code: 400 };
+      await raceGap(req); // crochet test concurrence : simule l'intercalage Postgres
+      // remplir les places : semi1.p2, semi2.p1, semi2.p2
+      const m1 = await get1("SELECT * FROM pk_matches WHERE tournament_id=? AND round='semi1'", req.params.id);
+      const m2 = await get1("SELECT * FROM pk_matches WHERE tournament_id=? AND round='semi2'", req.params.id);
+      if (m1 && !m1.player2_id) {
+        await runSql('UPDATE pk_matches SET player2_id=?, status=? WHERE id=?', req.userId, 'ready', m1.id);
+      } else if (!m2) {
+        await runSql("INSERT INTO pk_matches(tournament_id,round,player1_id,status,created_at) VALUES(?,'semi2',?,'waiting',?)",
+          req.params.id, req.userId, now());
+      } else if (!m2.player2_id) {
+        await runSql('UPDATE pk_matches SET player2_id=?, status=? WHERE id=?', req.userId, 'ready', m2.id);
+        await runSql('UPDATE pk_tournaments SET status=? WHERE id=?', 'running', req.params.id);
+      } else {
+        return { error: 'tournoi complet (4 joueurs)', code: 400 };
+      }
+      return { ok: true };
+    });
+    if (out.error) return res.status(out.code || 400).json({ error: out.error });
+    res.json(out);
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 app.get('/api/pk/tournament/:id', auth, async (req, res) => {
@@ -11041,6 +11067,12 @@ app.post('/api/shop/orders', auth, async (req, res) => {
       if (subtotal < Number(coupon.min_coins)) return res.status(400).json({ error: 'montant minimum non atteint pour ce coupon' });
       if (coupon.seller_id && !items.some(it => Number(it.seller_id) === Number(coupon.seller_id)))
         return res.status(400).json({ error: "ce coupon ne s'applique pas à votre panier" });
+      // FIX race 2026-10-05 (creusage profond #2) : 2 commandes parallèles avec un coupon
+      // à usage unique passaient toutes les deux le check used_count<max_uses → réduction
+      // appliquée 2 fois. Consommation ATOMIQUE et conditionnelle : un seul gagne.
+      const okCoupon = await runSqlChanges(
+        'UPDATE coupons SET used_count=used_count+1 WHERE id=? AND (max_uses<=0 OR used_count<max_uses)', coupon.id);
+      if (!okCoupon) return res.status(400).json({ error: 'coupon épuisé' });
       if (Number(coupon.discount_pct) > 0) discount = Math.floor(subtotal * Number(coupon.discount_pct) / 100);
       else discount = Number(coupon.discount_coins);
       discount = Math.min(discount, subtotal);
@@ -11071,6 +11103,8 @@ app.post('/api/shop/orders', auth, async (req, res) => {
       if (!okStock) {
         // restaure les stocks déjà décrémentés, aucun argent n'a bougé
         for (const r of decremented) await runSql('UPDATE products SET stock=stock+? WHERE id=?', r.qty, r.product_id);
+        // FIX race coupon : rend l'usage du coupon si la commande échoue après consommation
+        if (coupon) await runSql('UPDATE coupons SET used_count=used_count-1 WHERE id=?', coupon.id);
         return res.status(400).json({ error: 'stock épuisé : ' + it.title });
       }
       decremented.push({ product_id: it.product_id, qty: it.qty });
@@ -11078,6 +11112,8 @@ app.post('/api/shop/orders', auth, async (req, res) => {
     const debited = await runSqlChanges('UPDATE users SET coins=coins-? WHERE id=? AND coins>=?', total, req.userId, total);
     if (!debited) {
       for (const r of decremented) await runSql('UPDATE products SET stock=stock+? WHERE id=?', r.qty, r.product_id);
+      // FIX race coupon : rend l'usage du coupon si le débit échoue
+      if (coupon) await runSql('UPDATE coupons SET used_count=used_count-1 WHERE id=?', coupon.id);
       return res.status(400).json({ error: 'pas assez de pièces' });
     }
     await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
@@ -11099,7 +11135,7 @@ app.post('/api/shop/orders', auth, async (req, res) => {
         it.seller_id, net, 'vente boutique #' + orderId, now());
     }
     if (platformTotal > 0) await runSql('INSERT INTO platform_fees(order_id,coins,created_at) VALUES(?,?,?)', orderId, platformTotal, now());
-    if (coupon) await runSql('UPDATE coupons SET used_count=used_count+1 WHERE id=?', coupon.id);
+    // (coupon déjà consommé atomiquement avant le débit — pas de 2e incrément ici)
     if (affiliate) {
       const comm = Math.min(Math.floor(total * Number(affiliate.rate_pct) / 100), platformTotal);
       if (comm > 0) {
@@ -11812,22 +11848,29 @@ app.post('/api/series/:id/buy', auth, async (req, res) => {
     if (!s) return res.status(404).json({ error: 'série introuvable' });
     if (Number(s.creator_id) === Number(req.userId))
       return res.status(400).json({ error: 'impossible d\'acheter votre propre série' });
-    const already = await get1('SELECT 1 FROM series_purchases WHERE series_id=? AND user_id=?', s.id, req.userId);
-    if (already) return res.status(400).json({ error: 'série déjà achetée' });
-    const price = Number(s.price_coins);
-    const creatorShare = Math.floor(price * 0.9); // 90 % créateur, 10 % plateforme
-    const debited = await runSqlChanges('UPDATE users SET coins=coins-? WHERE id=? AND coins>=?', price, req.userId, price);
-    if (!debited) return res.status(400).json({ error: 'pas assez de pièces' });
-    await runSql('UPDATE users SET coins=coins+? WHERE id=?', creatorShare, s.creator_id);
-    await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
-      req.userId, -price, 'achat série #' + s.id, now());
-    await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
-      s.creator_id, creatorShare, 'vente série #' + s.id, now());
-    await insertIgnore('INSERT OR IGNORE INTO series_purchases(series_id,user_id,created_at) VALUES(?,?,?)',
-      s.id, req.userId, now());
-    await notify(s.creator_id, 'series_buy', req.userId, null, String(price));
-    const balS = await get1('SELECT coins FROM users WHERE id=?', req.userId);
-    res.json({ ok: true, coins: balS ? balS.coins : 0 });
+    // FIX race 2026-10-05 (creusage profond #1) : 2 achats parallèles passaient le check
+    // « déjà acheté » → double débit + double crédit créateur sur Postgres. Sérialisé par utilisateur.
+    const out = await withUserLock(req.userId, async () => {
+      const already = await get1('SELECT 1 FROM series_purchases WHERE series_id=? AND user_id=?', s.id, req.userId);
+      if (already) return { error: 'série déjà achetée', code: 400 };
+      const price = Number(s.price_coins);
+      const creatorShare = Math.floor(price * 0.9); // 90 % créateur, 10 % plateforme
+      await raceGap(req); // crochet test concurrence : simule l'intercalage Postgres
+      const debited = await runSqlChanges('UPDATE users SET coins=coins-? WHERE id=? AND coins>=?', price, req.userId, price);
+      if (!debited) return { error: 'pas assez de pièces', code: 400 };
+      await runSql('UPDATE users SET coins=coins+? WHERE id=?', creatorShare, s.creator_id);
+      await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
+        req.userId, -price, 'achat série #' + s.id, now());
+      await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
+        s.creator_id, creatorShare, 'vente série #' + s.id, now());
+      await insertIgnore('INSERT OR IGNORE INTO series_purchases(series_id,user_id,created_at) VALUES(?,?,?)',
+        s.id, req.userId, now());
+      await notify(s.creator_id, 'series_buy', req.userId, null, String(price));
+      const balS = await get1('SELECT coins FROM users WHERE id=?', req.userId);
+      return { ok: true, coins: balS ? balS.coins : 0 };
+    });
+    if (out.error) return res.status(out.code || 400).json({ error: out.error });
+    res.json(out);
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 
