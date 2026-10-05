@@ -256,6 +256,15 @@ CREATE TABLE IF NOT EXISTS login_streaks(
   last_day TEXT NOT NULL DEFAULT '',
   updated_at BIGINT NOT NULL
 );
+-- v2.48 SPEC-06 : séries d'amitié 🔥 (échange bidirectionnel entre deux amis)
+CREATE TABLE IF NOT EXISTS friendship_streaks(
+  user_a INTEGER NOT NULL,
+  user_b INTEGER NOT NULL,
+  streak INTEGER NOT NULL DEFAULT 0,
+  last_day TEXT NOT NULL DEFAULT '',
+  updated_at BIGINT NOT NULL,
+  PRIMARY KEY(user_a, user_b)
+);
 CREATE TABLE IF NOT EXISTS quest_claims(
   user_id INTEGER NOT NULL,
   quest_key TEXT NOT NULL,
@@ -2777,6 +2786,14 @@ async function auth(req, res, next) {
   req.token = m[1];
   next();
 }
+// B3 (v2.48, 2026-10-05) : accepte l'auth utilisateur (Bearer) OU le token admin (x-admin-token).
+// Avant, la branche `req.admin` du endpoint decide était morte : `auth` rejetait toute
+// requête sans Bearer (401) et ne positionnait jamais req.admin.
+async function authOrAdmin(req, res, next) {
+  const t = req.headers['x-admin-token'];
+  if (process.env.ADMIN_TOKEN && t === process.env.ADMIN_TOKEN) { req.admin = true; return next(); }
+  return auth(req, res, next);
+}
 // id de l'utilisateur courant depuis le jeton, sans exiger l'auth (null si anonyme)
 async function optUserId(req) {
   try {
@@ -2879,6 +2896,9 @@ function setupPushWs(server) {
         const id = await userIdFromToken(m.token);
         if (!id) { try { ws.close(); } catch (_) {} return; }
         uid = Number(id);
+        // COIN-05 (2026-10-05) : reconnexion → l'ANCIENNE socket du même utilisateur est fermée
+        const prev = pushSockets.get(uid);
+        if (prev && prev !== ws) { try { prev.close(); } catch (_) {} }
         pushSockets.set(uid, ws);
         try { ws.send(JSON.stringify({ t: 'ready' })); } catch (_) {}
       }
@@ -4863,6 +4883,8 @@ app.get('/api/kyc/pending', adminAuth, async (req, res) => {
 app.post('/api/kyc/:id/review', adminAuth, async (req, res) => {
   const approve = !!(req.body || {}).approve;
   const krow = await get1('SELECT user_id FROM id_verifications WHERE id=?', req.params.id);
+  // B6 (2026-10-05) : 404 si la demande KYC n'existe pas
+  if (!krow) return res.status(404).json({ error: 'demande KYC introuvable' });
   await runSql(`UPDATE id_verifications SET status=?, reviewed_at=? WHERE id=?`,
     approve ? 'approved' : 'rejected', now(), req.params.id);
   // v2.33 : notifie (in-app + push FCM) + e-mail de verdict
@@ -5561,16 +5583,20 @@ function setupLiveWs(server) {
         room.broadcaster = ws; role = 'broadcaster';
         return;
       }
-      const room = liveRooms[liveId];
-      if (!room) return;
       if (m.t === 'join') {
+        // COIN-04 (2026-10-05) : un viewer peut rejoindre même si le broadcaster n'a pas
+        // encore ouvert sa WS — avant, `if (!room) return` ignorait silencieusement le join
+        // et le chat HTTP ne trouvait personne à qui diffuser.
+        const rm = liveRooms[liveId] = liveRooms[liveId] || { broadcaster: null, viewers: new Map() };
         peerId = 'v' + Math.random().toString(36).slice(2, 9);
-        room.viewers.set(ws, peerId); role = 'viewer';
-        if (room.broadcaster && room.broadcaster.readyState === 1)
-          room.broadcaster.send(JSON.stringify({ t: 'viewer', id: peerId }));
+        rm.viewers.set(ws, peerId); role = 'viewer';
+        if (rm.broadcaster && rm.broadcaster.readyState === 1)
+          rm.broadcaster.send(JSON.stringify({ t: 'viewer', id: peerId }));
         liveBroadcastViewers(liveId);
         return;
       }
+      const room = liveRooms[liveId];
+      if (!room) return;
       if (m.t === 'chat') {
         const uid = await userIdFromToken(m.token);
         const text = String(m.text || '').slice(0, 200);
@@ -6919,7 +6945,9 @@ app.get('/api/admin/integrity/orphans', async (req, res) => {
 app.post('/api/admin/integrity/orphans/clean', async (req, res) => {
   try {
     if (!checkAdmin(req, res)) return;
-    const dry_run = req.body && req.body.dry_run !== false; // défaut = simulation
+    // B5 (2026-10-05) : SANS body (ou sans confirmation explicite) = simulation UNIQUEMENT.
+    // Avant : `req.body && ...` valait undefined sans body → branche DESTRUCTRICE exécutée.
+    const dry_run = !req.body || req.body.dry_run !== false; // défaut = simulation
     const cleaned = {};
     let total = 0;
     for (const c of ORPHAN_CHECKS) {
@@ -6974,7 +7002,8 @@ app.get('/api/admin/integrity/counters', async (req, res) => {
 app.post('/api/admin/integrity/counters/fix', async (req, res) => {
   try {
     if (!checkAdmin(req, res)) return;
-    const dry_run = req.body && req.body.dry_run !== false; // défaut = simulation
+    // B5 (2026-10-05) : SANS body (ou sans confirmation explicite) = simulation UNIQUEMENT.
+    const dry_run = !req.body || req.body.dry_run !== false; // défaut = simulation
     const fixed = {};
     let total = 0;
     for (const c of COUNTER_CHECKS) {
@@ -8015,6 +8044,81 @@ app.get('/api/friends/suggestions', auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 
+// ---------- v2.48 SPEC-06 : séries d'amitié 🔥 ----------
+// RÈGLE D'ÉCHANGE BIDIRECTIONNEL : une journée de série n'est validée que si les deux
+// amis ont échangé au moins un message chacun le même jour calendaire (dérivé des messages
+// de leur conversation). Une série peut aussi être échangée explicitement via un
+// commentaire OU via un code partagé entre les deux amis (endpoint /exchange ci-dessous).
+function streakPair(a, b) { a = Number(a); b = Number(b); return a < b ? [a, b] : [b, a]; }
+function dayBoundsMs(dayStr) { const s = new Date(dayStr + 'T00:00:00Z').getTime(); return [s, s + 86400000]; }
+async function friendshipStreakTouch(a, b) {
+  // Recalcule/valide la série de la paire depuis les messages (échange bidirectionnel).
+  const [x, y] = streakPair(a, b);
+  if (!x || !y || x === y) return null;
+  const t = now(), today = utcDay(t), yest = utcDay(t - 86400000);
+  const [ds, de] = dayBoundsMs(today);
+  const conv = await get1('SELECT id FROM conversations WHERE (user1_id=? AND user2_id=?) OR (user1_id=? AND user2_id=?)', x, y, y, x);
+  let bidir = false;
+  if (conv) {
+    const r = await get1('SELECT COUNT(DISTINCT sender_id) AS n FROM messages WHERE conversation_id=? AND created_at>=? AND created_at<?', conv.id, ds, de);
+    bidir = Number(r && r.n) >= 2; // échange bidirectionnel : les deux ont écrit aujourd'hui
+  }
+  const row = await get1('SELECT * FROM friendship_streaks WHERE user_a=? AND user_b=?', x, y);
+  if (!bidir || (row && row.last_day === today)) return row;
+  const streak = (row && row.last_day === yest) ? row.streak + 1 : 1;
+  if (row) await runSql('UPDATE friendship_streaks SET streak=?, last_day=?, updated_at=? WHERE user_a=? AND user_b=?', streak, today, t, x, y);
+  else await runSql('INSERT INTO friendship_streaks(user_a,user_b,streak,last_day,updated_at) VALUES(?,?,?,?,?)', x, y, streak, today, t);
+  return { user_a: x, user_b: y, streak, last_day: today, updated_at: t };
+}
+app.get('/api/friends/streaks', auth, async (req, res) => {
+  try {
+    const me = Number(req.userId);
+    const rows = await allRows(
+      `SELECT s.streak, s.last_day, u.id AS friend_id, u.username, u.avatar
+       FROM friendship_streaks s
+       JOIN users u ON u.id = CASE WHEN s.user_a=? THEN s.user_b ELSE s.user_a END
+       WHERE s.user_a=? OR s.user_b=? ORDER BY s.streak DESC LIMIT 100`, me, me, me);
+    res.json({ streaks: rows.map(r => ({ friend: { id: r.friend_id, username: r.username, avatar: r.avatar || '🙂' },
+      streak: r.streak, last_day: r.last_day, flame: '🔥' })) });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.get('/api/conversations/:id/streak', auth, async (req, res) => {
+  try {
+    const c = await get1('SELECT * FROM conversations WHERE id=?', req.params.id);
+    if (!c) return res.status(404).json({ error: 'conversation introuvable' });
+    const me = Number(req.userId);
+    if (Number(c.user1_id) !== me && Number(c.user2_id) !== me)
+      return res.status(403).json({ error: 'non autorisé' });
+    const other = Number(c.user1_id) === me ? Number(c.user2_id) : Number(c.user1_id);
+    const s = await friendshipStreakTouch(me, other); // recalcule depuis les messages du jour
+    res.json({ streak: s ? s.streak : 0, last_day: s ? s.last_day : null, flame: '🔥' });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.post('/api/friends/streaks/exchange', auth, async (req, res) => {
+  try {
+    // Échange explicite de série : via un commentaire OU via un code partagé.
+    const b = req.body || {};
+    const friendId = Number(b.friend_id);
+    const via = String(b.via || 'comment').slice(0, 20);
+    if (!friendId || friendId === Number(req.userId)) return res.status(400).json({ error: 'ami invalide' });
+    if (via !== 'comment' && via !== 'code') return res.status(400).json({ error: 'via invalide (comment|code)' });
+    const [x, y] = streakPair(req.userId, friendId);
+    const t = now(), today = utcDay(t), yest = utcDay(t - 86400000);
+    const row = await get1('SELECT * FROM friendship_streaks WHERE user_a=? AND user_b=?', x, y);
+    if (row && row.last_day === today) return res.json({ ok: true, streak: row.streak, already: true, via });
+    if (via === 'code') {
+      // code déterministe de la paire, à partager entre les deux amis
+      const expect = 'VG' + String(1000 + ((x * 31 + y * 17) % 9000));
+      if (String(b.code || '').trim().toUpperCase() !== expect)
+        return res.status(400).json({ error: 'code invalide' });
+    }
+    const streak = (row && row.last_day === yest) ? row.streak + 1 : 1;
+    if (row) await runSql('UPDATE friendship_streaks SET streak=?, last_day=?, updated_at=? WHERE user_a=? AND user_b=?', streak, today, t, x, y);
+    else await runSql('INSERT INTO friendship_streaks(user_a,user_b,streak,last_day,updated_at) VALUES(?,?,?,?,?)', x, y, streak, today, t);
+    res.json({ ok: true, streak, last_day: today, via, flame: '🔥' });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+
 // ---------- graphe social : amis communs ----------
 app.get('/api/users/:username/mutual', auth, async (req, res) => {
   try {
@@ -8832,6 +8936,13 @@ app.post('/api/pk/tournament/:id/join', auth, async (req, res) => {
   try {
     const t = await get1('SELECT * FROM pk_tournaments WHERE id=?', req.params.id);
     if (!t) return res.status(404).json({ error: 'tournoi introuvable' });
+    // B8 (2026-10-05) : distinguer « tournoi complet » (4 joueurs) de « tournoi fermé ».
+    // Avant : le statut passait à 'running' dès le 4e joueur → le 5e recevait 403 « fermé ».
+    const pc = await get1(
+      `SELECT COUNT(*) AS c FROM (SELECT player1_id AS p FROM pk_matches WHERE tournament_id=?
+        UNION SELECT player2_id FROM pk_matches WHERE tournament_id=? AND player2_id IS NOT NULL)`,
+      req.params.id, req.params.id);
+    if (pc && Number(pc.c) >= 4) return res.status(400).json({ error: 'tournoi complet' });
     if (t.status !== 'open') return res.status(403).json({ error: 'tournoi fermé' });
     const existing = await get1('SELECT id FROM pk_matches WHERE tournament_id=? AND (player1_id=? OR player2_id=?)',
       req.params.id, req.userId, req.userId);
@@ -8958,6 +9069,9 @@ app.post('/api/live/:id/questions/:qid/answer', auth, async (req, res) => {
     if (!l) return res.status(404).json({ error: 'live introuvable' });
     if (Number(l.user_id) !== Number(req.userId)) return res.status(403).json({ error: 'seul l\'hôte' });
     const a = String((req.body || {}).answer || '').slice(0, 500);
+    // B4 (2026-10-05) : 404 si la question n'existe pas sur ce live
+    const q = await get1('SELECT id FROM live_questions WHERE id=? AND live_id=?', req.params.qid, l.id);
+    if (!q) return res.status(404).json({ error: 'question introuvable' });
     await runSql('UPDATE live_questions SET answer=?, answered_at=? WHERE id=? AND live_id=?', a, now(), req.params.qid, l.id);
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
@@ -9102,7 +9216,8 @@ app.post('/api/live/:id/chat', auth, async (req, res) => {
       if (room) {
         const cpayload = JSON.stringify({ t: 'chat', id, user: u ? u.username : '?', text, created_at: now() });
         if (room.broadcaster && room.broadcaster.readyState === 1) room.broadcaster.send(cpayload);
-        room.viewers.forEach((w) => { if (w && w.readyState === 1) w.send(cpayload); });
+        // COIN-04 : viewers est une Map(ws -> peerId) — forEach(value, key) : le 2e arg est la socket
+        room.viewers.forEach((pid, w) => { if (w && w.readyState === 1) w.send(cpayload); });
       }
     } catch (_) {}
     res.json({ ok: true, id, msg: { id, user: pubUser({ ...u, id: req.userId }), text, created_at: now() } });
@@ -10067,14 +10182,13 @@ app.get('/api/shop/refunds', auth, async (req, res) => {
     res.json({ refunds: rows });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
-app.post('/api/shop/refunds/:id/decide', auth, async (req, res) => {
+app.post('/api/shop/refunds/:id/decide', authOrAdmin, async (req, res) => {
   try {
     const approve = !!((req.body || {}).approve);
     const rf = await get1('SELECT * FROM shop_refunds WHERE id=?', Number(req.params.id));
     if (!rf) return res.status(404).json({ error: 'demande introuvable' });
     if (rf.status !== 'pending') return res.status(400).json({ error: 'déjà traitée' });
-    // seul le vendeur concerné ou un admin peut décider
-    const u = await get1('SELECT id FROM users WHERE id=?', req.userId);
+    // seul le vendeur concerné ou un admin peut décider (B3 : x-admin-token accepté)
     const isAdmin = req.admin === true;
     if (Number(rf.seller_id) !== Number(req.userId) && !isAdmin)
       return res.status(403).json({ error: 'non autorisé' });
@@ -10500,6 +10614,9 @@ app.post('/api/groups/:id/members', auth, async (req, res) => {
 app.delete('/api/groups/:id/leave', auth, async (req, res) => {
   try {
     const gid = req.params.id;
+    // B7 (2026-10-05) : vérifier l'existence du groupe AVANT le contrôle d'appartenance
+    const g = await get1('SELECT id FROM chat_groups WHERE id=?', gid);
+    if (!g) return res.status(404).json({ error: 'groupe introuvable' });
     if (!await isGroupMember(gid, req.userId))
       return res.status(403).json({ error: 'non membre du groupe' });
     await runSql('DELETE FROM group_members WHERE group_id=? AND user_id=?', gid, req.userId);
@@ -10925,9 +11042,10 @@ app.get('/terms', _legal('terms.html'));
 // ==================== v2.44-EQA-OG : pages publiques de partage (OG tags) — Équipe A ====================
 // GET /v/:id, /u/:username, /@/:username, /live/:id → HTML avec Open Graph / Twitter Card
 // pour les aperçus WhatsApp / Facebook / X. Bouton "Ouvrir dans l'app" (deep link vidigagne://).
-// NOTE — PLACEHOLDERS À REMPLACER AVANT PUBLICATION (Kewin) :
-//   - sha256_cert_fingerprints : empreinte SHA-256 du keystore officiel de l'APK
-//   - TEAMID : identifiant d'équipe Apple Developer
+// NOTE (2026-10-05) :
+//   - sha256_cert_fingerprints : ✅ empreinte SHA-256 RÉELLE du keystore officiel (COIN-02)
+//   - Apple : aucun Team ID connu (login Apple à 99 $/an, en attente du feu vert de Kewin)
+//     → apple-app-site-association déclare details:[] (aucune app iOS associée), sans placeholder (COIN-03)
 const escOg = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const ogBaseOf = req => (req.protocol + '://' + req.get('host')).replace(/\/$/, '');
 function ogHtml(req, o) {
@@ -11016,9 +11134,11 @@ app.get('/live/:id', async (req, res) => {
 });
 const ASSETLINKS_EQA = [{ relation: ['delegate_permission/common.handle_all_urls'],
   target: { namespace: 'android_app', package_name: 'com.vidigagne.app',
-    sha256_cert_fingerprints: ['AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11'] } }];
-const AAS_EQA = { applinks: { details: [{ appID: 'TEAMID.com.vidigagne.app',
-  paths: ['/v/*', '/@/*', '/u/*', '/live/*'] }] } };
+    sha256_cert_fingerprints: ['BB:A7:AC:FD:81:9C:3D:E6:13:59:FA:6E:F9:FA:D8:97:0E:63:C6:35:9A:E5:F2:47:B8:31:C4:D5:D0:B2:E2:EA'] } }];
+// COIN-03 (2026-10-05) : pas d'identifiant d'équipe Apple Developer connu (login Apple non
+// configuré — 99 $/an, en attente du feu vert de Kewin) → aucun placeholder factice :
+// details vide = aucune app iOS associée déclarée (valide et honnête).
+const AAS_EQA = { applinks: { details: [] } };
 app.get('/.well-known/assetlinks.json', (req, res) => { res.type('application/json').send(JSON.stringify(ASSETLINKS_EQA)); });
 app.get('/.well-known/apple-app-site-association', (req, res) => { res.type('application/json').send(JSON.stringify(AAS_EQA)); });
 // ==================== fin v2.44-EQA-OG ====================
@@ -11361,7 +11481,13 @@ app.post('/api/messages/requests/:id/accept', auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 app.post('/api/messages/requests/:id/decline', auth, async (req, res) => {
-  try { await runSql("UPDATE message_requests SET status='declined' WHERE id=? AND to_user_id=?", req.params.id, req.userId); res.json({ ok: true }); }
+  try {
+    // B2 (2026-10-05) : 404 si la demande n'existe pas (ou ne m'est pas adressée)
+    const r = await get1('SELECT id FROM message_requests WHERE id=? AND to_user_id=?', req.params.id, req.userId);
+    if (!r) return res.status(404).json({ error: 'demande introuvable' });
+    await runSql("UPDATE message_requests SET status='declined' WHERE id=?", r.id);
+    res.json({ ok: true });
+  }
   catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 
@@ -12092,6 +12218,10 @@ app.get('/api/embed/:username', async (req, res) => {
 });
 app.get('/embed/:username', async (req, res) => {
   try {
+    // COIN-01 (2026-10-05) : la carte profil est FAITE pour être intégrée en iframe —
+    // on retire le DENY global (et le frame-ancestors 'none' de la CSP) sur cette route uniquement.
+    res.removeHeader('X-Frame-Options');
+    res.setHeader('Content-Security-Policy', "default-src 'self'; img-src 'self' data: https:; media-src 'self' https:; style-src 'self' 'unsafe-inline'; frame-ancestors *");
     const u = await get1('SELECT id, username, avatar, bio FROM users WHERE username=?', String(req.params.username).toLowerCase());
     if (!u) return res.status(404).type('html').send('<!DOCTYPE html><html><body style="font-family:sans-serif">utilisateur introuvable</body></html>');
     const f = await get1('SELECT COUNT(*) AS c FROM follows WHERE followed_id=?', u.id);
@@ -12114,7 +12244,8 @@ app.get('/api/videos/:id/download-url', auth, async (req, res) => {
     const v = await get1('SELECT * FROM videos WHERE id=?', req.params.id);
     if (!v) return res.status(404).json({ error: 'vidéo introuvable' });
     if (!Number(v.allow_download)) return res.status(403).json({ error: 'téléchargement non autorisé' });
-    res.json({ ok: true, url: v.url });
+    // B1 : la colonne s'appelle `file` (pas `url`) → construire l'URL via fileUrl()
+    res.json({ ok: true, url: fileUrl(v.file || '') });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 
