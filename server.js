@@ -1381,6 +1381,10 @@ async function pkPublic(b) {
     ends_at: b.ends_at ? Number(b.ends_at) : null, winner_id: b.winner_id || null,
     user_a: ua, user_b: ub, live_a_id: b.live_a_id, live_b_id: b.live_b_id };
 }
+// FIX 2026-10-05 : activePkForLive/pkPublic définis dans un scope non-global (v1.61) —
+// le endpoint /api/live/:id/gift (hors scope) levait ReferenceError, masqué par try/catch.
+// Exposition globale pour que les cadeaux alimentent le score PK.
+try { globalThis.activePkForLive = activePkForLive; globalThis.pkPublic = pkPublic; } catch (_) {}
 app.post('/api/live/:id/pk/invite', auth, async (req, res) => {
   try {
     const l = await liveById(req.params.id);
@@ -1802,7 +1806,7 @@ app.get('/api/search/insights', async (req, res) => {
     lite.exec(`CREATE TABLE IF NOT EXISTS verification_requests(
       id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL UNIQUE, status TEXT NOT NULL DEFAULT 'pending',
       reason TEXT NOT NULL DEFAULT '', created_at BIGINT NOT NULL, reviewed_at BIGINT)`);
-    for (const col of ['full_name','category','website','proof_links','activity','id_doc_url']) {
+    for (const col of ['full_name','category','website','proof_links','activity','id_doc_url','reviewed_by','review_reason']) {
       try { lite.exec(`ALTER TABLE verification_requests ADD COLUMN ${col} TEXT DEFAULT ''`); } catch (_) {}
     }
     lite.exec(`CREATE TABLE IF NOT EXISTS pk_battles(
@@ -2372,6 +2376,16 @@ async function botReviewBadge(r) {
 }
 
 // --- bot : KYC monétisation ---
+// v2.42 : le bot réessaie ses écritures en cas de contention SQLite (database is locked),
+// au lieu d'échouer silencieusement dans le catch — ne change rien d'autre.
+async function botWriteRetry(sql, params) {
+  let last = null;
+  for (let i = 0; i < 15; i++) {
+    try { await runSql(sql, ...(params || [])); return; }
+    catch (e) { last = e; if (!/locked|busy/i.test(String((e && e.message) || e))) throw e; await new Promise(r => setTimeout(r, 400)); }
+  }
+  throw last;
+}
 async function botReviewKyc(v) {
   const fails = [];
   if (!/^[A-Z]{2}$/.test(String(v.country || ''))) fails.push('pays invalide');
@@ -2396,10 +2410,10 @@ async function runVerificationBot() {
     for (const r of badges) {
       try {
         const verdict = await botReviewBadge(r);
-        await runSql(`UPDATE verification_requests SET status=?, reviewed_at=?, reviewed_by='bot', review_reason=? WHERE id=?`,
-          verdict.approved ? 'approved' : 'rejected', now(), verdict.reason, r.id);
+        await botWriteRetry(`UPDATE verification_requests SET status=?, reviewed_at=?, reviewed_by='bot', review_reason=? WHERE id=?`,
+          [verdict.approved ? 'approved' : 'rejected', now(), verdict.reason, r.id]);
         if (verdict.approved) {
-          await runSql('UPDATE users SET verified=1 WHERE id=?', r.user_id);
+          await botWriteRetry('UPDATE users SET verified=1 WHERE id=?', [r.user_id]);
           await notify(r.user_id, 'system', null, null, '🤖✔️ Ton compte est maintenant vérifié !');
         } else {
           await notify(r.user_id, 'system', null, null, '🤖 ' + verdict.reason);
@@ -2421,8 +2435,8 @@ async function runVerificationBot() {
     for (const v of kycs) {
       try {
         const verdict = await botReviewKyc(v);
-        await runSql(`UPDATE id_verifications SET status=?, reviewed_at=?, reviewed_by='bot', review_reason=? WHERE id=?`,
-          verdict.approved ? 'approved' : 'rejected', now(), verdict.reason, v.id);
+        await botWriteRetry(`UPDATE id_verifications SET status=?, reviewed_at=?, reviewed_by='bot', review_reason=? WHERE id=?`,
+          [verdict.approved ? 'approved' : 'rejected', now(), verdict.reason, v.id]);
         const u = await get1('SELECT username FROM users WHERE id=?', v.user_id);
         await notify(v.user_id, 'system', null, null,
           verdict.approved ? '🤖✔️ Ton identité est vérifiée — tu peux retirer tes gains !'
@@ -2891,9 +2905,12 @@ async function fraudAlert(type, userId, ip, detail) {
   try {
     const t = now(), hourAgo = t - 3600000;
     const ipS = String(ip || '');
+    // TODO-DEBUG v2.41 : à retirer après diagnostic
+    try { console.error('FADBG', type, userId, JSON.stringify(ipS)); } catch (_) {}
     const dup = await get1(
       'SELECT 1 FROM fraud_alerts WHERE type=? AND created_at>? AND (ip=? OR (user_id IS NOT NULL AND user_id=?))',
       String(type).slice(0, 40), hourAgo, ipS, userId || -1);
+    try { console.error('FADBG dup=' + JSON.stringify(dup)); } catch (_) {}
     if (dup) return false;
     await runSql('INSERT INTO fraud_alerts(type,user_id,ip,detail,created_at) VALUES(?,?,?,?,?)',
       String(type).slice(0, 40), userId || null, ipS, String(detail || '').slice(0, 500), t);
@@ -4222,6 +4239,7 @@ app.get('/api/creator/stats', auth, async (req, res) => {
     views_7d: views7, last7d: views7, likes_7d: likes7, new_followers_7d: followers7, new_followers7d: followers7,
     tips_total: Number(tipsR.s) || 0, tips: Number(tipsR.s) || 0,
     gifts_total: Number(giftsR.s) || 0, gifts: Number(giftsR.s) || 0,
+    ad_earnings_total: Number(adEarn.s) || 0, // v2.42 : gains publicitaires 50-50 (distribution quotidienne)
     top: vids.sort((a, b) => b.views - a.views).slice(0, 5)
       .map(v => ({ id: v.id, desc: v.description, views: Number(v.views) })),
   });
@@ -5751,11 +5769,14 @@ app.post('/api/videos/:id/like', auth, async (req, res) => {
     await insertIgnore('INSERT OR IGNORE INTO likes(user_id,video_id,created_at) VALUES(?,?,?)',
       req.userId, v.id, now());
     // v2.41 : vélocité anti-fraude — >15 likes en 5 min = comportement de bot (farme de likes).
+    // TODO-DEBUG v2.41 : à retirer après diagnostic
+    try { const _dbg = await get1('SELECT COUNT(*) AS c FROM likes WHERE user_id=?', req.userId); console.error('VELDBG', req.userId, 'total_likes=' + _dbg.c, 'already=' + !!alreadyLiked); } catch (_) {}
     if (!alreadyLiked) {
       try {
         const _lc = await get1('SELECT COUNT(*) AS c FROM likes WHERE user_id=? AND created_at>?', req.userId, now() - 300000);
+        try { console.error('VELCNT', req.userId, 'cnt5min=' + _lc.c); } catch (_) {}
         if (Number(_lc.c) > 15) await fraudAlert('like_velocity', req.userId, clientIp(req), Number(_lc.c) + ' likes en 5 min — vélocité suspecte');
-      } catch (_e) {}
+      } catch (_e) { try { console.error('VELERR', req.userId, String(_e && _e.message).slice(0, 120)); } catch (_) {} }
     }
     if (!alreadyLiked) await notify(v.user_id, 'like', req.userId, v.id, '');
     // v2.38 : signal « Pour toi » — un like frais incrémente les scores des tags de la vidéo
@@ -6313,8 +6334,8 @@ app.post('/api/admin/users/:id/suspend', adminAuth, async (req, res) => {
     const suspend = !!(req.body || {}).suspend;
     await runSql('UPDATE users SET suspended=? WHERE id=?', suspend ? 1 : 0, u.id);
     await notify(u.id, 'system', null, null, suspend ? '⛔ Ton compte a été suspendu par un administrateur.' : '✅ Ton compte a été réactivé.');
+    await logAudit(null, suspend ? 'user_ban' : 'user_unban', 'user', u.id, req); // v2.43 (avant res.json : pas de course avec le client)
     res.json({ ok: true, id: u.id, username: u.username, suspended: suspend });
-    await logAudit(null, suspend ? 'user_ban' : 'user_unban', 'user', u.id, req); // v2.43
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 
@@ -8673,7 +8694,7 @@ app.post('/api/live/:id/gift', auth, async (req, res) => {
       const _pkb = await activePkForLive(l.id);
       if (_pkb && _pkb.status === 'active') {
         const col = Number(_pkb.user_a_id) === Number(l.user_id) ? 'score_a' : 'score_b';
-        await runSql('UPDATE pk_battles SET ' + col + '=' + col + '+? WHERE id=?', g.coins || 1, _pkb.id);
+        await runSql('UPDATE pk_battles SET ' + col + '=' + col + '+? WHERE id=?', g.cost || 1, _pkb.id);
       }
     } catch (_) {}
     if (!g) return res.status(400).json({ error: 'cadeau inconnu' });
