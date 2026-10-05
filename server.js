@@ -2905,17 +2905,24 @@ async function fraudAlert(type, userId, ip, detail) {
   try {
     const t = now(), hourAgo = t - 3600000;
     const ipS = String(ip || '');
-    // TODO-DEBUG v2.41 : à retirer après diagnostic
-    try { console.error('FADBG', type, userId, JSON.stringify(ipS)); } catch (_) {}
-    const dup = await get1(
-      'SELECT 1 FROM fraud_alerts WHERE type=? AND created_at>? AND (ip=? OR (user_id IS NOT NULL AND user_id=?))',
-      String(type).slice(0, 40), hourAgo, ipS, userId || -1);
-    try { console.error('FADBG dup=' + JSON.stringify(dup)); } catch (_) {}
+    const t40 = String(type).slice(0, 40);
+    // Déduplication : 1 alerte/heure max — par IP pour ip_velocity (plusieurs comptes, même IP),
+    // par utilisateur pour les alertes liées à un compte (view_velocity, like_velocity),
+    // par IP pour les alertes anonymes. Sans ça, un faux positif partageant la même IP
+    // (ex. ::1 en local) bloquerait les alertes légitimes des autres utilisateurs.
+    let dup = null;
+    if (t40 === 'ip_velocity') {
+      dup = await get1('SELECT 1 FROM fraud_alerts WHERE type=? AND ip=? AND created_at>?', t40, ipS, hourAgo);
+    } else if (userId) {
+      dup = await get1('SELECT 1 FROM fraud_alerts WHERE type=? AND user_id=? AND created_at>?', t40, userId, hourAgo);
+    } else {
+      dup = await get1('SELECT 1 FROM fraud_alerts WHERE type=? AND user_id IS NULL AND ip=? AND created_at>?', t40, ipS, hourAgo);
+    }
     if (dup) return false;
     await runSql('INSERT INTO fraud_alerts(type,user_id,ip,detail,created_at) VALUES(?,?,?,?,?)',
-      String(type).slice(0, 40), userId || null, ipS, String(detail || '').slice(0, 500), t);
+      t40, userId || null, ipS, String(detail || '').slice(0, 500), t);
     return true;
-  } catch (e) { try { console.error('FADBG_ERR', String(e && e.message).slice(0, 160)); } catch (_) {} return false; }
+  } catch (e) { return false; }
 }
 // Vrai si l'utilisateur est sur un device flagged avec ≥5 comptes distincts → gains bloqués
 // (seuil 5 : en dessous, simple détection sans blocage — faux positifs possibles : famille, revente).
@@ -5769,14 +5776,11 @@ app.post('/api/videos/:id/like', auth, async (req, res) => {
     await insertIgnore('INSERT OR IGNORE INTO likes(user_id,video_id,created_at) VALUES(?,?,?)',
       req.userId, v.id, now());
     // v2.41 : vélocité anti-fraude — >15 likes en 5 min = comportement de bot (farme de likes).
-    // TODO-DEBUG v2.41 : à retirer après diagnostic
-    try { const _dbg = await get1('SELECT COUNT(*) AS c FROM likes WHERE user_id=?', req.userId); console.error('VELDBG', req.userId, 'total_likes=' + _dbg.c, 'already=' + !!alreadyLiked); } catch (_) {}
     if (!alreadyLiked) {
       try {
         const _lc = await get1('SELECT COUNT(*) AS c FROM likes WHERE user_id=? AND created_at>?', req.userId, now() - 300000);
-        try { console.error('VELCNT', req.userId, 'cnt5min=' + _lc.c); } catch (_) {}
         if (Number(_lc.c) > 15) await fraudAlert('like_velocity', req.userId, clientIp(req), Number(_lc.c) + ' likes en 5 min — vélocité suspecte');
-      } catch (_e) { try { console.error('VELERR', req.userId, String(_e && _e.message).slice(0, 120)); } catch (_) {} }
+      } catch (_e) {}
     }
     if (!alreadyLiked) await notify(v.user_id, 'like', req.userId, v.id, '');
     // v2.38 : signal « Pour toi » — un like frais incrémente les scores des tags de la vidéo
