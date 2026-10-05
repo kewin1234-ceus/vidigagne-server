@@ -13506,7 +13506,19 @@ app.post('/api/admin/app/apk', adminAuth, uploadApk.single('apk'), async (req, r
   } catch (e) { res.status(500).json({ error: 'échec du téléversement : ' + String((e && e.message) || e).slice(0, 150) }); }
 });
 
-// ---------- vidéos privées (onglet cadenas) ----------
+// Enregistrer directement une URL d'APK déjà hébergée (admin) — ex. GitHub Release
+// (fichiers >10 Mo refusés par Cloudinary gratuit). L'URL doit être https et finir en .apk.
+app.post('/api/admin/app/apk-url', adminAuth, async (req, res) => {
+  try {
+    const url = String((req.body || {}).url || '').trim();
+    if (!/^https:\/\//i.test(url) || !/\.apk(\?|$)/i.test(url))
+      return res.status(400).json({ error: 'URL https vers un fichier .apk requise' });
+    await runSql(`INSERT INTO app_config(key,value,updated_at) VALUES('apk_url',?,?)
+      ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at`,
+      url, now());
+    res.json({ ok: true, apkUrl: url, versionCode: APP_VERSION_CODE, versionName: APP_VERSION_NAME });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
 // FIX 2026-10-04 (chantier edge) : les erreurs multer (mauvais type de fichier, fichier
 // trop gros) tombaient sur le gestionnaire d'erreurs Express par défaut → page HTML 500
 // avec stack trace. → erreur JSON propre (400/413) avec message clair.
