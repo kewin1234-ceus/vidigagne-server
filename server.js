@@ -4076,10 +4076,20 @@ app.post('/api/videos', auth, upload.single('video'), async (req, res) => {
         }
       } catch (_) {}
     })();
-    // pièces : +10 par publication
-    await runSql('UPDATE users SET coins=coins+10 WHERE id=?', req.userId);
-    await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
-      req.userId, 10, 'publication vidéo #' + id, now());
+    // pièces : +10 par publication — FIX éco 2026-10-05 (abus B1) : AUCUN plafond avant →
+    // 100 micro-vidéos = 1000 pièces = seuil de retrait (2 $). Maintenant : 100/jour max
+    // (10 publications), même pattern que les watch-rewards (withUserLock anti-TOCTOU).
+    const _pubDayStart = new Date().setHours(0, 0, 0, 0);
+    await withUserLock(req.userId, async () => {
+      const _pubEarned = Number((await get1(
+        "SELECT COALESCE(SUM(amount),0) AS s FROM ledger WHERE user_id=? AND reason LIKE 'publication vidéo%' AND created_at>=?",
+        req.userId, _pubDayStart)).s);
+      if (_pubEarned >= 100) return;
+      const _pubGrant = Math.min(10, 100 - _pubEarned);
+      await runSql('UPDATE users SET coins=coins+? WHERE id=?', _pubGrant, req.userId);
+      await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
+        req.userId, _pubGrant, 'publication vidéo #' + id, now());
+    });
     // modération auto V3 : scan du texte (sans IA externe)
     const badW = scanBanned(descText + ' ' + String(b.tags || ''));
     if (badW) {
