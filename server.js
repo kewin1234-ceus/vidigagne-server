@@ -71,6 +71,12 @@ CREATE TABLE IF NOT EXISTS tokens(
   user_id INTEGER NOT NULL,
   created_at BIGINT NOT NULL
 );
+-- v2.49 : mise à jour auto de l'app (sans Play Store) — config clé/valeur (ex: apk_url)
+CREATE TABLE IF NOT EXISTS app_config(
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL DEFAULT '',
+  updated_at BIGINT NOT NULL DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS devices(
   device_id TEXT PRIMARY KEY,
   user_ids TEXT NOT NULL DEFAULT '[]',
@@ -5808,8 +5814,16 @@ function setupLiveWs(server) {
       if (!room) return;
       if (m.t === 'chat') {
         const uid = await userIdFromToken(m.token);
-        const text = String(m.text || '').slice(0, 200);
-        if (!uid || !text) return;
+        const raw = String(m.text || '').trim().slice(0, 280);
+        if (!uid || !raw) return;
+        // FIX sécu 2026-10-05 (failles vague 2 F3) : le chat WS contournait le filtre
+        // anti-gros mots et le ban/mute (appliqués sur le HTTP). Même protection ici.
+        if (containsBadword(raw)) return;
+        try {
+          const bk = await get1('SELECT kind FROM live_bans WHERE live_id=? AND user_id=?', liveId, uid);
+          if (bk) return;
+        } catch (_) {}
+        const text = raw;
         const u = await get1('SELECT username FROM users WHERE id=?', uid);
         const payload = JSON.stringify({ t: 'chat', user: u ? u.username : '?', text });
         if (room.broadcaster && room.broadcaster.readyState === 1) room.broadcaster.send(payload);
@@ -5817,17 +5831,10 @@ function setupLiveWs(server) {
         if (ws.readyState === 1) ws.send(payload);
         return;
       }
-      if (m.t === 'gift') {
-        // comme le chat : le cadeau doit venir d'un token valide, et le nom
-        // d'expéditeur vient du serveur (pas du client)
-        const uid = await userIdFromToken(m.token);
-        if (!uid) return;
-        const u = await get1('SELECT username FROM users WHERE id=?', uid);
-        const payload = JSON.stringify({ t: 'gift', gift: String(m.gift || '').slice(0, 40), from: u ? u.username : '?' });
-        if (room.broadcaster && room.broadcaster.readyState === 1) room.broadcaster.send(payload);
-        room.viewers.forEach((pid, w) => { if (w.readyState === 1) w.send(payload); });
-        return;
-      }
+      // FIX sécu 2026-10-05 (failles vague 2 F3) : le handler WS 'gift' a été SUPPRIMÉ.
+      // Il diffusait un visuel de cadeau SANS aucun débit de pièces (spoof prouvé :
+      // n'importe quel client WS pouvait afficher "🐉 DRAGON LÉGENDAIRE" gratuitement).
+      // Les vrais cadeaux passent par POST /api/live/:id/gift (débite puis crédite le score).
       // relais WebRTC offer/answer/ice
       const from = role === 'broadcaster' ? 'broadcaster' : peerId;
       let target = null;
@@ -10305,13 +10312,6 @@ app.post('/api/live/:id/gift', auth, async (req, res) => {
     if (!l) return res.status(404).json({ error: 'live introuvable' });
     if (l.ended_at) return res.status(403).json({ error: 'live terminé' });
     const g = GIFT_CATALOG.find(x => x.id === String((req.body || {}).gift_id || ''));
-    try {
-      const _pkb = await activePkForLive(l.id);
-      if (_pkb && _pkb.status === 'active') {
-        const col = Number(_pkb.user_a_id) === Number(l.user_id) ? 'score_a' : 'score_b';
-        await runSql('UPDATE pk_battles SET ' + col + '=' + col + '+? WHERE id=?', g.cost || 1, _pkb.id);
-      }
-    } catch (_) {}
     if (!g) return res.status(400).json({ error: 'cadeau inconnu' });
     const me = await get1('SELECT * FROM users WHERE id=?', req.userId);
     if (!me) return res.status(400).json({ error: 'compte introuvable' });
@@ -10330,6 +10330,16 @@ app.post('/api/live/:id/gift', auth, async (req, res) => {
     // débit atomique anti double-envoi (race condition)
     const debited = await runSqlChanges('UPDATE users SET coins=coins-? WHERE id=? AND coins>=?', g.cost, req.userId, g.cost);
     if (!debited) return res.status(400).json({ error: 'pas assez de pièces' });
+    // FIX sécu 2026-10-05 (failles vague 2 F1) : le score PK était crédité AVANT la validation
+    // du cadeau et AVANT le débit → score gonflable gratuitement (même avec un cadeau invalide
+    // ou 0 pièce). Maintenant : score APRÈS débit réussi uniquement.
+    try {
+      const _pkb = await activePkForLive(l.id);
+      if (_pkb && _pkb.status === 'active') {
+        const col = Number(_pkb.user_a_id) === Number(l.user_id) ? 'score_a' : 'score_b';
+        await runSql('UPDATE pk_battles SET ' + col + '=' + col + '+? WHERE id=?', g.cost, _pkb.id);
+      }
+    } catch (_) {}
     const split = await applyGiftSplit(req.userId, toUserId, g.cost, g.id, l.id);
     await runSql('INSERT INTO gifts(from_id,to_id,video_id,live_id,gift,cost,created_at) VALUES(?,?,?,?,?,?,?)',
       req.userId, toUserId, null, l.id, g.id, g.cost, now());
@@ -11255,6 +11265,10 @@ app.post('/api/shop/refunds/:id/decide', authOrAdmin, async (req, res) => {
     const rf = await get1('SELECT * FROM shop_refunds WHERE id=?', Number(req.params.id));
     if (!rf) return res.status(404).json({ error: 'demande introuvable' });
     if (rf.status !== 'pending') return res.status(400).json({ error: 'déjà traitée' });
+    // FIX sécu 2026-10-05 (failles vague 2 F2) : 2 décisions parallèles passaient le check
+    // 'pending' → acheteur crédité 2 fois (TOCTOU). Claim atomique : un seul gagne.
+    const claimed = await runSqlChanges("UPDATE shop_refunds SET status='processing' WHERE id=? AND status='pending'", rf.id);
+    if (!claimed) return res.status(400).json({ error: 'déjà traitée' });
     // seul le vendeur concerné ou un admin peut décider (B3 : x-admin-token accepté)
     const isAdmin = req.admin === true;
     if (Number(rf.seller_id) !== Number(req.userId) && !isAdmin)
@@ -13450,6 +13464,46 @@ app.get('/api/videos/:id/download-url', auth, async (req, res) => {
     // B1 : la colonne s'appelle `file` (pas `url`) → construire l'URL via fileUrl()
     res.json({ ok: true, url: fileUrl(v.file || '') });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+
+// ==================== v2.49 : MISE À JOUR AUTO DE L'APP (sans Play Store) ====================
+// L'app appelle /api/app/version au démarrage (1x/jour) et propose le téléchargement
+// si versionCode > celui installé. L'APK est hébergée sur Cloudinary (URL stable).
+const APP_VERSION_CODE = 249;
+const APP_VERSION_NAME = '2.49';
+const APP_CHANGELOG = "Mise à jour auto dans l'app, motif des sanctions affiché, correctifs sécurité et concurrence.";
+async function appConfigGet(key) {
+  try { const r = await get1('SELECT value FROM app_config WHERE key=?', key); return r ? r.value : ''; }
+  catch (e) { return ''; }
+}
+app.get('/api/app/version', async (req, res) => {
+  try {
+    const apkUrl = (await appConfigGet('apk_url')) || process.env.APP_APK_URL || '';
+    res.json({ ok: true, versionCode: APP_VERSION_CODE, versionName: APP_VERSION_NAME, apkUrl, changelog: APP_CHANGELOG, mandatory: false });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// Upload d'une nouvelle APK (admin) → Cloudinary (raw) → URL stable enregistrée
+const uploadApk = multer({ storage: multer.memoryStorage(), limits: { fileSize: 150 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    if (/\.apk$/i.test(file.originalname || '') || file.mimetype === 'application/vnd.android.package-archive') cb(null, true);
+    else cb(new Error('seuls les fichiers .apk sont acceptés'));
+  },
+});
+app.post('/api/admin/app/apk', adminAuth, uploadApk.single('apk'), async (req, res) => {
+  try {
+    if (!USE_CLOUDINARY) return res.status(500).json({ error: 'Cloudinary non configuré' });
+    if (!req.file) return res.status(400).json({ error: 'fichier APK requis (champ "apk")' });
+    const up = await new Promise((resolve, reject) => {
+      const stream = cloudinary.uploader.upload_stream(
+        { resource_type: 'raw', public_id: 'vidigagne-apk/VidiGagne-v' + APP_VERSION_NAME, overwrite: true },
+        (err, result) => err ? reject(err) : resolve(result));
+      stream.end(req.file.buffer);
+    });
+    await runSql(`INSERT INTO app_config(key,value,updated_at) VALUES('apk_url',?,?)
+      ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at`,
+      up.secure_url, now());
+    res.json({ ok: true, apkUrl: up.secure_url, versionCode: APP_VERSION_CODE, versionName: APP_VERSION_NAME });
+  } catch (e) { res.status(500).json({ error: 'échec du téléversement : ' + String((e && e.message) || e).slice(0, 150) }); }
 });
 
 // ---------- vidéos privées (onglet cadenas) ----------
