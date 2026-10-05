@@ -8947,6 +8947,9 @@ app.post('/api/follow/:username', auth, async (req, res) => {
   const u = await get1('SELECT * FROM users WHERE username=?', String(req.params.username).toLowerCase());
   if (!u) return res.status(404).json({ error: 'utilisateur introuvable' });
   if (Number(u.id) === Number(req.userId)) return res.status(400).json({ error: 'impossible de se suivre soi-même' });
+  // FIX états 2026-10-05 (I2b) : on pouvait suivre quelqu'un qu'on a bloqué (ou qui nous a
+  // bloqué) → état follow+block incohérent. Cohérent avec les DMs (403 « utilisateur bloqué »).
+  if (await isBlocked(req.userId, u.id)) return res.status(403).json({ error: 'utilisateur bloqué' });
   // v2.40 : compte privé → demande de suivi au lieu d'abonnement direct
   if (Number(u.is_private) === 1) {
     const already = await get1('SELECT 1 FROM follows WHERE follower_id=? AND followed_id=?', req.userId, u.id);
