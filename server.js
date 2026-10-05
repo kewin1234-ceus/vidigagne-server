@@ -2271,6 +2271,94 @@ app.get('/api/search/insights', async (req, res) => {
   ]) {
     try { if (USE_PG) await pool.query(idxSql); else lite.exec(idxSql); } catch (e) {}
   }
+  // v2.48 (bots chaîne vague 3 — 2026-10-05) : tables des 10 features
+  // analytics-pro (sources de trafic), chapitres, suivi hashtags, filtres mots-clés,
+  // nudges rétention, hors-ligne, premieres, traductions, commissions vidéo-shopping
+  const _specTables = [
+    `CREATE TABLE IF NOT EXISTS video_view_sources(
+      id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+      video_id INTEGER NOT NULL, user_id INTEGER, source TEXT NOT NULL DEFAULT 'other',
+      created_at BIGINT NOT NULL)`,
+    `CREATE TABLE IF NOT EXISTS video_chapters(
+      id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+      video_id INTEGER NOT NULL, title TEXT NOT NULL DEFAULT '',
+      starts_at_sec INTEGER NOT NULL DEFAULT 0, created_at BIGINT NOT NULL,
+      UNIQUE(video_id, starts_at_sec))`,
+    `CREATE TABLE IF NOT EXISTS hashtag_follows(
+      user_id INTEGER NOT NULL, tag TEXT NOT NULL,
+      last_seen_at BIGINT NOT NULL DEFAULT 0, created_at BIGINT NOT NULL,
+      PRIMARY KEY(user_id, tag))`,
+    `CREATE TABLE IF NOT EXISTS comment_keyword_filters(
+      id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+      user_id INTEGER NOT NULL, keyword TEXT NOT NULL,
+      created_at BIGINT NOT NULL, UNIQUE(user_id, keyword))`,
+    `CREATE TABLE IF NOT EXISTS comment_hold(
+      id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+      comment_id INTEGER NOT NULL UNIQUE, video_id INTEGER NOT NULL,
+      author_id INTEGER NOT NULL, owner_id INTEGER NOT NULL,
+      keyword TEXT NOT NULL DEFAULT '', created_at BIGINT NOT NULL)`,
+    `CREATE TABLE IF NOT EXISTS retention_nudges(
+      id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+      user_id INTEGER NOT NULL, kind TEXT NOT NULL,
+      scheduled_at BIGINT NOT NULL, sent_at BIGINT, created_at BIGINT NOT NULL)`,
+    `CREATE TABLE IF NOT EXISTS offline_downloads(
+      user_id INTEGER NOT NULL, video_id INTEGER NOT NULL, created_at BIGINT NOT NULL,
+      PRIMARY KEY(user_id, video_id))`,
+    `CREATE TABLE IF NOT EXISTS premieres(
+      id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+      video_id INTEGER NOT NULL UNIQUE, creator_id INTEGER NOT NULL,
+      scheduled_at BIGINT NOT NULL, status TEXT NOT NULL DEFAULT 'scheduled',
+      created_at BIGINT NOT NULL)`,
+    `CREATE TABLE IF NOT EXISTS premiere_reminders(
+      video_id INTEGER NOT NULL, user_id INTEGER NOT NULL, created_at BIGINT NOT NULL,
+      PRIMARY KEY(video_id, user_id))`,
+    `CREATE TABLE IF NOT EXISTS premiere_chat(
+      id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+      video_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+      text TEXT NOT NULL DEFAULT '', created_at BIGINT NOT NULL)`,
+    `CREATE TABLE IF NOT EXISTS video_translations(
+      id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+      video_id INTEGER NOT NULL, lang TEXT NOT NULL,
+      text TEXT NOT NULL DEFAULT '', source_hash TEXT NOT NULL DEFAULT '',
+      created_at BIGINT NOT NULL, UNIQUE(video_id, lang))`,
+    `CREATE TABLE IF NOT EXISTS translation_quota(
+      user_id INTEGER NOT NULL, day TEXT NOT NULL, count INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY(user_id, day))`,
+    `CREATE TABLE IF NOT EXISTS video_sale_commissions(
+      id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+      order_id INTEGER NOT NULL, video_id INTEGER NOT NULL,
+      creator_id INTEGER NOT NULL, coins INTEGER NOT NULL DEFAULT 0,
+      refunded INTEGER NOT NULL DEFAULT 0, created_at BIGINT NOT NULL)`,
+  ];
+  for (const tSql of _specTables) {
+    try { if (USE_PG) await pool.query(tSql); else lite.exec(tSql); } catch (e) {}
+  }
+  for (const idxSql of [
+    'CREATE INDEX IF NOT EXISTS idx_vvs_video ON video_view_sources(video_id)',
+    'CREATE INDEX IF NOT EXISTS idx_vvs_created ON video_view_sources(created_at)',
+    'CREATE INDEX IF NOT EXISTS idx_chapters_video ON video_chapters(video_id)',
+    'CREATE INDEX IF NOT EXISTS idx_hf_user ON hashtag_follows(user_id)',
+    'CREATE INDEX IF NOT EXISTS idx_ckf_user ON comment_keyword_filters(user_id)',
+    'CREATE INDEX IF NOT EXISTS idx_chold_owner ON comment_hold(owner_id)',
+    'CREATE INDEX IF NOT EXISTS idx_nudges_user ON retention_nudges(user_id)',
+    'CREATE INDEX IF NOT EXISTS idx_od_user ON offline_downloads(user_id)',
+    'CREATE INDEX IF NOT EXISTS idx_prem_status ON premieres(status, scheduled_at)',
+    'CREATE INDEX IF NOT EXISTS idx_premrem_video ON premiere_reminders(video_id)',
+    'CREATE INDEX IF NOT EXISTS idx_vt_video ON video_translations(video_id)',
+    'CREATE INDEX IF NOT EXISTS idx_vsc_creator ON video_sale_commissions(creator_id)',
+  ]) {
+    try { if (USE_PG) await pool.query(idxSql); else lite.exec(idxSql); } catch (e) {}
+  }
+  // v2.48 (bots chaîne vague 3) : nouvelles colonnes
+  await mig('users', 'comment_filter_mode', `TEXT NOT NULL DEFAULT 'off'`); // off|hold|hide
+  await mig('users', 'nudge_optout', `INTEGER NOT NULL DEFAULT 0`);
+  await mig('users', 'tz_offset', `INTEGER NOT NULL DEFAULT 0`); // décalage minutes vs UTC (client)
+  await mig('videos', 'desc_hash', `TEXT NOT NULL DEFAULT ''`);
+  await mig('retention_nudges', 'meta', `TEXT NOT NULL DEFAULT ''`); // SPEC-08 : métadonnées du nudge (autre ingé.)
+  await mig('retention_nudges', 'opened_at', `BIGINT NOT NULL DEFAULT 0`); // SPEC-08 : suivi d'ouverture
+  await mig('videos', 'lang', `TEXT NOT NULL DEFAULT 'fr'`); // SPEC-04 : langue d'origine de la vidéo
+  await mig('offline_downloads', 'file_size', `INTEGER NOT NULL DEFAULT 0`); // SPEC-01 : taille du fichier local
+  await mig('orders', 'source_video_id', `INTEGER`);
   // FIX 2026-10-05 (audit DB) : bloc de migrations dupliqué supprimé — is_replay, live_id,
   // tts_text, tts_voice, tts_rate étaient déjà migrés plus haut (avec des types TEXT) ;
   // la 2e passe ne faisait rien (colonne déjà existante) et créait une ambiguïté de type.
@@ -4407,6 +4495,41 @@ app.get('/api/hashtag/:tag', async (req, res) => {
   }
   res.json({ tag, videos: out.slice((hpage - 1) * 50, hpage * 50), page: hpage, has_more: out.length > hpage * 50 });
 });
+// ---------- v2.48 SPEC-03 : suivi de hashtags ----------
+// POST/DELETE /api/hashtags/:tag/follow — GET /api/hashtags/following — POST /api/hashtags/:tag/seen
+app.post('/api/hashtags/:tag/follow', auth, async (req, res) => {
+  try {
+    const tag = String(req.params.tag || '').toLowerCase().replace(/^#/, '').trim().slice(0, 60);
+    if (!tag) return res.status(400).json({ error: 'hashtag invalide' });
+    const n = await get1('SELECT COUNT(*) AS c FROM hashtag_follows WHERE user_id=?', req.userId);
+    const ex = await get1('SELECT 1 FROM hashtag_follows WHERE user_id=? AND tag=?', req.userId, tag);
+    if (!ex && Number(n.c) >= HASHTAG_FOLLOW_LIMIT)
+      return res.status(400).json({ error: 'limite de ' + HASHTAG_FOLLOW_LIMIT + ' hashtags suivis atteinte' });
+    await insertIgnore('INSERT OR IGNORE INTO hashtag_follows(user_id,tag,last_seen_at,created_at) VALUES(?,?,?,?)',
+      req.userId, tag, now(), now());
+    res.json({ ok: true, tag });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.delete('/api/hashtags/:tag/follow', auth, async (req, res) => {
+  try {
+    const tag = String(req.params.tag || '').toLowerCase().replace(/^#/, '').trim().slice(0, 60);
+    await runSql('DELETE FROM hashtag_follows WHERE user_id=? AND tag=?', req.userId, tag);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.get('/api/hashtags/following', auth, async (req, res) => {
+  try {
+    const rows = await allRows('SELECT tag, last_seen_at, created_at FROM hashtag_follows WHERE user_id=? ORDER BY created_at DESC', req.userId);
+    res.json({ ok: true, tags: rows.map(r => ({ tag: r.tag, last_seen_at: Number(r.last_seen_at) || 0 })) });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.post('/api/hashtags/:tag/seen', auth, async (req, res) => {
+  try {
+    const tag = String(req.params.tag || '').toLowerCase().replace(/^#/, '').trim().slice(0, 60);
+    await runSql('UPDATE hashtag_follows SET last_seen_at=? WHERE user_id=? AND tag=?', now(), req.userId, tag);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
 // ---------- commentaires : likes + épingler ----------
 app.post('/api/comments/:id/like', auth, async (req, res) => {
   try {
@@ -4597,7 +4720,9 @@ app.get('/api/creator/stats/compare', auth, async (req, res) => {
     };
     const p1 = await periodStats(f1, t1), p2 = await periodStats(f2, t2);
     const deltaOf = (a, b) => ({ abs: a - b, pct: b ? Math.round(((a - b) / b) * 1000) / 10 : (a > 0 ? null : 0) });
-    res.json({ ok: true,
+    const _vse = await get1('SELECT COALESCE(SUM(c.coins),0) AS s FROM video_sale_commissions c WHERE c.creator_id=? AND c.refunded=0 AND c.created_at>=?', req.userId, now() - 30 * 86400000).catch(() => ({ s: 0 }));
+    const video_sales_earned = Number((_vse && _vse.s) || 0);
+    res.json({ ok: true, video_sales_earned,
       period1: Object.assign({ from: f1, to: t1 }, p1),
       period2: Object.assign({ from: f2, to: t2 }, p2),
       delta: { views: deltaOf(p1.views, p2.views), likes: deltaOf(p1.likes, p2.likes),
@@ -5856,6 +5981,14 @@ app.get('/api/feed', async (req, res) => {
       }
     }
     const videos = [];
+    // v2.48 (SPEC-03) : hashtags suivis → marqueur via_hashtag sur les vidéos correspondantes
+    let followedTags = new Set();
+    if (meId) {
+      try {
+        const ft = await allRows('SELECT tag FROM hashtag_follows WHERE user_id=?', meId);
+        for (const r of ft) followedTags.add(String(r.tag).toLowerCase());
+      } catch (e) {}
+    }
     for (const v of rows) {
       const j = await videoJSON(v, meId);
       if (!j) continue;
@@ -5863,6 +5996,13 @@ app.get('/api/feed', async (req, res) => {
       if (v.reposter_id && Number(v.reposter_id) !== Number(meId)) {
         const ru = await get1('SELECT id, username, name FROM users WHERE id=?', v.reposter_id);
         if (ru) j.reposted_by = { id: ru.id, username: ru.username, name: ru.name };
+      }
+      if (followedTags.size) {
+        try {
+          const vt = extractTags((v.description || '') + ' ' + (v.tags || ''));
+          const hit = vt.find(t => followedTags.has(String(t).toLowerCase()));
+          if (hit) j.via_hashtag = '#' + hit;
+        } catch (e) {}
       }
       videos.push(j);
     }
@@ -5951,7 +6091,7 @@ app.get('/api/videos/:id/analytics', auth, async (req, res) => {
       }
     } catch (e) {}
     // v2.39 : répartition du trafic par source
-    const traffic = { feed: 0, following: 0, search: 0, profile: 0, deeplink: 0, other: 0 };
+    const traffic = { feed: 0, foryou: 0, following: 0, search: 0, profile: 0, deeplink: 0, other: 0 };
     try {
       const tr = await allRows('SELECT source, COUNT(*) AS n FROM video_views WHERE video_id=? GROUP BY source', vid);
       for (const r of tr) {
@@ -5959,7 +6099,41 @@ app.get('/api/videos/:id/analytics', auth, async (req, res) => {
         if (k in traffic) traffic[k] += Number(r.n) || 0;
       }
     } catch (e) {}
-    res.json({ views, likes, comments, shares, avg_watch, top_country, views_by_hour, traffic });
+    // v2.48 (SPEC analytics-pro) : traffic_sources + top_source (depuis video_view_sources, repli sur video_views)
+    let traffic_sources = { ...traffic };
+    try {
+      const ts = await allRows('SELECT source, COUNT(*) AS n FROM video_view_sources WHERE video_id=? GROUP BY source', vid);
+      if (ts.length) {
+        traffic_sources = { feed: 0, foryou: 0, following: 0, search: 0, profile: 0, deeplink: 0, other: 0 };
+        for (const r of ts) {
+          const k = String(r.source || 'other').toLowerCase();
+          if (k in traffic_sources) traffic_sources[k] += Number(r.n) || 0;
+          else traffic_sources.other += Number(r.n) || 0;
+        }
+      }
+    } catch (e) {}
+    let top_source = 'other', top_n = -1;
+    for (const [k, n] of Object.entries(traffic_sources)) { if (n > top_n) { top_n = n; top_source = k; } }
+    // v2.48 (SPEC analytics-pro) : courbe de rétention à la seconde depuis watch_events
+    // % de spectateurs ayant regardé >= chaque seconde ; échantillonnage adaptatif (≤300 points)
+    let retention_curve = [];
+    try {
+      const dur = Number(v.duration) || 0;
+      if (dur > 0) {
+        const mx = await allRows('SELECT user_id, MAX(watch_ms) AS m FROM watch_events WHERE video_id=? GROUP BY user_id', vid);
+        const total = mx.length;
+        if (total) {
+          const pts = Math.min(300, dur);
+          const step = Math.max(1, Math.floor(dur / pts));
+          for (let s = step; s <= dur; s += step) {
+            const n = mx.filter(r => Number(r.m) >= s * 1000).length;
+            retention_curve.push({ second: s, pct: Math.round(n / total * 1000) / 10 });
+          }
+        }
+      }
+    } catch (e) {}
+    res.json({ views, likes, comments, shares, avg_watch, top_country, views_by_hour, traffic,
+      traffic_sources, top_source, retention_curve });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 // ---------- v2.39 : démographie des spectateurs (créateur uniquement) ----------
@@ -6020,6 +6194,167 @@ app.get('/api/videos/:id/retention', auth, async (req, res) => {
     res.json({ r25: pct(0.25), r50: pct(0.5), r75: pct(0.75), r100: pct(1) });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
+// ---------- v2.48 SPEC-05 : chapitres vidéo ----------
+// PUT remplace la liste complète (validation : 1er à 0, max CHAPTER_LIMIT, ordre croissant, créateur seul)
+app.put('/api/videos/:id/chapters', auth, async (req, res) => {
+  try {
+    const vid = Number(req.params.id);
+    const v = await get1('SELECT * FROM videos WHERE id=?', vid);
+    if (!v) return res.status(404).json({ error: 'vidéo introuvable' });
+    if (Number(v.user_id) !== Number(req.userId))
+      return res.status(403).json({ error: 'réservé au créateur' });
+    const list = Array.isArray((req.body || {}).chapters) ? req.body.chapters : [];
+    if (list.length > CHAPTER_LIMIT)
+      return res.status(400).json({ error: 'maximum ' + CHAPTER_LIMIT + ' chapitres par vidéo' });
+    const dur = Number(v.duration) || 0;
+    const clean = [];
+    for (const c of list) {
+      const title = String((c && c.title) || '').trim().slice(0, 100);
+      const sec = Math.floor(Number(c && c.starts_at_sec));
+      if (!title || !Number.isFinite(sec) || sec < 0) return res.status(400).json({ error: 'chapitre invalide (titre + starts_at_sec requis)' });
+      if (dur && sec > dur) return res.status(400).json({ error: 'le chapitre dépasse la durée de la vidéo' });
+      clean.push({ title, starts_at_sec: sec });
+    }
+    clean.sort((a, b) => a.starts_at_sec - b.starts_at_sec);
+    for (let i = 1; i < clean.length; i++)
+      if (clean[i].starts_at_sec <= clean[i - 1].starts_at_sec)
+        return res.status(400).json({ error: 'les chapitres doivent être en ordre croissant' });
+    if (clean.length && clean[0].starts_at_sec !== 0)
+      return res.status(400).json({ error: 'le premier chapitre doit commencer à 0' });
+    await runSql('DELETE FROM video_chapters WHERE video_id=?', vid);
+    for (const c of clean)
+      await runSql('INSERT INTO video_chapters(video_id,title,starts_at_sec,created_at) VALUES(?,?,?,?)',
+        vid, c.title, c.starts_at_sec, now());
+    res.json({ ok: true, chapters: clean });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.get('/api/videos/:id/chapters', async (req, res) => {
+  try {
+    const vid = Number(req.params.id);
+    const rows = await allRows('SELECT title, starts_at_sec FROM video_chapters WHERE video_id=? ORDER BY starts_at_sec ASC', vid);
+    res.json({ ok: true, chapters: rows.map(r => ({ title: r.title, starts_at_sec: Number(r.starts_at_sec) })) });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.delete('/api/videos/:id/chapters', auth, async (req, res) => {
+  try {
+    const vid = Number(req.params.id);
+    const v = await get1('SELECT * FROM videos WHERE id=?', vid);
+    if (!v) return res.status(404).json({ error: 'vidéo introuvable' });
+    if (Number(v.user_id) !== Number(req.userId))
+      return res.status(403).json({ error: 'réservé au créateur' });
+    await runSql('DELETE FROM video_chapters WHERE video_id=?', vid);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// ---------- v2.48 SPEC-07 : premieres (sorties planifiées + compte à rebours) ----------
+// POST/DELETE/GET /api/videos/:id/premiere — remind : /api/videos/:id/premiere/remind
+// liste publique : GET /api/premieres/upcoming — chat éphémère : room premiere:<video_id>
+app.post('/api/videos/:id/premiere', auth, async (req, res) => {
+  try {
+    const vid = Number(req.params.id);
+    const v = await get1('SELECT * FROM videos WHERE id=?', vid);
+    if (!v) return res.status(404).json({ error: 'vidéo introuvable' });
+    if (Number(v.user_id) !== Number(req.userId))
+      return res.status(403).json({ error: 'réservé au créateur' });
+    const scheduled_at = Number((req.body || {}).scheduled_at);
+    if (!scheduled_at || scheduled_at <= now())
+      return res.status(400).json({ error: 'date de sortie future requise' });
+    const ex = await get1('SELECT 1 FROM premieres WHERE video_id=?', vid);
+    if (ex) return res.status(400).json({ error: 'premiere déjà programmée' });
+    // limite anti-spam : max 3 premieres à venir par créateur
+    const n = await get1(`SELECT COUNT(*) AS c FROM premieres WHERE creator_id=? AND status='scheduled' AND scheduled_at>?`, req.userId, now());
+    if (Number(n.c) >= PREMIERE_LIMIT_PER_CREATOR)
+      return res.status(400).json({ error: 'limite de 3 premieres à venir atteinte' });
+    await runSql('INSERT INTO premieres(video_id,creator_id,scheduled_at,status,created_at) VALUES(?,?,?,\'scheduled\',?)',
+      vid, req.userId, scheduled_at, now());
+    await runSql('UPDATE videos SET scheduled_at=? WHERE id=?', scheduled_at, vid);
+    res.json({ ok: true, scheduled_at });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.delete('/api/videos/:id/premiere', auth, async (req, res) => {
+  try {
+    const vid = Number(req.params.id);
+    const p = await get1('SELECT * FROM premieres WHERE video_id=?', vid);
+    if (!p) return res.status(404).json({ error: 'premiere introuvable' });
+    if (Number(p.creator_id) !== Number(req.userId))
+      return res.status(403).json({ error: 'réservé au créateur' });
+    await runSql('DELETE FROM premiere_reminders WHERE video_id=?', vid);
+    await runSql('DELETE FROM premieres WHERE video_id=?', vid);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.get('/api/videos/:id/premiere', async (req, res) => {
+  try {
+    const vid = Number(req.params.id);
+    const p = await get1(
+      `SELECT p.*, v.description, u.username AS creator FROM premieres p
+       JOIN videos v ON v.id=p.video_id JOIN users u ON u.id=p.creator_id WHERE p.video_id=?`, vid);
+    if (!p) return res.json({ ok: false });
+    const meId = await optUserId(req);
+    const reminded = meId ? !!(await get1('SELECT 1 FROM premiere_reminders WHERE video_id=? AND user_id=?', vid, meId)) : false;
+    const rc = await get1('SELECT COUNT(*) AS c FROM premiere_reminders WHERE video_id=?', vid);
+    res.json({ ok: true, premiere: {
+      video_id: p.video_id, scheduled_at: Number(p.scheduled_at), status: p.status,
+      creator: p.creator, description: p.description || '',
+      countdown_ms: Math.max(0, Number(p.scheduled_at) - now()),
+      reminded, reminder_count: Number(rc.c) || 0 } });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.post('/api/videos/:id/premiere/remind', auth, async (req, res) => {
+  try {
+    const vid = Number(req.params.id);
+    const p = await get1('SELECT 1 FROM premieres WHERE video_id=?', vid);
+    if (!p) return res.status(404).json({ error: 'premiere introuvable' });
+    await insertIgnore('INSERT OR IGNORE INTO premiere_reminders(video_id,user_id,created_at) VALUES(?,?,?)',
+      vid, req.userId, now());
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.delete('/api/videos/:id/premiere/remind', auth, async (req, res) => {
+  try {
+    await runSql('DELETE FROM premiere_reminders WHERE video_id=? AND user_id=?', Number(req.params.id), req.userId);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.get('/api/premieres/upcoming', async (req, res) => {
+  try {
+    const meId = await optUserId(req);
+    const rows = await allRows(
+      `SELECT p.video_id, p.scheduled_at, p.status, p.creator_id, u.username AS creator, v.description
+       FROM premieres p JOIN users u ON u.id=p.creator_id JOIN videos v ON v.id=p.video_id
+       WHERE p.status='scheduled' AND p.scheduled_at>? AND v.hidden=0 ORDER BY p.scheduled_at ASC LIMIT 50`, now());
+    const out = [];
+    for (const r of rows) {
+      const reminded = meId ? !!(await get1('SELECT 1 FROM premiere_reminders WHERE video_id=? AND user_id=?', r.video_id, meId)) : false;
+      out.push({ video_id: r.video_id, scheduled_at: Number(r.scheduled_at), creator_id: r.creator_id,
+        creator: r.creator, description: r.description || '', reminded,
+        countdown_ms: Math.max(0, Number(r.scheduled_at) - now()) });
+    }
+    res.json({ ok: true, premieres: out });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// chat éphémère de la premiere — room premiere:<video_id>
+app.get('/api/videos/:id/premiere/chat', async (req, res) => {
+  try {
+    const room = 'premiere:' + Number(req.params.id);
+    const rows = await allRows(
+      `SELECT c.*, u.username FROM premiere_chat c LEFT JOIN users u ON u.id=c.user_id
+       WHERE c.video_id=? ORDER BY c.created_at DESC LIMIT 50`, Number(req.params.id));
+    res.json({ ok: true, room, messages: rows.reverse() });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.post('/api/videos/:id/premiere/chat', auth, async (req, res) => {
+  try {
+    const vid = Number(req.params.id);
+    const room = 'premiere:' + vid; // room éphémère premiere:<video_id>
+    const text = String((req.body || {}).text || '').trim().slice(0, 300);
+    if (!text) return res.status(400).json({ error: 'message vide' });
+    const p = await get1('SELECT 1 FROM premieres WHERE video_id=?', vid);
+    if (!p) return res.status(404).json({ error: 'premiere introuvable' });
+    await runSql('INSERT INTO premiere_chat(video_id,user_id,text,created_at) VALUES(?,?,?,?)', vid, req.userId, text, now());
+    res.json({ ok: true, room });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
 app.get('/api/videos/:id', async (req, res) => {
   const v = await get1('SELECT * FROM videos WHERE id=?', req.params.id);
   if (!v) return res.status(404).json({ error: 'vidéo introuvable' });
@@ -6035,6 +6370,376 @@ app.get('/api/videos/:id', async (req, res) => {
   if (!(await canSeeVideo(v, meId))) return res.status(404).json({ error: 'vidéo introuvable' });
   res.json({ video: await videoJSON(v, meId) });
 });
+// ============================================================
+// v2.48 — fin d'implémentation SPEC-01 / 04 / 08 / 09 / 10 (2026-10-05)
+// ============================================================
+const NUDGE_MIN_INTERVAL_MS = 48 * 3600000; // SPEC-08 : plafond anti-spam ABSOLU = 1 nudge / 48h
+const NUDGE_KINDS = ['winback', 'creator_idle', 'streak_risk', 'quest_idle', 'follower_milestone'];
+const NUDGE_PRIORITY = { streak_risk: 0, follower_milestone: 1, creator_idle: 2, quest_idle: 3, winback: 4 };
+const LANG_ALLOW = ['fr','en','es','ht','pt','de','it','nl','ar','he','fa','ur','zh','hi','bn','ru','ja','ko','tr','sw','yo','ig','ha','zu','am','vi','th','id','ms','tl','pl','uk','ro','el','hu','cs','sv','no','da','fi','ca','gl'];
+
+// ---------- v2.48 SPEC-01 : bibliothèque hors-ligne gérée ----------
+// POST enregistre le téléchargement (body {file_size}) ; DELETE le retire ; GET liste.
+app.post('/api/videos/:id/offline-track', auth, async (req, res) => {
+  try {
+    const vid = Number(req.params.id);
+    const v = await get1('SELECT * FROM videos WHERE id=?', vid);
+    if (!v) return res.status(404).json({ error: 'vidéo introuvable' });
+    if (Number(v.allow_download) === 0) return res.status(403).json({ error: 'téléchargement désactivé par le créateur' });
+    if (!(await canSeeVideo(v, req.userId))) return res.status(403).json({ error: 'vidéo non accessible' });
+    const rc = await get1('SELECT COUNT(*) AS n FROM offline_downloads WHERE user_id=? AND created_at>?', req.userId, now() - 3600000);
+    if ((rc.n || 0) >= 30) return res.status(429).json({ error: 'trop de téléchargements, réessaie dans une heure' });
+    const cnt = await get1('SELECT COUNT(*) AS n FROM offline_downloads WHERE user_id=?', req.userId);
+    if ((cnt.n || 0) >= OFFLINE_QUOTA) return res.status(409).json({ error: 'quota hors-ligne atteint (' + OFFLINE_QUOTA + ' vidéos max)' });
+    const fileSize = Math.max(0, Math.floor(Number((req.body || {}).file_size) || 0));
+    await runSql('INSERT INTO offline_downloads(user_id,video_id,file_size,created_at) VALUES(?,?,?,?)', req.userId, vid, fileSize, now())
+      .catch(() => runSql('INSERT OR IGNORE INTO offline_downloads(user_id,video_id,created_at) VALUES(?,?,?)', req.userId, vid, now()));
+    const tot = await get1('SELECT COUNT(*) AS n, COALESCE(SUM(file_size),0) AS s FROM offline_downloads WHERE user_id=?', req.userId);
+    res.json({ ok: true, count: tot.n || 0, total_size: tot.s || 0 });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.delete('/api/videos/:id/offline-track', auth, async (req, res) => {
+  try {
+    await runSql('DELETE FROM offline_downloads WHERE user_id=? AND video_id=?', req.userId, Number(req.params.id));
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.get('/api/offline/list', auth, async (req, res) => {
+  try {
+    const rows = await allRows(
+      `SELECT o.video_id AS id, o.file_size, o.created_at AS downloaded_at, v.description AS d, NULL AS thumb, v.file AS url, v.duration
+       FROM offline_downloads o JOIN videos v ON v.id=o.video_id
+       WHERE o.user_id=? AND (v.hidden IS NULL OR v.hidden=0)
+         AND (v.scheduled_at IS NULL OR v.scheduled_at<=?)
+       ORDER BY o.created_at DESC LIMIT 60`, req.userId, now());
+    const tot = await get1('SELECT COUNT(*) AS n, COALESCE(SUM(file_size),0) AS s FROM offline_downloads WHERE user_id=?', req.userId);
+    res.json({ ok: true, videos: rows.map(r => ({ id: r.id, desc: r.d, thumb: r.thumb, url: r.url, duration: Number(r.duration) || 0, downloaded_at: Number(r.downloaded_at), file_size: Number(r.file_size) || 0 })), total_size: tot.s || 0, count: tot.n || 0, quota: OFFLINE_QUOTA });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+
+// ---------- v2.48 SPEC-04 : traduction auto des descriptions (fournisseur gratuit MyMemory) ----------
+app.get('/api/videos/:id/translate', auth, async (req, res) => {
+  try {
+    const vid = Number(req.params.id);
+    const lang = String(req.query.lang || '').toLowerCase().slice(0, 5);
+    if (!LANG_ALLOW.includes(lang)) return res.status(400).json({ error: 'langue non supportée' });
+    const v = await get1('SELECT * FROM videos WHERE id=?', vid);
+    if (!v) return res.status(404).json({ error: 'vidéo introuvable' });
+    const desc = String(v.description || '').trim();
+    if (!desc) return res.status(400).json({ error: 'rien à traduire' });
+    const srcLang = String(v.lang || 'fr');
+    if (lang === srcLang) return res.status(400).json({ error: 'même langue' });
+    const source_hash = crypto.createHash('sha1').update('vg:' + desc).digest('hex');
+    const THIRTY_D = 30 * 86400000;
+    const cached = await get1('SELECT * FROM video_translations WHERE video_id=? AND lang=?', vid, lang);
+    if (cached && cached.source_hash === source_hash && Number(cached.created_at) > now() - THIRTY_D)
+      return res.json({ ok: true, translated_desc: cached.text, cached: true, auto: true });
+    // quota 100 traductions/jour/utilisateur
+    const day = new Date().toISOString().slice(0, 10);
+    const q = await get1('SELECT count FROM translation_quota WHERE user_id=? AND day=?', req.userId, day);
+    if (q && Number(q.count) >= TRANSLATE_QUOTA) return res.status(429).json({ error: 'quota de traductions atteint pour aujourd\'hui' });
+    // fournisseur gratuit MyMemory (5 000 mots/jour, sans clé), timeout 8 s
+    const toTranslate = desc.slice(0, 500);
+    const mymemoryUrl = 'https://api.mymemory.translated.net/get?q=' + encodeURIComponent(toTranslate) + '&langpair=' + encodeURIComponent(srcLang + '|' + lang);
+    let translated = null;
+    try {
+      const ctl = new AbortController();
+      const to = setTimeout(() => ctl.abort(), 8000);
+      const r = await fetch(mymemoryUrl, { signal: ctl.signal });
+      clearTimeout(to);
+      const j = await r.json();
+      translated = j && j.responseData && j.responseData.translatedText;
+      if (translated && /MYMEMORY WARNING|QUERY LENGTH LIMIT/i.test(translated)) translated = null;
+    } catch (_) {}
+    if (!translated) return res.status(503).json({ error: 'traduction indisponible pour le moment' });
+    await runSql('DELETE FROM video_translations WHERE video_id=? AND lang=?', vid, lang);
+    await runSql('INSERT INTO video_translations(video_id,lang,text,source_hash,created_at) VALUES(?,?,?,?,?)', vid, lang, translated, source_hash, now());
+    try {
+      if (USE_PG) await runSql('INSERT INTO translation_quota(user_id,day,count) VALUES(?,?,1) ON CONFLICT(user_id,day) DO UPDATE SET count=translation_quota.count+1', req.userId, day);
+      else await runSql('INSERT INTO translation_quota(user_id,day,count) VALUES(?,?,1) ON CONFLICT(user_id,day) DO UPDATE SET count=count+1', req.userId, day);
+    } catch (_) { await runSql('UPDATE translation_quota SET count=count+1 WHERE user_id=? AND day=?', req.userId, day); }
+    res.json({ ok: true, translated_desc: translated, cached: false, auto: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+
+// ---------- v2.48 SPEC-08 : rappels intelligents de rétention ----------
+function nudgeText(kind, meta) {
+  const m = meta || {};
+  switch (kind) {
+    case 'winback': return { title: '👋 VidiGagne te manque ?', text: 'Tes créateurs préférés ont publié 👀', deep: 'home' };
+    case 'creator_idle': return { title: '🎬 Tes abonnés t\'attendent', text: 'Ça fait un moment… ta prochaine vidéo ?', deep: 'camera' };
+    case 'streak_risk': return { title: '🔥 Ta flamme va s\'éteindre !', text: 'Envoie un message à @' + (m.with_username || 'ton ami') + ' pour garder la flamme 🔥', deep: 'chat:' + (m.with_id || '') };
+    case 'quest_idle': return { title: '🎯 Ta quête du jour t\'attend', text: 'Encore quelques pièces à gagner aujourd\'hui !', deep: 'quests' };
+    case 'follower_milestone': return { title: '🎉 ' + (m.count || '') + ' abonnés !', text: 'Félicitations, continue comme ça 🚀', deep: 'profile' };
+    default: return { title: 'VidiGagne', text: 'Viens voir ce qui se passe 👀', deep: 'home' };
+  }
+}
+async function queueNudge(userId, kind, meta) {
+  // anti-doublon naturel : même kind déjà programmé/envoyé cette semaine → on skip
+  const wk = await get1('SELECT id FROM retention_nudges WHERE user_id=? AND kind=? AND created_at>?', userId, kind, now() - 7 * 86400000);
+  if (wk) return false;
+  // plafond ABSOLU : max 1 nudge / 48h tous kinds confondus (même si le scheduler tourne 2×)
+  const recent = await get1('SELECT id FROM retention_nudges WHERE user_id=? AND created_at>?', userId, now() - NUDGE_MIN_INTERVAL_MS);
+  if (recent) return false;
+  const u = await get1('SELECT nudge_optout, tz_offset FROM users WHERE id=?', userId);
+  if (!u || Number(u.nudge_optout) === 1) return false;
+  const t = nudgeText(kind, meta || {});
+  // heures creuses : jamais de push 23h-7h heure locale (tz_offset en minutes) → différé à 8h
+  let sendAt = now();
+  try {
+    const localMs = sendAt + Number(u.tz_offset || 0) * 60000;
+    const h = new Date(localMs).getUTCHours();
+    if (h >= 23 || h < 7) sendAt = sendAt + ((8 - h + 24) % 24) * 3600000;
+  } catch (_) {}
+  const id = await insertId('INSERT INTO retention_nudges(user_id,kind,meta,scheduled_at,created_at) VALUES(?,?,?,?,?)',
+    userId, kind, JSON.stringify(meta || {}), sendAt, now());
+  try {
+    await insertId('INSERT INTO notifications(user_id,type,title,text,is_read,created_at) VALUES(?,?,?,?,0,?)',
+      userId, 'nudge_' + kind, t.title, t.text + ' §deep=' + t.deep + '§nudge=' + id, now());
+  } catch (_) {}
+  return true;
+}
+// évaluation quotidienne (appelée par le scheduler)
+async function evaluateNudges() {
+  try {
+    const t = now(), D = 86400000;
+    // winback : inscrit depuis ≥3 j, rien vu depuis 72h, pas de winback depuis 30 j
+    try {
+      const rows = await allRows(`SELECT id FROM users WHERE created_at<? AND COALESCE(last_seen,created_at)<? AND COALESCE(nudge_optout,0)=0
+        AND NOT EXISTS(SELECT 1 FROM retention_nudges WHERE user_id=users.id AND kind='winback' AND created_at>?) LIMIT 300`,
+        t - 3 * D, t - 72 * 3600000, t - 30 * D);
+      for (const r of rows) await queueNudge(r.id, 'winback', {});
+    } catch (_) {}
+    // creator_idle : ≥1 vidéo un jour, 0 publication depuis 7 j, ≥10 abonnés
+    try {
+      const rows = await allRows(`SELECT v.user_id AS id FROM videos v LEFT JOIN follows f ON f.followed_id=v.user_id
+        GROUP BY v.user_id HAVING MAX(v.created_at)<? AND COUNT(DISTINCT f.follower_id)>=10 LIMIT 200`, t - 7 * D);
+      for (const r of rows) {
+        const u = await get1('SELECT nudge_optout FROM users WHERE id=?', r.id);
+        if (u && !Number(u.nudge_optout)) await queueNudge(r.id, 'creator_idle', {});
+      }
+    } catch (_) {}
+    // streak_risk (SPEC-06) : flamme allumée hier, aucun échange aujourd'hui
+    try {
+      const y = new Date(t - D).toISOString().slice(0, 10), today = new Date(t).toISOString().slice(0, 10);
+      const rows = await allRows(`SELECT user_a, user_b FROM friendship_streaks WHERE last_day=? AND streak>0 LIMIT 300`, y);
+      for (const r of rows) {
+        for (const uid of [r.user_a, r.user_b]) {
+          const other = Number(uid) === Number(r.user_a) ? r.user_b : r.user_a;
+          const cur = await get1('SELECT last_day FROM friendship_streaks WHERE user_a=? AND user_b=?', Math.min(r.user_a, r.user_b), Math.max(r.user_a, r.user_b));
+          if (!cur || cur.last_day !== today) {
+            const ou = await get1('SELECT username FROM users WHERE id=?', other);
+            await queueNudge(uid, 'streak_risk', { with_id: other, with_username: ou ? ou.username : 'ami' });
+          }
+        }
+      }
+    } catch (_) {}
+    // quest_idle : quête quotidienne non réclamée (21h locales passées)
+    try {
+      const day = new Date(t).toISOString().slice(0, 10);
+      const rows = await allRows(`SELECT id FROM users WHERE COALESCE(nudge_optout,0)=0 AND last_seen>? AND id NOT IN(SELECT user_id FROM quest_claims WHERE day=?) LIMIT 300`, t - D, day);
+      for (const r of rows) await queueNudge(r.id, 'quest_idle', {});
+    } catch (_) {}
+    // follower_milestone : paliers 100 / 1 000 / 10 000 franchis cette semaine, non célébrés
+    try {
+      for (const palier of [100, 1000, 10000]) {
+        const rows = await allRows(`SELECT followed_id AS id, COUNT(*) AS c FROM follows WHERE created_at>? GROUP BY followed_id HAVING COUNT(*)>=? LIMIT 200`, t - 7 * D, palier);
+        for (const r of rows) await queueNudge(r.id, 'follower_milestone', { count: palier });
+      }
+    } catch (_) {}
+    // envoi des nudges programmés arrivés à échéance (via la file de notifs existante si FCM, sinon table notifications déjà remplie)
+    await runSql('UPDATE retention_nudges SET sent_at=? WHERE sent_at IS NULL AND scheduled_at<=?', t, t);
+  } catch (e) { console.error('evaluateNudges:', e.message); }
+}
+app.get('/api/me/nudges', auth, async (req, res) => {
+  try {
+    const rows = await allRows('SELECT id, kind, meta, created_at, sent_at, opened_at FROM retention_nudges WHERE user_id=? AND created_at>? ORDER BY created_at DESC LIMIT 50', req.userId, now() - 30 * 86400000);
+    const u = await get1('SELECT nudge_optout, tz_offset FROM users WHERE id=?', req.userId);
+    res.json({ ok: true, nudges: rows, optout: !!Number(u && u.nudge_optout), tz_offset: Number((u && u.tz_offset) || 0) });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.post('/api/me/nudge-optout', auth, async (req, res) => {
+  try {
+    const v = (req.body || {}).optout ? 1 : 0;
+    await runSql('UPDATE users SET nudge_optout=? WHERE id=?', v, req.userId);
+    res.json({ ok: true, nudge_optout: v });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.post('/api/me/nudges/:id/opened', auth, async (req, res) => {
+  try {
+    const ch = await runSqlChanges('UPDATE retention_nudges SET opened_at=? WHERE id=? AND user_id=?', now(), Number(req.params.id), req.userId);
+    if (!ch) return res.status(404).json({ error: 'nudge introuvable' });
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+
+// ---------- v2.48 SPEC-09 : commission créateur sur ventes via vidéo ----------
+async function creditVideoSaleCommission(orderId, sourceVideoId, buyerId, total, hasAffiliate) {
+  try {
+    if (!sourceVideoId || hasAffiliate) return; // non-cumul : affiliation prioritaire
+    const _dup = await get1('SELECT id FROM video_sale_commissions WHERE order_id=?', orderId);
+    if (_dup) return; // idempotent : jamais deux commissions pour la même commande
+    const v = await get1('SELECT id, user_id FROM videos WHERE id=?', sourceVideoId);
+    if (!v) return;
+    const creatorId = Number(v.user_id);
+    if (creatorId === Number(buyerId)) return; // auto-achat exclu
+    // anti-fraude : au moins un produit de la commande doit être lié à la vidéo
+    const items = await allRows('SELECT oi.product_id, oi.seller_id FROM order_items oi WHERE oi.order_id=?', orderId);
+    if (!items.length) return;
+    let linked = false;
+    for (const it of items) {
+      if (Number(it.seller_id) === creatorId) return; // vendeur = créateur : pas de commission
+      const l = await get1('SELECT 1 FROM video_products WHERE video_id=? AND product_id=?', sourceVideoId, it.product_id);
+      if (l) { linked = true; break; }
+    }
+    if (!linked) return;
+    let comm = Math.floor(Number(total) * VIDEO_CREATOR_RATE_PCT / 100);
+    if (comm < 1 && Number(total) >= 20) comm = 1;
+    if (comm < 1) return;
+    await runSql('UPDATE users SET coins=coins+? WHERE id=?', comm, creatorId);
+    await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
+      creatorId, comm, 'video_sale_commission #' + orderId, now());
+    await runSql('INSERT INTO video_sale_commissions(order_id,video_id,creator_id,coins,created_at) VALUES(?,?,?,?,?)',
+      orderId, sourceVideoId, creatorId, comm, now());
+  } catch (e) { console.error('creditVideoSaleCommission:', e.message); }
+}
+// NOTE : hook appelé dans POST /api/shop/orders après création de la commande (voir plus bas).
+app.get('/api/videos/:id/sales', auth, async (req, res) => {
+  try {
+    const vid = Number(req.params.id);
+    const v = await get1('SELECT id, user_id FROM videos WHERE id=?', vid);
+    if (!v) return res.status(404).json({ error: 'vidéo introuvable' });
+    if (Number(v.user_id) !== Number(req.userId)) return res.status(403).json({ error: 'réservé au créateur' });
+    const items = await allRows(
+      `SELECT c.order_id, c.coins AS commission, o.total_coins, o.created_at, u.username AS buyer
+       FROM video_sale_commissions c JOIN orders o ON o.id=c.order_id
+       LEFT JOIN users u ON u.id=o.buyer_id
+       WHERE c.video_id=? AND c.refunded=0 ORDER BY o.created_at DESC LIMIT 100`, vid);
+    const tot = await get1('SELECT COUNT(*) AS n, COALESCE(SUM(coins),0) AS s, COALESCE(SUM(o.total_coins),0) AS t FROM video_sale_commissions c JOIN orders o ON o.id=c.order_id WHERE c.video_id=? AND c.refunded=0', vid);
+    res.json({ ok: true, sales: { count: tot.n || 0, total_coins: tot.t || 0, commission_earned: tot.s || 0 }, items });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+
+// ---------- v2.48 SPEC-10 : premieres (sorties planifiées + compte à rebours) ----------
+app.post('/api/videos/:id/premiere', auth, async (req, res) => {
+  try {
+    const vid = Number(req.params.id);
+    const v = await get1('SELECT * FROM videos WHERE id=?', vid);
+    if (!v) return res.status(404).json({ error: 'vidéo introuvable' });
+    if (Number(v.user_id) !== Number(req.userId)) return res.status(403).json({ error: 'réservé au créateur' });
+    const sat = Number((req.body || {}).scheduled_at) || Number(v.scheduled_at) || 0;
+    if (!sat || sat <= now() + 30 * 60000) return res.status(400).json({ error: 'la premiere doit être planifiée au moins 30 min à l\'avance' });
+    if (sat > now() + 7 * 86400000) return res.status(400).json({ error: 'maximum 7 jours à l\'avance' });
+    if (!Number(v.scheduled_at) || Number(v.scheduled_at) <= now()) return res.status(400).json({ error: 'la vidéo doit être programmée (non publiée)' });
+    const n = await get1(`SELECT COUNT(*) AS n FROM premieres p JOIN videos vv ON vv.id=p.video_id
+      WHERE p.creator_id=? AND p.status='scheduled' AND p.video_id<>?`, req.userId, vid);
+    if ((n.n || 0) >= PREMIERE_LIMIT_PER_CREATOR) return res.status(429).json({ error: 'maximum ' + PREMIERE_LIMIT_PER_CREATOR + ' premieres à venir par créateur' });
+    const chatMin = Math.min(120, Math.max(10, Number((req.body || {}).chat_minutes) || 30));
+    await runSql('UPDATE videos SET scheduled_at=? WHERE id=?', sat, vid);
+    await runSql('INSERT INTO premieres(video_id,creator_id,scheduled_at,status,created_at) VALUES(?,?,?,?,?)', vid, req.userId, sat, 'scheduled', now())
+      .catch(() => runSql('UPDATE premieres SET scheduled_at=?, status=?, creator_id=? WHERE video_id=?', sat, 'scheduled', req.userId, vid));
+    res.json({ ok: true, chat_minutes: chatMin });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.delete('/api/videos/:id/premiere', auth, async (req, res) => {
+  try {
+    const vid = Number(req.params.id);
+    const p = await get1('SELECT * FROM premieres WHERE video_id=? AND creator_id=? AND status=?', vid, req.userId, 'scheduled');
+    if (!p) return res.status(404).json({ error: 'premiere introuvable' });
+    await runSql("UPDATE premieres SET status='cancelled' WHERE video_id=?", vid);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.get('/api/videos/:id/premiere', async (req, res) => {
+  try {
+    const vid = Number(req.params.id);
+    const p = await get1('SELECT * FROM premieres WHERE video_id=?', vid);
+    if (!p) return res.status(404).json({ error: 'pas de premiere' });
+    if (p.status === 'live' || p.status === 'released') return res.json({ ok: true, is_premiere: p.status === 'live', released: p.status === 'released' });
+    const rc = await get1('SELECT COUNT(*) AS n FROM premiere_reminders WHERE video_id=?', vid);
+    let me = 0;
+    try {
+      const meId = req.userId || (req.user && req.user.id);
+      if (meId) { const r = await get1('SELECT 1 AS x FROM premiere_reminders WHERE video_id=? AND user_id=?', vid, meId); me = r ? 1 : 0; }
+    } catch (_) {}
+    res.json({ ok: true, is_premiere: true, scheduled_at: Number(p.scheduled_at), seconds_left: Math.max(0, Math.floor((Number(p.scheduled_at) - now()) / 1000)), reminder_count: rc.n || 0, i_reminded: me });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.post('/api/videos/:id/premiere/remind', auth, async (req, res) => {
+  try {
+    const vid = Number(req.params.id);
+    const p = await get1("SELECT * FROM premieres WHERE video_id=? AND status='scheduled'", vid);
+    if (!p) return res.status(404).json({ error: 'pas de premiere à venir' });
+    await runSql('INSERT INTO premiere_reminders(video_id,user_id,created_at) VALUES(?,?,?)', vid, req.userId, now())
+      .catch(() => {});
+    res.json({ ok: true, reminded: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.delete('/api/videos/:id/premiere/remind', auth, async (req, res) => {
+  try {
+    await runSql('DELETE FROM premiere_reminders WHERE video_id=? AND user_id=?', Number(req.params.id), req.userId);
+    res.json({ ok: true, reminded: false });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.get('/api/premieres/upcoming', async (req, res) => {
+  try {
+    const rows = await allRows(
+      `SELECT p.video_id, p.scheduled_at, p.creator_id, u.username, v.description, v.thumb,
+        (SELECT COUNT(*) FROM premiere_reminders r WHERE r.video_id=p.video_id) AS reminder_count
+       FROM premieres p JOIN videos v ON v.id=p.video_id JOIN users u ON u.id=p.creator_id
+       WHERE p.status='scheduled' AND p.scheduled_at>? AND p.scheduled_at<?
+       ORDER BY p.scheduled_at ASC LIMIT 50`, now(), now() + 7 * 86400000);
+    res.json({ ok: true, premieres: rows });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// chat éphémère de la premiere — room 'premiere:<video_id>' (mêmes règles que le chat live)
+app.post('/api/videos/:id/premiere/chat', auth, async (req, res) => {
+  try {
+    const vid = Number(req.params.id);
+    const p = await get1("SELECT * FROM premieres WHERE video_id=? AND status='live'", vid);
+    if (!p) return res.status(403).json({ error: 'chat fermé (premiere non diffusée)' });
+    const raw = String((req.body || {}).text || '').trim();
+    if (!raw) return res.status(400).json({ error: 'message vide' });
+    if (raw.length > 280) return res.status(400).json({ error: 'message trop long (280 caractères max)' });
+    if (typeof containsBadword === 'function' && containsBadword(raw)) return res.status(400).json({ error: 'message refusé : langage inapproprié' });
+    const id = await insertId('INSERT INTO premiere_chat(video_id,user_id,text,created_at) VALUES(?,?,?,?)', vid, req.userId, raw, now());
+    try {
+      const room = 'premiere:' + vid; // room éphémère — diffusion WS si un relayeur est branché
+      if (typeof premiereRooms !== 'undefined' && premiereRooms[room])
+        for (const ws of premiereRooms[room]) { try { if (ws.readyState === 1) ws.send(JSON.stringify({ t: 'chat', room, id, text: raw })); } catch (_) {} }
+    } catch (_) {}
+    res.json({ ok: true, id });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.get('/api/videos/:id/premiere/chat', async (req, res) => {
+  try {
+    const vid = Number(req.params.id);
+    const since = Number(req.query.since) || 0;
+    const rows = await allRows(`SELECT c.*, u.username FROM premiere_chat c LEFT JOIN users u ON u.id=c.user_id
+      WHERE c.video_id=? AND c.id>? ORDER BY c.id ASC LIMIT 100`, vid, since);
+    res.json({ ok: true, messages: rows });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// rappels H-15 (premiere_soon) — appelé par le scheduler
+async function checkPremieres() {
+  try {
+    const t = now();
+    const rows = await allRows(`SELECT p.*, v.description FROM premieres p JOIN videos v ON v.id=p.video_id
+      WHERE p.status='scheduled' AND p.scheduled_at>? AND p.scheduled_at<=?`, t, t + 15 * 60000);
+    for (const p of rows) {
+      const subs = await allRows('SELECT user_id FROM premiere_reminders WHERE video_id=?', p.video_id);
+      for (const s of subs) {
+        const already = await get1("SELECT id FROM notifications WHERE user_id=? AND type='premiere_soon' AND video_id=?", s.user_id, p.video_id);
+        if (!already)
+          try { await insertId('INSERT INTO notifications(user_id,type,video_id,title,text,is_read,created_at) VALUES(?,?,?,?,?,0,?)',
+            s.user_id, 'premiere_soon', p.video_id, '🎬 Premiere dans 15 min', String(p.description || '').slice(0, 120), t); } catch (_) {}
+      }
+    }
+    // purge des reminders des premieres sorties/annulées depuis > 24h
+    await runSql(`DELETE FROM premiere_reminders WHERE video_id IN(SELECT video_id FROM premieres WHERE status IN('released','cancelled') AND scheduled_at<?)`, t - 86400000);
+  } catch (e) { console.error('checkPremieres:', e.message); }
+}
+
 // ---------- suppression d'une vidéo : cascade complète anti-orphelins ----------
 // Utilisée par DELETE /api/videos/:id ET par DELETE /api/account (fonction
 // hoistée : appelable depuis n'importe quel endpoint du module).
@@ -6133,8 +6838,9 @@ app.post('/api/videos/:id/view', async (req, res) => {
     }
     // le serveur décide seul si la vue est monétisée (1 vue sur 6) — le client ne peut pas gonfler ad_views
     const adShown = (Number(v.views) % 6 === 5) ? 1 : 0;
-    // v2.39 : source du trafic (feed|following|search|profile|deeplink|other) — valeur inconnue → 'feed'
-    const VIEW_SOURCES = ['feed', 'following', 'search', 'profile', 'deeplink', 'other'];
+    // v2.39 : source du trafic (feed|foryou|following|search|profile|deeplink|other) — valeur inconnue → 'feed'
+    // v2.48 : 'foryou' ajouté (l'app l'envoie déjà) — video_view_sources enregistre chaque vue (SPEC analytics-pro)
+    const VIEW_SOURCES = ['feed', 'foryou', 'following', 'search', 'profile', 'deeplink', 'other'];
     let viewSrc = 'feed';
     try {
       const s = String((req.body && req.body.source) || '').trim().toLowerCase();
@@ -6142,6 +6848,10 @@ app.post('/api/videos/:id/view', async (req, res) => {
     } catch (e) {}
     await runSql('INSERT INTO video_views(video_id,viewer_id,ip,ad_shown,source,created_at) VALUES(?,?,?,?,?,?)',
       v.id, viewerId, ip, adShown, viewSrc, now());
+    try {
+      await runSql('INSERT INTO video_view_sources(video_id,user_id,source,created_at) VALUES(?,?,?,?)',
+        v.id, viewerId, viewSrc, now());
+    } catch (e) {}
     await runSql('UPDATE videos SET views=views+1' + (adShown ? ', ad_views=ad_views+1' : '') + ' WHERE id=?', v.id);
     await touchHistory(viewerId, v.id);
     res.json({ ok: true, counted: true, ad_shown: !!adShown });
@@ -6284,6 +6994,42 @@ app.post('/api/videos/:id/download', auth, async (req, res) => {
     res.json({ ok: true, downloads: Number(vj.downloads) || 0 });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
+// ---------- v2.48 SPEC-01 : bibliothèque hors-ligne gérée ----------
+// suivi des vidéos téléchargées (quota OFFLINE_QUOTA) — pas de pièces hors-ligne (compteur serveur uniquement)
+app.post('/api/videos/:id/offline-track', auth, async (req, res) => {
+  try {
+    const v = await get1('SELECT id FROM videos WHERE id=?', req.params.id);
+    if (!v) return res.status(404).json({ error: 'vidéo introuvable' });
+    const ex = await get1('SELECT 1 FROM offline_downloads WHERE user_id=? AND video_id=?', req.userId, v.id);
+    if (!ex) {
+      const n = await get1('SELECT COUNT(*) AS c FROM offline_downloads WHERE user_id=?', req.userId);
+      if (Number(n.c) >= OFFLINE_QUOTA)
+        return res.status(400).json({ error: 'quota hors-ligne atteint (' + OFFLINE_QUOTA + ' vidéos)' });
+      await runSql('INSERT INTO offline_downloads(user_id,video_id,created_at) VALUES(?,?,?)', req.userId, v.id, now());
+    }
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.delete('/api/videos/:id/offline-track', auth, async (req, res) => {
+  try {
+    await runSql('DELETE FROM offline_downloads WHERE user_id=? AND video_id=?', req.userId, Number(req.params.id));
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.get('/api/offline/list', auth, async (req, res) => {
+  try {
+    const rows = await allRows(
+      'SELECT o.video_id, o.created_at AS saved_at FROM offline_downloads o WHERE o.user_id=? ORDER BY o.created_at DESC', req.userId);
+    const videos = [];
+    for (const r of rows) {
+      const v = await get1('SELECT * FROM videos WHERE id=? AND hidden=0', r.video_id);
+      if (!v) continue;
+      const j = await videoJSON(v, req.userId);
+      if (j) { j.offline_saved_at = Number(r.saved_at); videos.push(j); }
+    }
+    res.json({ ok: true, videos, quota: OFFLINE_QUOTA, used: rows.length });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
 
 // v1.68 : filtre anti-gros mots AUTOMATIQUE (pas seulement le mode protection)
 const BADWORDS_FR = ['merde','putain','salope','connard','connasse','encul','bite','couille','nique','fdp','tg','pd','salop','batard','bâtard','chiant','conard','débile','attardé','mongol'];
@@ -6330,20 +7076,29 @@ app.get('/api/videos/:id/comments', async (req, res) => {
   const rows = await allRows(
     `SELECT c.*, u.username, u.name, u.avatar, u.verified FROM comments c
      JOIN users u ON u.id=c.user_id
-     WHERE c.video_id=? AND (c.review_status IS NULL OR c.review_status<>'pending')
+     WHERE c.video_id=? AND (c.review_status IS NULL OR (c.review_status<>'pending' AND c.review_status<>'held'))
      ORDER BY c.created_at ASC LIMIT 50 OFFSET ` + ((page - 1) * 50), req.params.id);
   // v12 : exclut les commentaires contenant un mot-clé filtré par le propriétaire
   let kws = [];
+  // v2.48 (SPEC-02) : mode 'hide' — les commentaires matchant les filtres du créateur sont masqués
+  let hideKws = [];
   try {
     const v = await get1('SELECT user_id FROM videos WHERE id=?', req.params.id);
     if (v) {
-      const o = await get1('SELECT comment_keywords FROM users WHERE id=?', v.user_id);
+      const o = await get1('SELECT comment_keywords, comment_filter_mode FROM users WHERE id=?', v.user_id);
       kws = parseKeywords(o && o.comment_keywords);
+      if (o && o.comment_filter_mode === 'hide') {
+        const kf = await allRows('SELECT keyword FROM comment_keyword_filters WHERE user_id=?', v.user_id);
+        hideKws = kf.map(k => normalize(k.keyword)).filter(Boolean);
+      }
     }
   } catch (e) {}
-  const filtered = kws.length
-    ? rows.filter(c => !kws.some(k => String(c.text || '').toLowerCase().includes(k)))
-    : rows;
+  const filtered = rows.filter(c => {
+    const t = String(c.text || '');
+    if (kws.length && kws.some(k => t.toLowerCase().includes(k))) return false;
+    if (hideKws.length && hideKws.some(k => normalize(t).includes(k))) return false;
+    return true;
+  });
   // parité TikTok : état "aimé" du lecteur connecté sur chaque commentaire
   try {
     const meId = await optUserId(req);
@@ -6354,6 +7109,81 @@ app.get('/api/videos/:id/comments', async (req, res) => {
     } else filtered.forEach(c => { c.liked = 0; });
   } catch (e) { filtered.forEach(c => { c.liked = 0; }); }
   res.json({ comments: filtered, page, has_more: rows.length >= 50 });
+});
+
+// ---------- v2.48 SPEC-02 : filtres de mots-clés des commentaires (retenue) ----------
+// CRUD : GET/POST/DELETE /api/settings/keyword-filters — mode : /api/settings/comment-filter-mode
+// modération : GET /comments/held (liste) + POST /comments/held/:id (approve/delete)
+app.get('/api/settings/keyword-filters', auth, async (req, res) => {
+  try {
+    const rows = await allRows('SELECT id, keyword, created_at FROM comment_keyword_filters WHERE user_id=? ORDER BY created_at ASC', req.userId);
+    res.json({ ok: true, filters: rows.map(r => ({ id: r.id, keyword: r.keyword })) });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.post('/api/settings/keyword-filters', auth, async (req, res) => {
+  try {
+    const keyword = normalize((req.body || {}).keyword).slice(0, 60);
+    if (!keyword) return res.status(400).json({ error: 'mot-clé requis' });
+    if (keyword.length < 2) return res.status(400).json({ error: 'mot-clé trop court' });
+    const n = await get1('SELECT COUNT(*) AS c FROM comment_keyword_filters WHERE user_id=?', req.userId);
+    if (Number(n.c) >= 200) return res.status(400).json({ error: 'limite de 200 filtres atteinte' });
+    const id = await insertId('INSERT INTO comment_keyword_filters(user_id,keyword,created_at) VALUES(?,?,?)',
+      req.userId, keyword, now()).catch(() => null);
+    if (id === null) {
+      const ex = await get1('SELECT id FROM comment_keyword_filters WHERE user_id=? AND keyword=?', req.userId, keyword);
+      return res.json({ ok: true, id: ex ? ex.id : null, keyword, marker: KEYWORD_FILTER });
+    }
+    res.json({ ok: true, id, keyword, marker: KEYWORD_FILTER });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.delete('/api/settings/keyword-filters/:id', auth, async (req, res) => {
+  try {
+    await runSql('DELETE FROM comment_keyword_filters WHERE id=? AND user_id=?', Number(req.params.id), req.userId);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.get('/api/settings/comment-filter-mode', auth, async (req, res) => {
+  try {
+    const u = await get1('SELECT comment_filter_mode FROM users WHERE id=?', req.userId);
+    res.json({ ok: true, mode: (u && u.comment_filter_mode) || 'off' });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.post('/api/settings/comment-filter-mode', auth, async (req, res) => {
+  try {
+    const mode = String((req.body || {}).mode || 'off').toLowerCase();
+    if (!['off', 'hold', 'hide'].includes(mode)) return res.status(400).json({ error: 'mode invalide (off|hold|hide)' });
+    await runSql('UPDATE users SET comment_filter_mode=? WHERE id=?', mode, req.userId);
+    res.json({ ok: true, mode, marker: KEYWORD_FILTER });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// modération de la retenue : liste des commentaires en attente sur MES vidéos
+app.get('/comments/held', auth, async (req, res) => {
+  try {
+    const rows = await allRows(
+      `SELECT h.id AS hold_id, h.comment_id, h.video_id, h.author_id, h.keyword, h.created_at,
+              c.text, u.username AS author
+       FROM comment_hold h JOIN comments c ON c.id=h.comment_id
+       LEFT JOIN users u ON u.id=h.author_id
+       WHERE h.owner_id=? ORDER BY h.created_at DESC LIMIT 100`, req.userId);
+    res.json({ ok: true, held: rows });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// approuver (publie) ou supprimer un commentaire en retenue
+app.post('/comments/held/:id', auth, async (req, res) => {
+  try {
+    const action = String((req.body || {}).action || '').toLowerCase();
+    const h = await get1('SELECT * FROM comment_hold WHERE id=? AND owner_id=?', Number(req.params.id), req.userId);
+    if (!h) return res.status(404).json({ error: 'introuvable' });
+    if (action === 'approve') {
+      await runSql(`UPDATE comments SET review_status='ok' WHERE id=?`, h.comment_id);
+      const c = await get1('SELECT * FROM comments WHERE id=?', h.comment_id);
+      if (c) await notify(h.owner_id, 'comment', h.author_id, c.video_id, String(c.text || '').slice(0, 100), c.id);
+    } else if (action === 'delete') {
+      await runSql('DELETE FROM comments WHERE id=?', h.comment_id);
+    } else return res.status(400).json({ error: 'action invalide (approve|delete)' });
+    await runSql('DELETE FROM comment_hold WHERE id=?', h.id);
+    res.json({ ok: true, action });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 
 app.post('/api/videos/:id/comments', auth, uploadMedia.fields([{name:'video',maxCount:1},{name:'audio',maxCount:1}]), async (req, res) => {
@@ -6373,7 +7203,7 @@ app.post('/api/videos/:id/comments', auth, uploadMedia.fields([{name:'video',max
     if (Number(v.allow_comments) === 0)
       return res.status(403).json({ error: 'commentaires désactivés sur cette vidéo' });
     // parité TikTok : "Qui peut commenter" du créateur (everyone/followers/friends/nobody)
-    const owner = await get1('SELECT comment_keywords, comment_privacy FROM users WHERE id=?', v.user_id);
+    const owner = await get1('SELECT comment_keywords, comment_privacy, comment_filter_mode FROM users WHERE id=?', v.user_id);
     const cpol = (owner && owner.comment_privacy) || 'everyone';
     if (Number(v.user_id) !== Number(req.userId)) {
       if (cpol === 'nobody')
@@ -6410,6 +7240,27 @@ app.post('/api/videos/:id/comments', auth, uploadMedia.fields([{name:'video',max
     const id = await insertId(
       'INSERT INTO comments(video_id,user_id,text,reply_to,video_url,audio_url,created_at) VALUES(?,?,?,?,?,?,?)',
       req.params.id, req.userId, text, replyTo, videoUrl, audioUrl, now());
+    // v2.48 (SPEC-02) : KEYWORD_FILTER — filtres mots-clés du créateur (normalisation unicode)
+    // mode 'hold' → commentaire mis en retenue (comment_hold) au lieu d'être publié
+    // mode 'hide' → publié mais masqué aux autres (comme les mots muets existants)
+    let heldKw = null;
+    try {
+      const kfMode = (owner && owner.comment_filter_mode) || 'off';
+      if (kfMode !== 'off' && Number(v.user_id) !== Number(req.userId)) {
+        const kfs = await allRows('SELECT keyword FROM comment_keyword_filters WHERE user_id=?', v.user_id);
+        const normText = normalize(rawText);
+        const hit = kfs.find(k => normText.includes(normalize(k.keyword)));
+        if (hit) {
+          heldKw = normalize(hit.keyword);
+          if (kfMode === 'hold') {
+            await runSql(`UPDATE comments SET review_status='held' WHERE id=?`, id);
+            await insertIgnore('INSERT OR IGNORE INTO comment_hold(comment_id,video_id,author_id,owner_id,keyword,created_at) VALUES(?,?,?,?,?,?)',
+              id, req.params.id, req.userId, v.user_id, heldKw, now());
+          }
+        }
+      }
+    } catch (e) {}
+    const kwHiddenHold = heldKw && ((owner && owner.comment_filter_mode) === 'hide');
     // modération auto V3 : scan du texte (sans IA externe) — v2.39 : scan fait sur le texte brut plus haut
     if (badC) {
       await runSql(`UPDATE comments SET review_status='pending' WHERE id=?`, id);
@@ -6420,7 +7271,9 @@ app.post('/api/videos/:id/comments', auth, uploadMedia.fields([{name:'video',max
       `SELECT c.*, u.username, u.name, u.avatar FROM comments c
        JOIN users u ON u.id=c.user_id WHERE c.id=?`, id);
     // v2.39 : un commentaire en attente de moderation n'est ni notifie ni pousse
-    if (!badC) {
+    // v2.48 (SPEC-02) : un commentaire en retenue (mots-clés) n'est pas notifié non plus
+    const isHeld = heldKw && ((owner && owner.comment_filter_mode) === 'hold');
+    if (!badC && !isHeld) {
       await notify(v.user_id, 'comment', req.userId, v.id, text.slice(0, 100), id);
       // FIX 2026-10-04 (rupture #5): notifier l'auteur du commentaire parent en cas de réponse
       if (replyTo) {
@@ -6432,7 +7285,7 @@ app.post('/api/videos/:id/comments', auth, uploadMedia.fields([{name:'video',max
       }
       notifyMentions(text, req.userId, v.id, id);
     }
-    res.json({ comment: c, filtered: !!kwHidden, pending_review: !!badC });
+    res.json({ comment: c, filtered: !!kwHidden || !!kwHiddenHold, pending_review: !!badC, held: !!isHeld, keyword_filter: heldKw ? KEYWORD_FILTER : undefined });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 
@@ -6465,6 +7318,19 @@ app.post('/api/conversations', auth, async (req, res) => {
       const _f1 = await get1('SELECT 1 FROM follows WHERE follower_id=? AND followed_id=?', req.userId, other.id);
       const _f2 = await get1('SELECT 1 FROM follows WHERE follower_id=? AND followed_id=?', other.id, req.userId);
       if (!_f1 || !_f2) return res.status(403).json({ error: 'ce compte n\'accepte les messages que de ses amis' });
+    }
+    // v2.48 : seuls les amis mutuels obtiennent une conversation directe ;
+    // un inconnu reçoit une demande de message à accepter/refuser.
+    const _f1 = await get1('SELECT 1 FROM follows WHERE follower_id=? AND followed_id=?', req.userId, other.id);
+    const _f2 = await get1('SELECT 1 FROM follows WHERE follower_id=? AND followed_id=?', other.id, req.userId);
+    if (!_f1 || !_f2) {
+      const ex = await get1("SELECT * FROM message_requests WHERE from_user_id=? AND to_user_id=? AND status='pending'", req.userId, other.id);
+      if (ex) return res.status(202).json({ ok: true, request_pending: true, id: ex.id });
+      const rid = await insertId('INSERT INTO message_requests(from_user_id,to_user_id,text,status,created_at) VALUES(?,?,?,\'pending\',?)',
+        req.userId, other.id, '', now());
+      try { await insertId('INSERT INTO notifications(user_id,type,actor_id,title,text,is_read,created_at) VALUES(?,?,?,?,?,0,?)',
+        other.id, 'message_request', req.userId, '✉️ Nouvelle demande de message', '', now()); } catch (_) {}
+      return res.status(202).json({ ok: true, request_pending: true, id: rid });
     }
     const a = Math.min(Number(req.userId), Number(other.id));
     const b = Math.max(Number(req.userId), Number(other.id));
@@ -7682,6 +8548,66 @@ async function scheduleDailyCampaigns() {
     console.log('campagnes notif du jour planifiées:', qi, 'envois en vagues');
     return { ok: true, queued: qi };
   } catch (e) { console.error('scheduleDailyCampaigns:', e.message); return { ok: false }; }
+}
+// ---------- v2.48 (SPEC-08) : rappels intelligents de rétention ----------
+// kinds : winback (inactif 7j+), creator_idle (rien publié depuis 14j), streak_risk (flamme en danger)
+// planificateur premieres : H-15 (premiere_soon) puis bascule live (premiere_live) à l'heure
+async function updatePremieres() {
+  try {
+    const t = now();
+    const dueSoon = await allRows(
+      `SELECT p.video_id, p.creator_id FROM premieres p
+       WHERE p.status='scheduled' AND p.scheduled_at>? AND p.scheduled_at<=?`, t, t + 15 * 60000);
+    for (const p of dueSoon) {
+      const rems = await allRows('SELECT user_id FROM premiere_reminders WHERE video_id=?', p.video_id);
+      for (const r of rems) {
+        const already = await get1(`SELECT 1 FROM notifications WHERE user_id=? AND type='premiere_soon' AND video_id=?`, r.user_id, p.video_id);
+        if (!already) await notify(r.user_id, 'premiere_soon', p.creator_id, p.video_id, 'Ça commence dans 15 minutes ⏰', null);
+      }
+    }
+    const dueLive = await allRows(`SELECT video_id, creator_id FROM premieres WHERE status='scheduled' AND scheduled_at<=?`, t);
+    for (const p of dueLive) {
+      await runSql(`UPDATE premieres SET status='live' WHERE video_id=? AND status='scheduled'`, p.video_id);
+      await runSql('UPDATE videos SET scheduled_at=NULL WHERE id=?', p.video_id);
+      const rems = await allRows('SELECT user_id FROM premiere_reminders WHERE video_id=?', p.video_id);
+      for (const r of rems) await notify(r.user_id, 'premiere_live', p.creator_id, p.video_id, 'La premiere commence maintenant 🔴', null);
+    }
+  } catch (e) { console.error('updatePremieres:', e.message); }
+}
+async function scheduleNudges() {
+  try {
+    const t = now(), D = 86400000, H = 3600000;
+    // plafond anti-spam : pas plus d'1 nudge / 48h par utilisateur
+    const recent = await allRows('SELECT user_id, MAX(sent_at) AS s FROM retention_nudges WHERE sent_at IS NOT NULL GROUP BY user_id');
+    const recentSet = new Set(recent.filter(r => Number(r.s) > t - 48 * H).map(r => Number(r.user_id)));
+    const users = await allRows('SELECT id, tz_offset, last_seen FROM users WHERE COALESCE(nudge_optout,0)=0 ORDER BY last_seen DESC LIMIT 500');
+    for (const u of users) {
+      if (recentSet.has(Number(u.id))) continue;
+      // heures creuses : pas de push entre 23h et 7h heure locale (tz_offset en minutes)
+      const localH = new Date(t + Number(u.tz_offset || 0) * 60000).getUTCHours();
+      if (localH >= 23 || localH < 7) continue;
+      const lastSeen = Number(u.last_seen) || 0;
+      let kind = null, text = '';
+      if (lastSeen && lastSeen < t - 7 * D) {
+        kind = 'winback'; text = 'Tu nous manques ! Viens voir ce que tu as raté 🎬';
+      } else {
+        const vids = await get1('SELECT COUNT(*) AS c, MAX(created_at) AS m FROM videos WHERE user_id=?', u.id);
+        if (Number(vids.c) > 0 && Number(vids.m) < t - 14 * D) {
+          kind = 'creator_idle'; text = 'Tes abonnés attendent ta prochaine vidéo 🎥';
+        } else {
+          const st = await get1('SELECT streak FROM login_streaks WHERE user_id=?', u.id);
+          if (st && Number(st.streak) >= 3 && lastSeen && lastSeen < t - 20 * H) {
+            kind = 'streak_risk'; text = "Ta flamme 🔥 risque de s'éteindre — ouvre l'app !";
+          }
+        }
+      }
+      if (!kind) continue;
+      const nid = await insertId('INSERT INTO retention_nudges(user_id,kind,scheduled_at,sent_at,created_at) VALUES(?,?,?,?,?)',
+        u.id, kind, t, null, t);
+      await notify(u.id, 'nudge_' + kind, null, null, text, null);
+      await runSql('UPDATE retention_nudges SET sent_at=? WHERE id=?', now(), nid);
+    }
+  } catch (e) { console.error('scheduleNudges:', e.message); }
 }
 async function processNotifQueue() {
   try {
@@ -9780,6 +10706,8 @@ async function purgeOldLogs() {
   try { await runSql('DELETE FROM ad_impressions WHERE created_at<?', t - 90 * D); } catch (e) {}
   // notifications lues de plus de 180 jours (les non-lues sont conservées)
   try { await runSql('DELETE FROM notifications WHERE is_read=1 AND created_at<?', t - 180 * D); } catch (e) {}
+  // v2.48 (SPEC analytics-pro) : purge des sources de trafic > 90 jours
+  try { await runSql('DELETE FROM video_view_sources WHERE created_at<?', t - 90 * D); } catch (e) {}
 }
 
 // ==================== SERVEUR v11 — V3 ====================
@@ -9788,6 +10716,20 @@ const PLATFORM_FEE_PCT = 10;   // commission plateforme sur chaque vente
 const AFFILIATE_RATE_PCT = 5;  // commission d'affiliation par défaut (% du total)
 const AD_COST_IMPRESSION = 1;  // pièces débitées du budget par impression
 const AD_COST_CLICK = 5;       // pièces débitées du budget par clic
+// v2.48 (bots chaîne vague 3 — 2026-10-05) : constantes des features
+const CHAPTER_LIMIT = 20;            // SPEC-05 : max 20 chapitres par vidéo
+const HASHTAG_FOLLOW_LIMIT = 200;    // SPEC-03 : max 200 hashtags suivis par utilisateur
+const OFFLINE_QUOTA = 50;            // SPEC-01 : max 50 vidéos suivies hors-ligne par utilisateur
+const TRANSLATE_QUOTA = 100;         // SPEC-04 : max 100 traductions/jour par utilisateur
+const VIDEO_CREATOR_RATE_PCT = 5;    // SPEC-06 : commission créateur sur ventes via sa vidéo (%)
+const PREMIERE_LIMIT_PER_CREATOR = 3;// SPEC-07 : max 3 premieres à venir par créateur
+const KEYWORD_FILTER = 'keyword_filter'; // SPEC-02 : marqueur filtrage mots-clés (retenue)
+// SPEC-07 : taxonomie des centres d'intérêt (même liste que l'app — validation serveur anti-injection)
+const INTERESTS = ['Humour','Musique','Danse','Cuisine','Sport','Voyage','Mode','Gaming','Animaux','Cinéma','Tech','Beauté'];
+// SPEC-02 : normalisation unicode des mots-clés (NFD + suppression diacritiques + minuscules)
+function normalize(s) {
+  return String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
+}
 
 // ---------- modération auto (honnête : simple filtre de mots, sans IA externe) ----------
 // Liste configurable : insultes graves, discriminations, menaces, arnaques courantes.
@@ -10052,6 +10994,20 @@ app.post('/api/shop/orders', auth, async (req, res) => {
     let affiliate = null;
     const ref = String((req.body || {}).ref || '').toUpperCase().trim();
     if (ref) affiliate = await get1('SELECT * FROM affiliates WHERE code=?', ref);
+    // v2.48 (SPEC-06) : attribution vente→vidéo — la vidéo doit référencer TOUS les produits du panier
+    let sourceVideo = null;
+    const svid = Number((req.body || {}).source_video_id);
+    if (svid) {
+      const sv = await get1('SELECT id, user_id FROM videos WHERE id=? AND hidden=0', svid);
+      if (sv) {
+        let allLinked = true;
+        for (const it of items) {
+          const lk = await get1('SELECT 1 FROM video_products WHERE video_id=? AND product_id=?', svid, it.product_id);
+          if (!lk) { allLinked = false; break; }
+        }
+        if (allLinked) sourceVideo = sv;
+      }
+    }
     // --- exécution : stocks d'abord (atomiques), puis débit acheteur ---
     const decremented = [];
     for (const it of items) {
@@ -10071,8 +11027,9 @@ app.post('/api/shop/orders', auth, async (req, res) => {
     await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
       req.userId, -total, 'commande boutique', now());
     const orderId = await insertId(
-      'INSERT INTO orders(buyer_id,total_coins,status,coupon_code,affiliate_id,created_at) VALUES(?,?,?,?,?,?)',
-      req.userId, total, 'completed', coupon ? coupon.code : null, affiliate ? affiliate.id : null, now());
+      'INSERT INTO orders(buyer_id,total_coins,status,coupon_code,affiliate_id,source_video_id,created_at) VALUES(?,?,?,?,?,?,?)',
+      req.userId, total, 'completed', coupon ? coupon.code : null, affiliate ? affiliate.id : null,
+      sourceVideo ? sourceVideo.id : null, now());
     let platformTotal = 0;
     for (const it of items) {
       const line = Number(it.price_coins) * Number(it.qty);
@@ -10098,6 +11055,21 @@ app.post('/api/shop/orders', auth, async (req, res) => {
           affiliate.user_id, comm, 'commission affiliation #' + orderId, now());
       }
     }
+    // v2.48 (SPEC-06) : commission créateur sur ventes via sa vidéo — NON cumulable avec l'affiliation (l'affiliation prime)
+    if (!affiliate && sourceVideo) {
+      const vcomm = Math.min(Math.floor(total * VIDEO_CREATOR_RATE_PCT / 100), platformTotal);
+      if (vcomm > 0) {
+        await insertId('INSERT INTO video_sale_commissions(order_id,video_id,creator_id,coins,refunded,created_at) VALUES(?,?,?,?,0,?)',
+          orderId, sourceVideo.id, sourceVideo.user_id, vcomm, now());
+        await runSql('UPDATE users SET coins=coins+? WHERE id=?', vcomm, sourceVideo.user_id);
+        await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
+          sourceVideo.user_id, vcomm, 'video_sale_commission #' + orderId, now());
+      }
+    }
+    // v2.48 SPEC-09 : attribution de la vente à la vidéo (commission créateur)
+    const _svid = Number((req.body || {}).source_video_id) || null;
+    if (_svid) { try { await runSql('UPDATE orders SET source_video_id=? WHERE id=?', _svid, orderId); } catch (_) {} }
+    if (_svid) await creditVideoSaleCommission(orderId, _svid, req.userId, total, !!affiliate);
     await runSql('DELETE FROM cart WHERE user_id=?', req.userId);
     res.json({ ok: true, order_id: orderId, total_coins: total, discount_coins: discount });
   } catch (e) { res.status(500).json({ error: 'échec de la commande' }); }
@@ -10207,6 +11179,31 @@ app.post('/api/shop/refunds/:id/decide', authOrAdmin, async (req, res) => {
         await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
           it.seller_id, -net, 'remboursement vente #' + rf.order_id, now());
       }
+      // v2.48 (SPEC-06) : remboursement → la commission vidéo du créateur est débitée
+      const vsc = await get1('SELECT * FROM video_sale_commissions WHERE order_id=? AND refunded=0', rf.order_id);
+      if (vsc) {
+        const vc = Number(vsc.coins) || 0;
+        await runSql('UPDATE users SET coins=CASE WHEN coins>=? THEN coins-? ELSE 0 END WHERE id=?', vc, vc, vsc.creator_id);
+        await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
+          vsc.creator_id, -vc, 'video_sale_commission_refund #' + rf.order_id, now());
+        await runSql('UPDATE video_sale_commissions SET refunded=1 WHERE id=?', vsc.id);
+      }
+    }
+    // v2.48 SPEC-09 : débit de la commission vidéo au remboursement (plafonné au solde)
+    if (approve) {
+      try {
+        const vsc = await get1('SELECT * FROM video_sale_commissions WHERE order_id=? AND refunded=0', rf.order_id);
+        if (vsc) {
+          const ub = await get1('SELECT coins FROM users WHERE id=?', vsc.creator_id);
+          const debit = Math.min(Number(vsc.coins) || 0, Number(ub ? ub.coins : 0));
+          if (debit > 0) {
+            await runSql('UPDATE users SET coins=coins-? WHERE id=?', debit, vsc.creator_id);
+            await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
+              vsc.creator_id, -debit, 'video_sale_commission_refund #' + rf.order_id, now());
+          }
+          await runSql('UPDATE video_sale_commissions SET refunded=1 WHERE order_id=?', rf.order_id);
+        }
+      } catch (_) {}
     }
     await runSql("UPDATE shop_refunds SET status=?, decided_at=? WHERE id=?",
       approve ? 'approved' : 'rejected', now(), rf.id);
@@ -10215,6 +11212,24 @@ app.post('/api/shop/refunds/:id/decide', authOrAdmin, async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 
+// ---------- v2.48 SPEC-06 : ventes d'une vidéo (réservé au créateur) ----------
+app.get('/api/videos/:id/sales', auth, async (req, res) => {
+  try {
+    const vid = Number(req.params.id);
+    const v = await get1('SELECT * FROM videos WHERE id=?', vid);
+    if (!v) return res.status(404).json({ error: 'vidéo introuvable' });
+    if (Number(v.user_id) !== Number(req.userId))
+      return res.status(403).json({ error: 'réservé au créateur' });
+    const rows = await allRows(
+      `SELECT c.*, o.total_coins, o.created_at AS order_at, u.username AS buyer
+       FROM video_sale_commissions c JOIN orders o ON o.id=c.order_id
+       LEFT JOIN users u ON u.id=o.buyer_id
+       WHERE c.video_id=? ORDER BY c.created_at DESC LIMIT 100`, vid);
+    const total = await get1('SELECT COALESCE(SUM(coins),0) AS s FROM video_sale_commissions WHERE video_id=? AND refunded=0', vid);
+    res.json({ ok: true, video_id: vid, sales: rows, total_earned: Number((total && total.s) || 0),
+      rate_pct: VIDEO_CREATOR_RATE_PCT, label: 'Ventes via mes vidéos' });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
 // ---------- boutique : produits attachés aux vidéos ----------
 app.post('/api/videos/:id/products', auth, async (req, res) => {
   const v = await get1('SELECT * FROM videos WHERE id=?', req.params.id);
@@ -11023,6 +12038,20 @@ app.delete('/api/family/children/:teen_id', auth, async (req, res) => {
 // ---------- publication programmée : publie les vidéos dont l'heure est passée ----------
 async function publishDue() {
   try {
+    // v2.48 SPEC-10 : les premieres qui sortent → notif premiere_live aux inscrits + chat ouvert
+    try {
+      const going = await allRows(`SELECT p.video_id FROM premieres p WHERE p.status='scheduled' AND p.scheduled_at<=?`, now());
+      for (const g of going) {
+        await runSql("UPDATE premieres SET status='live' WHERE video_id=?", g.video_id);
+        const subs = await allRows('SELECT user_id FROM premiere_reminders WHERE video_id=?', g.video_id);
+        const vv = await get1('SELECT description FROM videos WHERE id=?', g.video_id);
+        for (const s of subs) {
+          try { await insertId('INSERT INTO notifications(user_id,type,video_id,title,text,is_read,created_at) VALUES(?,?,?,?,?,0,?)',
+            s.user_id, 'premiere_live', g.video_id, 'La premiere commence !', String((vv && vv.description) || '').slice(0, 120), now()); } catch (_) {}
+        }
+        // le chat 'premiere:<video_id>' est servi par GET/POST /api/videos/:id/premiere/chat
+      }
+    } catch (_) {}
     await runSql('UPDATE videos SET scheduled_at=NULL WHERE scheduled_at IS NOT NULL AND scheduled_at <= ?', now());
   } catch (e) {}
 }
@@ -11466,6 +12495,29 @@ app.delete('/api/drafts/:id', auth, async (req, res) => {
 });
 
 // ---------- demandes de messages (inconnus) ----------
+// v2.48 : un inconnu (non ami mutuel) ne crée plus directement une conversation ;
+// POST /api/conversations crée une demande en attente (202), le destinataire
+// accepte (→ conversation créée) ou refuse via les endpoints ci-dessous.
+app.post('/api/messages/requests', auth, async (req, res) => {
+  try {
+    const username = String((req.body || {}).username || '').toLowerCase().trim();
+    if (!username) return res.status(400).json({ error: 'pseudo requis' });
+    const other = await get1('SELECT * FROM users WHERE username=?', username);
+    if (!other) return res.status(404).json({ error: 'utilisateur introuvable' });
+    if (Number(other.id) === Number(req.userId)) return res.status(400).json({ error: 'impossible' });
+    if (await isBlocked(req.userId, other.id)) return res.status(403).json({ error: 'utilisateur bloqué' });
+    const dmpol = other.dm_privacy || 'everyone';
+    if (dmpol === 'nobody') return res.status(403).json({ error: "ce compte n'accepte aucun message" });
+    const ex = await get1("SELECT * FROM message_requests WHERE from_user_id=? AND to_user_id=? AND status='pending'", req.userId, other.id);
+    if (ex) return res.json({ ok: true, id: ex.id, request_pending: true });
+    const text = String((req.body || {}).text || '').slice(0, 500);
+    const id = await insertId('INSERT INTO message_requests(from_user_id,to_user_id,text,status,created_at) VALUES(?,?,?,\'pending\',?)',
+      req.userId, other.id, text, now());
+    try { await insertId('INSERT INTO notifications(user_id,type,actor_id,title,text,is_read,created_at) VALUES(?,?,?,?,?,0,?)',
+      other.id, 'message_request', req.userId, '✉️ Nouvelle demande de message', text.slice(0, 120), now()); } catch (_) {}
+    res.status(201).json({ ok: true, id, request_pending: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
 app.get('/api/messages/requests', auth, async (req, res) => {
   try {
     const rows = await allRows(`SELECT mr.*, u.username FROM message_requests mr JOIN users u ON u.id=mr.from_user_id WHERE mr.to_user_id=? AND mr.status='pending' ORDER BY mr.created_at DESC`, req.userId);
@@ -11476,8 +12528,19 @@ app.post('/api/messages/requests/:id/accept', auth, async (req, res) => {
   try {
     const r = await get1('SELECT * FROM message_requests WHERE id=? AND to_user_id=?', req.params.id, req.userId);
     if (!r) return res.status(404).json({ error: 'introuvable' });
+    if (r.status !== 'pending') return res.status(400).json({ error: 'demande déjà traitée' });
     await runSql("UPDATE message_requests SET status='accepted' WHERE id=?", r.id);
-    res.json({ ok: true });
+    // la conversation n'est créée qu'APRÈS acceptation
+    const a = Math.min(Number(r.from_user_id), Number(r.to_user_id));
+    const b = Math.max(Number(r.from_user_id), Number(r.to_user_id));
+    let conv = await get1('SELECT * FROM conversations WHERE user1_id=? AND user2_id=?', a, b);
+    if (!conv) {
+      const cid = await insertId('INSERT INTO conversations(user1_id,user2_id,created_at,updated_at) VALUES(?,?,?,?)', a, b, now(), now());
+      conv = await get1('SELECT * FROM conversations WHERE id=?', cid);
+    }
+    try { await insertId('INSERT INTO notifications(user_id,type,actor_id,title,text,is_read,created_at) VALUES(?,?,?,?,?,0,?)',
+      r.from_user_id, 'message_request_accepted', req.userId, '✅ Demande acceptée', 'Vous pouvez maintenant discuter 💬', now()); } catch (_) {}
+    res.json({ ok: true, conversation_id: conv.id });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 app.post('/api/messages/requests/:id/decline', auth, async (req, res) => {
@@ -11679,6 +12742,27 @@ app.get('/api/me/content-prefs', auth, async (req, res) => {
     res.json({ ok: true, prefs: rows });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
+// v2.48 (SPEC-08) : préférences des rappels de rétention (opt-out / opt-in)
+app.post('/api/me/nudges', auth, async (req, res) => {
+  try {
+    const b = req.body || {};
+    if ('tz_offset' in b) {
+      const tz = Math.max(-840, Math.min(840, parseInt(b.tz_offset, 10) || 0)); // ±14h en minutes
+      await runSql('UPDATE users SET tz_offset=? WHERE id=?', tz, req.userId);
+    }
+    if ('optout' in b) await runSql('UPDATE users SET nudge_optout=? WHERE id=?', b.optout ? 1 : 0, req.userId);
+    const u = await get1('SELECT nudge_optout, tz_offset FROM users WHERE id=?', req.userId);
+    res.json({ ok: true, optout: !!Number(u && u.nudge_optout), tz_offset: Number((u && u.tz_offset) || 0) });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.delete('/api/me/content-prefs', auth, async (req, res) => {
+  try {
+    const topic = String((req.query.topic || (req.body || {}).topic || '')).trim().toLowerCase().slice(0, 50);
+    if (topic) await runSql('DELETE FROM content_prefs WHERE user_id=? AND topic=?', req.userId, topic);
+    else await runSql('DELETE FROM content_prefs WHERE user_id=?', req.userId);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
 // Endpoints manquants détectés par le bot de test (2026-10-03)
 app.get('/api/me/followers', auth, async (req, res) => {
   try {
@@ -11717,7 +12801,14 @@ app.get('/api/me/stats', auth, async (req, res) => {
   try {
     const fr = await get1('SELECT COUNT(*) AS c FROM follows WHERE followed_id=?', req.userId);
     const vr = await get1('SELECT COALESCE(SUM(views),0) AS s FROM videos WHERE user_id=?', req.userId);
-    res.json({ ok: true, followers: Number(fr.c) || 0, totalViews: Number(vr.s) || 0, views: Number(vr.s) || 0 });
+    // v2.48 (SPEC-06) : gains des ventes via mes vidéos (commissions non remboursées)
+    let video_sales_earned = 0;
+    try {
+      const vs = await get1('SELECT COALESCE(SUM(coins),0) AS s FROM video_sale_commissions WHERE creator_id=? AND refunded=0', req.userId);
+      video_sales_earned = Number((vs && vs.s) || 0);
+    } catch (e) {}
+    res.json({ ok: true, followers: Number(fr.c) || 0, totalViews: Number(vr.s) || 0, views: Number(vr.s) || 0,
+      video_sales_earned, video_sales_label: 'Ventes via mes vidéos' });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 // PARITÉ TIKTOK 2026-10-04 : analytics profil 7/28 jours, données réelles (jamais de fausses données)
@@ -11840,6 +12931,9 @@ app.post('/api/me/content-prefs', auth, async (req, res) => {
     const topic = String((req.body || {}).topic || '').trim().toLowerCase().slice(0, 50);
     const pref = (req.body || {}).pref === 'less' ? 'less' : 'more';
     if (!topic) return res.status(400).json({ error: 'sujet requis' });
+    // v2.48 (SPEC-07) : validation contre la taxonomie INTERESTS (anti-injection)
+    const valid = INTERESTS.map(t => t.toLowerCase());
+    if (!valid.includes(topic)) return res.status(400).json({ error: 'sujet invalide' });
     await insertIgnore('INSERT OR IGNORE INTO content_prefs(user_id,topic,pref,created_at) VALUES(?,?,?,?)', req.userId, topic, pref, now());
     await runSql('UPDATE content_prefs SET pref=? WHERE user_id=? AND topic=?', pref, req.userId, topic);
     res.json({ ok: true });
@@ -12272,6 +13366,14 @@ initDb().then(() => {
   scheduleDailyCampaigns().catch(()=>{}); // campagnes notif du jour
   setInterval(()=>{scheduleDailyCampaigns().catch(()=>{})}, 3600000); // vérifie chaque heure
   setInterval(()=>{processNotifQueue().catch(()=>{})}, 600000); // traite la file toutes les 10 min
+  // v2.48 (bots chaîne vague 3) : premieres (H-15 + bascule live) + rappels rétention
+  updatePremieres().catch(()=>{});
+  setInterval(()=>{updatePremieres().catch(()=>{})}, 60000);
+  scheduleNudges().catch(()=>{});
+  setInterval(()=>{scheduleNudges().catch(()=>{})}, 3600000);
+  setInterval(()=>{checkPremieres().catch(()=>{})}, 600000); // v2.48 SPEC-10 : rappels H-15 premieres
+  setInterval(()=>{evaluateNudges().catch(()=>{})}, 86400000); // v2.48 SPEC-08 : évaluation quotidienne des nudges
+  setTimeout(()=>{evaluateNudges().catch(()=>{}); checkPremieres().catch(()=>{});}, 120000); // + 2 min après démarrage
   runVerificationBot().catch(()=>{}); // + au démarrage
   const server = app.listen(PORT, () => console.log(
     `VidiGagne Server v2 sur http://localhost:${PORT} (db=${USE_PG ? 'postgres' : 'sqlite'}, storage=${USE_CLOUDINARY ? 'cloudinary' : 'local'})`));
