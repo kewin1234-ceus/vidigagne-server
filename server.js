@@ -56,6 +56,13 @@ CREATE TABLE IF NOT EXISTS tokens(
   user_id INTEGER NOT NULL,
   created_at BIGINT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS devices(
+  device_id TEXT PRIMARY KEY,
+  user_ids TEXT NOT NULL DEFAULT '[]',
+  first_seen BIGINT NOT NULL,
+  last_seen BIGINT NOT NULL,
+  flagged INTEGER NOT NULL DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS videos(
   id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
   user_id INTEGER NOT NULL,
@@ -312,6 +319,13 @@ CREATE TABLE IF NOT EXISTS collection_items(
   video_id INTEGER NOT NULL,
   added_at BIGINT NOT NULL,
   PRIMARY KEY(collection_id, video_id)
+);
+CREATE TABLE IF NOT EXISTS collection_shares(
+  id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+  collection_id INTEGER NOT NULL,
+  owner_id INTEGER NOT NULL,
+  share_code TEXT NOT NULL UNIQUE,
+  created_at BIGINT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS reposts(
   user_id INTEGER NOT NULL,
@@ -1260,7 +1274,7 @@ app.post('/api/admin/sounds/bulk-import', async (req, res) => {
   if (!process.env.ADMIN_TOKEN || t !== process.env.ADMIN_TOKEN)
     return res.status(403).json({ error: 'non autorisé' });
   if (!USE_CLOUDINARY || !cloudinary)
-    return res.status(500).json({ error: 'Cloudinary non configuré' });
+    return res.status(503).json({ error: 'stockage audio non configuré' });
   const tracks = ((req.body || {}).tracks || []).slice(0, 60);
   if (!tracks.length) return res.status(400).json({ error: 'tracks requis' });
   const https = require('https'), http = require('http');
@@ -2264,6 +2278,33 @@ function parseKeywords(s) {
   } catch (e) { return []; }
 }
 
+// ---------- v2.32 : 1 identité par installation (DÉTECTION anti-fraude, jamais de blocage) ----------
+// L'app envoie X-Device-Id (UUID persistant par installation, voir vgDeviceId() dans index.html).
+// Règle : un device vu sur ≥2 comptes DISTINCTS est marqué flagged=1 pour révision admin —
+// les sessions restent fonctionnelles (faux positifs possibles : famille partageant un téléphone,
+// réinstallation, revente d'appareil). Les tokens sans device (anciennes versions de l'app)
+// restent valides : aucune casse rétroactive.
+async function recordDevice(req, userId) {
+  try {
+    const raw = String(req.headers['x-device-id'] || (req.body || {}).device_id || '').trim().slice(0, 128);
+    if (!/^[A-Za-z0-9_-]{8,128}$/.test(raw)) return; // absent ou invalide : on n'enregistre rien
+    const t = now();
+    const row = await get1('SELECT * FROM devices WHERE device_id=?', raw);
+    if (!row) {
+      await runSql('INSERT INTO devices(device_id,user_ids,first_seen,last_seen,flagged) VALUES(?,?,?,?,0)',
+        raw, JSON.stringify([userId]), t, t);
+      return;
+    }
+    let ids = [];
+    try { ids = JSON.parse(row.user_ids || '[]'); } catch (e) { ids = []; }
+    if (!Array.isArray(ids)) ids = [];
+    if (!ids.includes(userId)) ids.push(userId);
+    const flagged = (ids.length > 1 || row.flagged) ? 1 : 0;
+    await runSql('UPDATE devices SET user_ids=?, last_seen=?, flagged=? WHERE device_id=?',
+      JSON.stringify(ids), t, flagged, raw);
+  } catch (e) { /* jamais bloquant : l'auth ne doit pas échouer à cause du suivi device */ }
+}
+
 // ---------- auth ----------
 app.post('/api/auth/register', async (req, res) => {
   try {
@@ -2305,6 +2346,7 @@ app.post('/api/auth/register', async (req, res) => {
     if (refCode) await runSql('UPDATE users SET ref_code=? WHERE id=?', refCode, id);
     const token = crypto.randomBytes(32).toString('hex');
     await runSql('INSERT INTO tokens(token,user_id,created_at) VALUES(?,?,?)', token, id, now());
+    await recordDevice(req, id); // v2.32 : 1 identité par installation (détection, jamais bloquant)
     const u = await get1('SELECT * FROM users WHERE id=?', id);
     if (email) await consumeVerifiedToken((req.body || {}).verification_token);
     res.json({ token, user: privUser(u), coins: u.coins });
@@ -2332,6 +2374,7 @@ app.post('/api/auth/login', async (req, res) => {
       await consumeVerifiedToken((req.body || {}).verification_token);
       const _token = crypto.randomBytes(32).toString('hex');
       await runSql('INSERT INTO tokens(token,user_id,created_at) VALUES(?,?,?)', _token, _u.id, now());
+      await recordDevice(req, _u.id); // v2.32 : 1 identité par installation (détection, jamais bloquant)
       return res.json({ token: _token, user: privUser(_u), coins: _u.coins });
     }
     const ident = ((req.body || {}).username || (req.body || {}).identifier || (req.body || {}).email || '').toLowerCase().trim();
@@ -2342,6 +2385,7 @@ app.post('/api/auth/login', async (req, res) => {
       return res.status(401).json({ error: 'pseudo ou mot de passe incorrect' });
     const token = crypto.randomBytes(32).toString('hex');
     await runSql('INSERT INTO tokens(token,user_id,created_at) VALUES(?,?,?)', token, u.id, now());
+    await recordDevice(req, u.id); // v2.32 : 1 identité par installation (détection, jamais bloquant)
     res.json({ token, user: privUser(u), coins: u.coins });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
@@ -3077,6 +3121,9 @@ app.delete('/api/comments/:id', auth, async (req, res) => {
     const isOwner = v && Number(v.user_id) === Number(req.userId);
     if (!isAuthor && !isOwner) return res.status(403).json({ error: 'non autorisé' });
     // supprime les réponses (et leurs likes) puis le commentaire
+    // anti-orphelins : notifications et vidéos-réponses pointant vers le commentaire ou ses réponses
+    await runSql('DELETE FROM notifications WHERE comment_id=? OR comment_id IN (SELECT id FROM comments WHERE reply_to=?)', c.id, c.id);
+    await runSql('UPDATE videos SET reply_to_comment_id=0 WHERE reply_to_comment_id=? OR reply_to_comment_id IN (SELECT id FROM comments WHERE reply_to=?)', c.id, c.id);
     const kids = await allRows('SELECT id FROM comments WHERE reply_to=?', c.id);
     for (const k of kids) await runSql('DELETE FROM comment_likes WHERE comment_id=?', k.id);
     await runSql('DELETE FROM comments WHERE reply_to=?', c.id);
@@ -3171,24 +3218,40 @@ app.delete('/api/account', auth, async (req, res) => {
       } catch (e) {}
     }
     const vIds = (await allRows('SELECT id FROM videos WHERE user_id=?', uid)).map(r => r.id);
-    for (const vid of vIds) {
-      await runSql('DELETE FROM likes WHERE video_id=?', vid);
-      const cIds = (await allRows('SELECT id FROM comments WHERE video_id=?', vid)).map(r => r.id);
-      for (const cid of cIds) await runSql('DELETE FROM comment_likes WHERE comment_id=?', cid);
-      await runSql('DELETE FROM comments WHERE video_id=?', vid);
-      await runSql('DELETE FROM playlist_items WHERE video_id=?', vid);
-      await runSql('DELETE FROM videos WHERE id=?', vid);
-    }
+    for (const vid of vIds) await deleteVideoCascade(vid);
+    // stories (+ leurs vues), playlists, collections (+ items, partages)
+    await runSql('DELETE FROM story_views WHERE story_id IN (SELECT id FROM stories WHERE user_id=?) OR viewer_id=?', uid, uid);
     await runSql('DELETE FROM stories WHERE user_id=?', uid);
     await runSql('DELETE FROM playlists WHERE user_id=?', uid);
     await runSql('DELETE FROM playlist_items WHERE playlist_id NOT IN (SELECT id FROM playlists)');
+    await runSql('DELETE FROM collection_items WHERE collection_id IN (SELECT id FROM collections WHERE user_id=?)', uid);
+    await runSql('DELETE FROM collection_shares WHERE collection_id IN (SELECT id FROM collections WHERE user_id=?) OR owner_id=?', uid, uid);
+    await runSql('DELETE FROM collections WHERE user_id=?', uid);
+    await runSql('DELETE FROM shared_collection_videos WHERE collection_id IN (SELECT id FROM shared_collections WHERE owner_id=?)', uid);
+    await runSql('DELETE FROM shared_collection_members WHERE collection_id IN (SELECT id FROM shared_collections WHERE owner_id=?) OR user_id=?', uid, uid);
+    await runSql('DELETE FROM shared_collections WHERE owner_id=?', uid);
+    // interactions : les notifs pointant vers ses commentaires sont purgées AVANT les commentaires
     await runSql('DELETE FROM comment_likes WHERE user_id=?', uid);
+    await runSql('DELETE FROM notifications WHERE comment_id IN (SELECT id FROM comments WHERE user_id=?)', uid);
     await runSql('DELETE FROM comments WHERE user_id=?', uid);
     await runSql('DELETE FROM likes WHERE user_id=?', uid);
+    await runSql('DELETE FROM reposts WHERE user_id=?', uid);
+    await runSql('DELETE FROM video_pins WHERE user_id=?', uid);
+    await runSql('DELETE FROM hidden_videos WHERE user_id=?', uid);
     await runSql('DELETE FROM follows WHERE follower_id=? OR followed_id=?', uid, uid);
+    await runSql('DELETE FROM blocks WHERE user_id=? OR blocked_id=?', uid, uid);
+    await runSql('DELETE FROM reports WHERE reporter_id=?', uid);
     await runSql('DELETE FROM gifts WHERE from_id=? OR to_id=?', uid, uid);
+    await runSql('DELETE FROM tips WHERE from_user_id=? OR to_user_id=?', uid, uid);
     await runSql('DELETE FROM ledger WHERE user_id=?', uid);
     await runSql('DELETE FROM withdrawals WHERE user_id=?', uid);
+    await runSql('DELETE FROM receipts WHERE user_id=?', uid);
+    await runSql('DELETE FROM coin_recharges WHERE user_id=?', uid);
+    await runSql('DELETE FROM order_items WHERE order_id IN (SELECT id FROM orders WHERE buyer_id=?)', uid);
+    await runSql('DELETE FROM orders WHERE buyer_id=?', uid);
+    await runSql('DELETE FROM cart WHERE user_id=? OR product_id IN (SELECT id FROM products WHERE seller_id=?)', uid, uid);
+    await runSql('DELETE FROM video_products WHERE product_id IN (SELECT id FROM products WHERE seller_id=?)', uid);
+    await runSql('DELETE FROM products WHERE seller_id=?', uid);
     // m9 : nettoyage complet, pas de lignes orphelines
     await runSql('DELETE FROM video_views WHERE viewer_id=?', uid);
     await runSql('DELETE FROM watch_events WHERE user_id=?', uid);
@@ -3196,16 +3259,51 @@ app.delete('/api/account', auth, async (req, res) => {
     await runSql('DELETE FROM watch_rewards WHERE user_id=?', uid);
     await runSql('DELETE FROM like_rewards WHERE liker_id=?', uid);
     await runSql('DELETE FROM messages WHERE conversation_id IN (SELECT id FROM conversations WHERE user1_id=? OR user2_id=?)', uid, uid);
+    await runSql('DELETE FROM conversation_reads WHERE user_id=? OR conversation_id IN (SELECT id FROM conversations WHERE user1_id=? OR user2_id=?)', uid, uid, uid);
     await runSql('DELETE FROM conversations WHERE user1_id=? OR user2_id=?', uid, uid);
-    await runSql('DELETE FROM notifications WHERE user_id=?', uid);
+    await runSql('DELETE FROM message_requests WHERE from_user_id=? OR to_user_id=?', uid, uid);
+    await runSql('DELETE FROM group_messages WHERE sender_id=?', uid);
+    await runSql('DELETE FROM group_members WHERE user_id=?', uid);
+    await runSql('DELETE FROM notifications WHERE user_id=? OR actor_id=?', uid, uid);
+    await runSql('DELETE FROM series_items WHERE series_id IN (SELECT id FROM series WHERE creator_id=?)', uid);
+    await runSql('DELETE FROM series_purchases WHERE user_id=? OR series_id IN (SELECT id FROM series WHERE creator_id=?)', uid, uid);
     await runSql('DELETE FROM series WHERE creator_id=?', uid);
-    await runSql('DELETE FROM series_purchases WHERE user_id=?', uid);
     await runSql('DELETE FROM id_verifications WHERE user_id=?', uid);
+    await runSql('DELETE FROM verification_requests WHERE user_id=?', uid);
     await runSql('DELETE FROM payment_methods WHERE user_id=?', uid);
     await runSql('DELETE FROM family_links WHERE parent_id=? OR teen_id=?', uid, uid);
     await runSql('DELETE FROM family_settings WHERE teen_id=?', uid);
+    await runSql('DELETE FROM family_codes WHERE parent_id=?', uid);
+    await runSql('DELETE FROM challenge_claims WHERE user_id=?', uid);
+    await runSql('DELETE FROM creator_subs WHERE subscriber_id=? OR creator_id=?', uid, uid);
+    await runSql('DELETE FROM effect_favs WHERE user_id=?', uid);
+    await runSql('DELETE FROM sound_favs WHERE user_id=?', uid);
+    await runSql('DELETE FROM qa_questions WHERE user_id=? OR asker_id=?', uid, uid);
+    await runSql('DELETE FROM video_drafts WHERE user_id=?', uid);
+    await runSql('DELETE FROM content_prefs WHERE user_id=?', uid);
+    await runSql('DELETE FROM search_logs WHERE user_id=?', uid);
+    await runSql('DELETE FROM activities WHERE user_id=?', uid);
+    await runSql('DELETE FROM bot_messages WHERE user_id=?', uid);
+    await runSql('DELETE FROM call_signals WHERE call_id IN (SELECT id FROM calls WHERE caller_id=? OR callee_id=?) OR to_user_id=? OR from_user_id=?', uid, uid, uid, uid);
+    await runSql('DELETE FROM calls WHERE caller_id=? OR callee_id=?', uid, uid);
+    await runSql('DELETE FROM live_signals WHERE to_user_id=? OR from_user_id=?', uid, uid);
     await runSql('UPDATE lives SET ended_at=? WHERE user_id=? AND ended_at IS NULL', now(), uid);
     await runSql('DELETE FROM tokens WHERE user_id=?', uid);
+    await runSql('DELETE FROM oauth_sessions WHERE user_id=?', uid);
+    // codes de vérification / resets liés à l'e-mail ou au téléphone du compte
+    const idents = await get1('SELECT email, phone FROM users WHERE id=?', uid);
+    if (idents) {
+      const idv = [idents.email, idents.phone].filter(Boolean);
+      if (idv.length) {
+        const iph = idv.map(() => '?').join(',');
+        await runSql(`DELETE FROM verification_codes WHERE identifier IN (${iph})`, ...idv);
+        await runSql(`DELETE FROM password_resets WHERE email IN (${iph})`, ...idv);
+      }
+    }
+    // sondages : décrémente les compteurs avant de supprimer les votes (cohérence poll_options.votes)
+    const myVotes = await allRows('SELECT option_id FROM poll_votes WHERE user_id=?', uid);
+    for (const vt of myVotes) await runSql('UPDATE poll_options SET votes=votes-1 WHERE id=?', vt.option_id);
+    await runSql('DELETE FROM poll_votes WHERE user_id=?', uid);
     await runSql('DELETE FROM users WHERE id=?', uid);
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
@@ -4138,12 +4236,51 @@ app.get('/api/videos/:id', async (req, res) => {
   if (!(await canSeeVideo(v, meId))) return res.status(404).json({ error: 'vidéo introuvable' });
   res.json({ video: await videoJSON(v, meId) });
 });
+// ---------- suppression d'une vidéo : cascade complète anti-orphelins ----------
+// Utilisée par DELETE /api/videos/:id ET par DELETE /api/account (fonction
+// hoistée : appelable depuis n'importe quel endpoint du module).
+// Convention : duet_of/stitch_of/reply_to_comment_id valent 0 quand absents.
+async function deleteVideoCascade(vid) {
+  vid = Number(vid);
+  // les vidéos-réponses / duos / stitches pointant vers la vidéo supprimée
+  // retombent sur 0 (aucune) au lieu de pointer vers le vide
+  await runSql('UPDATE videos SET reply_to_comment_id=0 WHERE reply_to_comment_id IN (SELECT id FROM comments WHERE video_id=?)', vid);
+  await runSql('DELETE FROM comment_likes WHERE comment_id IN (SELECT id FROM comments WHERE video_id=?)', vid);
+  await runSql('DELETE FROM notifications WHERE video_id=? OR comment_id IN (SELECT id FROM comments WHERE video_id=?)', vid, vid);
+  await runSql('DELETE FROM comments WHERE video_id=?', vid);
+  await runSql('DELETE FROM likes WHERE video_id=?', vid);
+  await runSql('DELETE FROM video_views WHERE video_id=?', vid);
+  await runSql('DELETE FROM watch_events WHERE video_id=?', vid);
+  await runSql('DELETE FROM watch_history WHERE video_id=?', vid);
+  await runSql('DELETE FROM watch_rewards WHERE video_id=?', vid);
+  await runSql('DELETE FROM like_rewards WHERE video_id=?', vid);
+  await runSql('DELETE FROM tips WHERE video_id=?', vid);
+  await runSql('DELETE FROM playlist_items WHERE video_id=?', vid);
+  await runSql('DELETE FROM collection_items WHERE video_id=?', vid);
+  await runSql('DELETE FROM shared_collection_videos WHERE video_id=?', vid);
+  await runSql('DELETE FROM series_items WHERE video_id=?', vid);
+  await runSql('DELETE FROM reposts WHERE video_id=?', vid);
+  await runSql('DELETE FROM gifts WHERE video_id=?', vid);
+  await runSql('DELETE FROM video_pins WHERE video_id=?', vid);
+  await runSql('DELETE FROM video_products WHERE video_id=?', vid);
+  await runSql('DELETE FROM hidden_videos WHERE video_id=?', vid);
+  await runSql("DELETE FROM reports WHERE target_type='video' AND target_id=?", vid);
+  await runSql("DELETE FROM review_queue WHERE item_type='video' AND item_id=?", vid);
+  await runSql('DELETE FROM poll_votes WHERE poll_id IN (SELECT id FROM polls WHERE video_id=?)', vid);
+  await runSql('DELETE FROM poll_options WHERE poll_id IN (SELECT id FROM polls WHERE video_id=?)', vid);
+  await runSql('DELETE FROM polls WHERE video_id=?', vid);
+  await runSql('UPDATE videos SET duet_of=0 WHERE duet_of=?', vid);
+  await runSql('UPDATE videos SET stitch_of=0 WHERE stitch_of=?', vid);
+  await runSql('DELETE FROM videos WHERE id=?', vid);
+}
 // ---------- suppression d'une vidéo (propriétaire uniquement) ----------
 app.delete('/api/videos/:id', auth, async (req, res) => {
   try {
     const v = await get1('SELECT * FROM videos WHERE id=?', req.params.id);
     if (!v) return res.status(404).json({ error: 'vidéo introuvable' });
-    if (Number(v.user_id) !== Number(req.userId)) return res.status(403).json({ error: 'non autorisé' });
+    // v2.38 : l'admin (x-admin-token) peut supprimer n'importe quelle vidéo
+    const _isAdm = process.env.ADMIN_TOKEN && req.headers['x-admin-token'] === process.env.ADMIN_TOKEN;
+    if (!_isAdm && Number(v.user_id) !== Number(req.userId)) return res.status(403).json({ error: 'non autorisé' });
     // fichier : Cloudinary ou disque local
     try {
       if (USE_CLOUDINARY && v.file) {
@@ -4151,18 +4288,7 @@ app.delete('/api/videos/:id', auth, async (req, res) => {
         if (m) await cloudinary.uploader.destroy(m[1], { resource_type: 'video' });
       } else if (v.file) fs.unlink(path.join(UP, v.file), () => {});
     } catch (e) {}
-    const cIds = (await allRows('SELECT id FROM comments WHERE video_id=?', v.id)).map(r => r.id);
-    for (const cid of cIds) await runSql('DELETE FROM comment_likes WHERE comment_id=?', cid);
-    await runSql('DELETE FROM comments WHERE video_id=?', v.id);
-    await runSql('DELETE FROM likes WHERE video_id=?', v.id);
-    await runSql('DELETE FROM video_views WHERE video_id=?', v.id);
-    await runSql('DELETE FROM watch_events WHERE video_id=?', v.id);
-    await runSql('DELETE FROM watch_history WHERE video_id=?', v.id);
-    await runSql('DELETE FROM watch_rewards WHERE video_id=?', v.id);
-    await runSql('DELETE FROM like_rewards WHERE video_id=?', v.id);
-    await runSql('DELETE FROM tips WHERE video_id=?', v.id);
-    await runSql('DELETE FROM playlist_items WHERE video_id=?', v.id);
-    await runSql('DELETE FROM videos WHERE id=?', v.id);
+    await deleteVideoCascade(v.id);
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
@@ -4459,6 +4585,17 @@ app.post('/api/conversations', auth, async (req, res) => {
       return res.status(400).json({ error: 'impossible de se parler à soi-même' });
     if (await isBlocked(req.userId, other.id))
       return res.status(403).json({ error: 'utilisateur bloqué' });
+    // FIX 2026-10-04 (bot chain-security-private) : appliquer la politique DM du destinataire
+    // (dm_privacy était enregistrée par /api/me/privacy mais JAMAIS appliquée — n'importe qui
+    // pouvait écrire à un compte réglé sur « personne »)
+    const dmpol = other.dm_privacy || 'everyone';
+    if (dmpol === 'nobody')
+      return res.status(403).json({ error: 'ce compte n\'accepte aucun message' });
+    if (dmpol === 'friends') {
+      const _f1 = await get1('SELECT 1 FROM follows WHERE follower_id=? AND followed_id=?', req.userId, other.id);
+      const _f2 = await get1('SELECT 1 FROM follows WHERE follower_id=? AND followed_id=?', other.id, req.userId);
+      if (!_f1 || !_f2) return res.status(403).json({ error: 'ce compte n\'accepte les messages que de ses amis' });
+    }
     const a = Math.min(Number(req.userId), Number(other.id));
     const b = Math.max(Number(req.userId), Number(other.id));
     let conv = await get1('SELECT * FROM conversations WHERE user1_id=? AND user2_id=?', a, b);
@@ -4522,6 +4659,16 @@ app.post('/api/conversations/:id/messages', auth, async (req, res) => {
     const otherId = Number(c.user1_id) === Number(req.userId) ? c.user2_id : c.user1_id;
     if (await isBlocked(req.userId, otherId))
       return res.status(403).json({ error: 'utilisateur bloqué' });
+    // FIX 2026-10-04 (bot chain-security-private) : politique DM aussi sur les conversations existantes
+    const _dmo = await get1('SELECT dm_privacy FROM users WHERE id=?', otherId);
+    const _dmpol = (_dmo && _dmo.dm_privacy) || 'everyone';
+    if (_dmpol === 'nobody')
+      return res.status(403).json({ error: 'ce compte n\'accepte aucun message' });
+    if (_dmpol === 'friends') {
+      const _g1 = await get1('SELECT 1 FROM follows WHERE follower_id=? AND followed_id=?', req.userId, otherId);
+      const _g2 = await get1('SELECT 1 FROM follows WHERE follower_id=? AND followed_id=?', otherId, req.userId);
+      if (!_g1 || !_g2) return res.status(403).json({ error: 'ce compte n\'accepte les messages que de ses amis' });
+    }
     // v12 : jumelage familial — politique DM du destinataire (s'il est sous contrôle parental)
     const fset = await get1('SELECT dm_policy FROM family_settings WHERE teen_id=?', otherId);
     if (fset) {
@@ -4653,6 +4800,17 @@ app.post('/api/admin/users/:id/verify', async (req, res) => {
     res.json({ user: pubUser(upd) });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
+// v2.38 : bannir / débannir un utilisateur (admin) — suspend=true → compte suspendu (auth 403), suspend=false → réactivé
+app.post('/api/admin/users/:id/suspend', adminAuth, async (req, res) => {
+  try {
+    const u = await get1('SELECT id, username, suspended FROM users WHERE id=?', req.params.id);
+    if (!u) return res.status(404).json({ error: 'utilisateur introuvable' });
+    const suspend = !!(req.body || {}).suspend;
+    await runSql('UPDATE users SET suspended=? WHERE id=?', suspend ? 1 : 0, u.id);
+    await notify(u.id, 'system', null, null, suspend ? '⛔ Ton compte a été suspendu par un administrateur.' : '✅ Ton compte a été réactivé.');
+    res.json({ ok: true, id: u.id, username: u.username, suspended: suspend });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
 
 // ---------- retraits : validation admin (2026-10-04) ----------
 // protégé comme /api/fund/deposit : en-tête x-admin-token=<redacted>
@@ -4696,6 +4854,30 @@ app.post('/api/admin/withdrawals/:id/reject', async (req, res) => {
     await runSql('UPDATE withdrawals SET status=?, decided_at=? WHERE id=?', 'rejected', t, w.id);
     await runSql('UPDATE receipts SET status=? WHERE withdrawal_id=?', 'rejected', w.id);
     res.json({ ok: true, id: w.id, status: 'rejected', refunded: w.coins });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+
+// ---------- v2.32 : 1 identité par installation — révision admin des doublons de device ----------
+// Un device flagged=1 = vu sur ≥2 comptes distincts. Détection anti-fraude UNIQUEMENT :
+// l'admin arbitre (faux positifs possibles : famille partageant un téléphone, réinstallation).
+// Protégé comme /api/admin/withdrawals : en-tête x-admin-token.
+app.get('/api/admin/devices/flagged', async (req, res) => {
+  try {
+    if (!checkAdmin(req, res)) return;
+    const rows = await allRows('SELECT * FROM devices WHERE flagged=1 ORDER BY last_seen DESC');
+    const out = [];
+    for (const d of rows) {
+      let ids = [];
+      try { ids = JSON.parse(d.user_ids || '[]'); } catch (e) { ids = []; }
+      const users = [];
+      for (const id of ids) {
+        const u = await get1('SELECT id,username,coins,created_at FROM users WHERE id=?', id);
+        if (u) users.push(u);
+      }
+      out.push({ device_id: d.device_id, first_seen: Number(d.first_seen), last_seen: Number(d.last_seen),
+        users, accounts: users.length });
+    }
+    res.json({ devices: out });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 
@@ -4940,6 +5122,41 @@ app.get('/api/collections/:id', async (req, res) => {
       if (v) { const j = await videoJSON(v, meId); if (j) videos.push(j); }
     }
     res.json({ collection: { id: c.id, name: c.name, is_private: !!c.is_private, videos } });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+
+// ---------- partage de collection par code (entre 2 appareils) ----------
+app.post('/api/collections/:id/share', auth, async (req, res) => {
+  try {
+    const c = await collOf(req.params.id, req.userId);
+    if (!c) return res.status(404).json({ error: 'collection introuvable' });
+    let code = '';
+    for (let i = 0; i < 5 && !code; i++) {
+      const cand = 'VG-SHARE-' + Math.random().toString(36).slice(2, 8).toUpperCase();
+      const ex = await get1('SELECT 1 FROM collection_shares WHERE share_code=?', cand);
+      if (!ex) code = cand;
+    }
+    if (!code) return res.status(500).json({ error: 'réessaie' });
+    await runSql('INSERT INTO collection_shares(collection_id,owner_id,share_code,created_at) VALUES(?,?,?,?)',
+      c.id, req.userId, code, now());
+    res.json({ ok: true, code });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.get('/api/shared/:code', async (req, res) => {
+  try {
+    const sh = await get1('SELECT * FROM collection_shares WHERE share_code=?',
+      String(req.params.code || '').trim().toUpperCase());
+    if (!sh) return res.status(404).json({ error: 'code invalide' });
+    const c = await get1('SELECT * FROM collections WHERE id=?', sh.collection_id);
+    if (!c) return res.status(404).json({ error: 'collection introuvable' });
+    const meId = await optUserId(req);
+    const items = await allRows('SELECT video_id FROM collection_items WHERE collection_id=? ORDER BY added_at DESC', c.id);
+    const videos = [];
+    for (const it of items) {
+      const v = await get1('SELECT * FROM videos WHERE id=? AND hidden=0', it.video_id);
+      if (v) { const j = await videoJSON(v, meId); if (j) videos.push(j); }
+    }
+    res.json({ ok: true, collection: { id: c.id, name: c.name }, owner_id: Number(sh.owner_id), videos });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 
@@ -5338,8 +5555,14 @@ app.get('/api/users/:username', async (req, res) => {
 // ---------- v13 : Q&A sur le profil ----------
 app.get('/api/users/:username/qa', async (req, res) => {
   try {
-    const u = await get1('SELECT id FROM users WHERE username=?', String(req.params.username).toLowerCase());
+    const u = await get1('SELECT id, is_private FROM users WHERE username=?', String(req.params.username).toLowerCase());
     if (!u) return res.status(404).json({ error: 'utilisateur introuvable' });
+    // FIX 2026-10-04 (bot chain-security-private) : compte privé → questions masquées aux non-abonnés
+    const meIdQ = await optUserId(req);
+    if (Number(u.is_private) && meIdQ && Number(meIdQ) !== Number(u.id)) {
+      const _qf = await get1('SELECT 1 FROM follows WHERE follower_id=? AND followed_id=?', meIdQ, u.id);
+      if (!_qf) return res.json({ questions: [] });
+    }
     const qs = await allRows(
       `SELECT q.*, u.username AS asker_name FROM qa_questions q
        LEFT JOIN users u ON u.id=q.asker_id
@@ -5366,6 +5589,25 @@ app.post('/api/qa/:id/answer', auth, async (req, res) => {
     if (Number(q.user_id) !== Number(req.userId)) return res.status(403).json({ error: 'non autorisé' });
     const a = String((req.body || {}).answer || '').trim().slice(0, 1000);
     await runSql('UPDATE qa_questions SET answer=?, answered_at=? WHERE id=?', a, now(), req.params.id);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// v2.37 : Q&R — liste perso + suppression (CRUD /api/me/qa)
+app.get('/api/me/qa', auth, async (req, res) => {
+  try {
+    const qs = await allRows(
+      `SELECT q.*, u.username AS asker_name FROM qa_questions q
+       LEFT JOIN users u ON u.id=q.asker_id
+       WHERE q.user_id=? ORDER BY q.created_at DESC`, req.userId);
+    res.json({ questions: qs });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.delete('/api/me/qa/:id', auth, async (req, res) => {
+  try {
+    const q = await get1('SELECT * FROM qa_questions WHERE id=?', req.params.id);
+    if (!q) return res.status(404).json({ error: 'question introuvable' });
+    if (Number(q.user_id) !== Number(req.userId)) return res.status(403).json({ error: 'non autorisé' });
+    await runSql('DELETE FROM qa_questions WHERE id=?', req.params.id);
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
@@ -5549,6 +5791,7 @@ app.get('/api/auth/google/callback', async (req, res) => {
     }
     const token = crypto.randomBytes(32).toString('hex');
     await runSql('INSERT INTO tokens(token,user_id,created_at) VALUES(?,?,?)', token, u.id, now());
+    await recordDevice(req, u.id); // v2.32 : 1 identité par installation (no-op ici : redirection navigateur sans en-tête)
     await runSql('INSERT INTO oauth_sessions(session,token,user_id,created_at) VALUES(?,?,?,?)',
       state, token, u.id, now());
     res.send(`<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head><body style="font-family:sans-serif;text-align:center;padding:60px 20px"><div style="font-size:64px">✅</div><h2>Connexion réussie !</h2><p>Retourne dans l'application VidiGagne.</p></body></html>`);
@@ -5615,6 +5858,7 @@ app.post('/api/auth/phone', async (req, res) => {
     }
     const token = crypto.randomBytes(32).toString('hex');
     await runSql('INSERT INTO tokens(token,user_id,created_at) VALUES(?,?,?)', token, u.id, now());
+    await recordDevice(req, u.id); // v2.32 : 1 identité par installation (détection, jamais bloquant)
     res.json({ token, user: privUser(u), coins: u.coins });
   } catch (e) { res.status(401).json({ error: 'vérification téléphone échouée' }); }
 });
@@ -5770,6 +6014,7 @@ app.get('/api/live/:id/summary', auth, async (req, res) => {
 app.post('/api/live/withdraw', auth, async (req, res) => {
   try {
     const { live_id, amount_usd, method_id } = req.body || {};
+    if (!live_id) return res.status(400).json({ error: 'live_id requis' });
     const amount = Math.round(Number(amount_usd) * 100) / 100;
     const p = await livePool(live_id, req.userId);
     if (p.err) return res.status(p.code).json({ error: p.err });
@@ -5816,6 +6061,7 @@ app.post('/api/live/withdraw', auth, async (req, res) => {
 app.post('/api/live/exchange-coins', auth, async (req, res) => {
   try {
     const { live_id, amount_usd } = req.body || {};
+    if (!live_id) return res.status(400).json({ error: 'live_id requis' });
     const amount = Math.round(Number(amount_usd) * 100) / 100;
     const p = await livePool(live_id, req.userId);
     if (p.err) return res.status(p.code).json({ error: p.err });
@@ -7735,6 +7981,11 @@ app.get('/api/users/:username/followers', async (req, res) => {
     const meId = await optUserId(req);
     if (meId && Number(meId) !== Number(u.id) && await isBlocked(meId, u.id))
       return res.status(403).json({ error: 'utilisateur bloqué' });
+    // FIX 2026-10-04 (bot chain-security-private) : compte privé → liste d'abonnés masquée aux non-abonnés
+    if (Number(u.is_private) && (!meId || Number(meId) !== Number(u.id))) {
+      const _pf = await get1('SELECT 1 FROM follows WHERE follower_id=? AND followed_id=?', meId || -1, u.id);
+      if (!_pf) return res.status(403).json({ error: 'compte privé' });
+    }
     const rows = await allRows(
       'SELECT u.id, u.username, u.avatar FROM follows f JOIN users u ON u.id=f.follower_id WHERE f.followed_id=? ORDER BY f.created_at DESC LIMIT 100',
       u.id
@@ -8016,6 +8267,16 @@ app.get('/api/videos/mine/private', auth, async (req, res) => {
     const rows = await allRows(`SELECT * FROM videos WHERE user_id=? AND (is_private=1 OR visibility='private') ORDER BY created_at DESC`, req.userId);
     res.json({ ok: true, videos: rows });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+
+// FIX 2026-10-04 (chantier edge) : les erreurs multer (mauvais type de fichier, fichier
+// trop gros) tombaient sur le gestionnaire d'erreurs Express par défaut → page HTML 500
+// avec stack trace. → erreur JSON propre (400/413) avec message clair.
+app.use((err, req, res, next) => {
+  if (res.headersSent) return next(err);
+  const msg = String((err && err.message) || 'erreur serveur').slice(0, 200);
+  const code = err && err.code === 'LIMIT_FILE_SIZE' ? 413 : 400;
+  res.status(code).json({ error: msg });
 });
 
 initDb().then(() => {
