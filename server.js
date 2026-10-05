@@ -7629,6 +7629,7 @@ app.get('/invite/:code', async (req, res) => {
 
 app.get('/api/users/:username', async (req, res) => {
   try {
+    const upage = Math.max(1, parseInt(req.query.page, 10) || 1); // FIX v2.42 : upage référencé mais jamais défini → 500
     const u = await get1('SELECT * FROM users WHERE username=?', String(req.params.username).toLowerCase());
     if (!u) return res.status(404).json({ error: 'utilisateur introuvable' });
     // profil inaccessible si blocage dans un sens ou l'autre (sauf soi-même)
