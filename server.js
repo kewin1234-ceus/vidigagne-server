@@ -11,6 +11,11 @@ const path = require('node:path');
 const fs = require('node:fs');
 const os = require('node:os');
 
+// v2.44-EQB-QR : QR codes côté serveur — lib Nayuki (MIT) vendored dans lib/, sans dépendance npm.
+// Chargement défensif : si le fichier manque, les endpoints /api/qr* répondent 503 proprement.
+let QRGEN = null;
+try { QRGEN = require('./lib/qrcodegen.js'); } catch (e) { QRGEN = null; }
+
 const PORT = process.env.PORT || 3000;
 const USE_PG = !!process.env.DATABASE_URL;
 const USE_CLOUDINARY = !!(process.env.CLOUDINARY_CLOUD_NAME && process.env.CLOUDINARY_API_KEY && process.env.CLOUDINARY_API_SECRET);
@@ -311,6 +316,12 @@ CREATE TABLE IF NOT EXISTS conversation_reads(
   conversation_id INTEGER NOT NULL,
   user_id INTEGER NOT NULL,
   last_read_at BIGINT NOT NULL DEFAULT 0,
+  PRIMARY KEY(conversation_id, user_id)
+);
+CREATE TABLE IF NOT EXISTS conversation_mutes(
+  conversation_id INTEGER NOT NULL,
+  user_id INTEGER NOT NULL,
+  created_at BIGINT NOT NULL,
   PRIMARY KEY(conversation_id, user_id)
 );
 CREATE TABLE IF NOT EXISTS polls(
@@ -892,7 +903,37 @@ CREATE TABLE IF NOT EXISTS abuse_flags(
   challenged_at BIGINT,
   created_at BIGINT NOT NULL,
   last_event_at BIGINT NOT NULL DEFAULT 0
-);`;
+);
+-- v2.44-EQC-WH : webhooks créateurs pro (abonnements aux événements)
+CREATE TABLE IF NOT EXISTS creator_webhooks(
+  id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+  user_id INTEGER NOT NULL,
+  url TEXT NOT NULL,
+  events TEXT NOT NULL DEFAULT '[]',
+  secret TEXT NOT NULL DEFAULT '',
+  active INTEGER NOT NULL DEFAULT 1,
+  created_at BIGINT NOT NULL
+);
+-- v2.44-EQC-WH : journal des envois de webhooks
+CREATE TABLE IF NOT EXISTS webhook_deliveries(
+  id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+  hook_id INTEGER NOT NULL,
+  event TEXT NOT NULL DEFAULT '',
+  payload TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'queued',
+  created_at BIGINT NOT NULL
+);
+-- v2.44-EQC-WH : clés API publiques développeurs tiers
+CREATE TABLE IF NOT EXISTS api_keys(
+  id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+  user_id INTEGER NOT NULL,
+  api_key TEXT NOT NULL UNIQUE,
+  name TEXT NOT NULL DEFAULT '',
+  scopes TEXT NOT NULL DEFAULT 'read',
+  created_at BIGINT NOT NULL,
+  last_used BIGINT
+);
+CREATE INDEX IF NOT EXISTS api_keys_key_idx ON api_keys(api_key);`;
   if (USE_PG) { await pool.query(schema);
     for (const col of ["ALTER TABLE withdrawals ADD COLUMN IF NOT EXISTS decided_at BIGINT",
       "ALTER TABLE lives ADD COLUMN IF NOT EXISTS live_type TEXT NOT NULL DEFAULT 'guests'",
@@ -1325,6 +1366,16 @@ app.post('/api/admin/videos/:id/demonetize', async (req, res) => {
     if (v) await notify(v.user_id, 'system', null, null, demonetized
       ? '⚠️ Ta vidéo a été démonétisée' + (reason ? ' : ' + reason : '') + ' — aucune pub ne sera diffusée dessus.'
       : '✅ Ta vidéo est de nouveau monétisée.');
+    // v2.44-EQD-MAIL : e-mail de démonétisation (uniquement quand la vidéo est démonétisée)
+    if (demonetized && v) {
+      const vu = await get1('SELECT email FROM users WHERE id=?', v.user_id);
+      if (vu && vu.email) sendVidiEmail(vu.email,
+        '⚠️ Vidéo démonétisée — VidiGagne',
+        '<p style="font-size:18px">⚠️ Vidéo démonétisée</p>'
+        + '<p style="color:#ccc;font-size:14px">L\'une de tes vidéos a été démonétisée' + (reason ? ' : ' + String(reason).replace(/</g, '&lt;') : '') + ' — aucune publicité ne sera diffusée dessus.</p>'
+        + '<p style="color:#999;font-size:12px">Merci de respecter les règles de la communauté. ✨</p>',
+        'L\'une de tes vidéos VidiGagne a été démonétisée' + (reason ? ' : ' + reason : '') + '.').catch(() => {});
+    }
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
@@ -1890,6 +1941,8 @@ app.get('/api/search/insights', async (req, res) => {
   // serveur v9 : modération MVP (vidéos masquées, comptes suspendus)
   await mig('videos', 'hidden', `INTEGER NOT NULL DEFAULT 0`);
   await mig('users', 'suspended', `INTEGER NOT NULL DEFAULT 0`);
+  // v2.47 : source d'acquisition des abonnés (profil, vidéo, recherche, suggestion, qr, live)
+  await mig('follows', 'source', `TEXT NOT NULL DEFAULT 'other'`);
   // serveur v13 : replay LIVE, TTS, commentaires audio, Q&A, collections partagées
   await mig('videos', 'is_replay', `INTEGER NOT NULL DEFAULT 0`);
   await mig('videos', 'live_id', `TEXT`);
@@ -2665,6 +2718,24 @@ const pushSockets = new Map();
 async function notify(userId, type, actorId, videoId, text, commentId) {
   try {
     if (!userId || Number(userId) === Number(actorId)) return;
+    // v2.47 : conversation en sourdine — le message est stocké mais aucun push
+    // (ni WebSocket in-app ni FCM) n'est envoyé au destinataire qui a muté
+    if (type === 'message' && actorId) {
+      try {
+        const cm = await get1(
+          'SELECT id FROM conversations WHERE (user1_id=? AND user2_id=?) OR (user1_id=? AND user2_id=?)',
+          userId, actorId, actorId, userId);
+        if (cm) {
+          const m = await get1('SELECT 1 FROM conversation_mutes WHERE conversation_id=? AND user_id=?', cm.id, userId);
+          if (m) {
+            // stocke la notif silencieusement (is_read=0) sans aucun push
+            await insertId('INSERT INTO notifications(user_id,type,actor_id,video_id,comment_id,text,is_read,created_at) VALUES(?,?,?,?,?,?,0,?)',
+              userId, type, actorId || null, videoId || null, commentId || null, String(text || '').slice(0, 200), now());
+            return;
+          }
+        }
+      } catch (_) {}
+    }
     // v1.84 : vérifie les préférences de notification du destinataire
     let prefs = null;
     try {
@@ -2985,7 +3056,7 @@ async function recordIpSignup(req, userId) {
 // date de moins d'1 heure ET que l'IP est identique (anti-spam).
 async function maybeLoginAlert(userId, ip) {
   try {
-    const u = await get1('SELECT last_login_ip FROM users WHERE id=?', userId);
+    const u = await get1('SELECT last_login_ip, email FROM users WHERE id=?', userId);
     const prevIp = (u && u.last_login_ip) || '';
     const last = await get1("SELECT created_at FROM notifications WHERE user_id=? AND type='login_alert' ORDER BY created_at DESC LIMIT 1", userId);
     const recent = last && (now() - Number(last.created_at) < 3600000);
@@ -2994,6 +3065,13 @@ async function maybeLoginAlert(userId, ip) {
     const dt = d.toLocaleDateString('fr-FR') + ' à ' + d.toLocaleTimeString('fr-FR');
     await notify(userId, 'login_alert', null, null,
       `Nouvelle connexion à ton compte le ${dt} (IP ${ip || 'inconnue'}). Si ce n'est pas toi, change ton mot de passe.`);
+    // v2.44-EQD-MAIL : e-mail d'alerte sécurité (envoyé seulement quand l'alerte se déclenche — anti-spam déjà géré ci-dessus)
+    if (u && u.email) sendVidiEmail(u.email,
+      '🔐 Nouvelle connexion à ton compte VidiGagne',
+      '<p style="font-size:18px">🔐 Nouvelle connexion détectée</p>'
+      + '<p style="color:#ccc;font-size:14px">Quelqu\'un s\'est connecté à ton compte le ' + dt + ' (IP ' + String(ip || 'inconnue').replace(/</g, '&lt;') + ').</p>'
+      + '<p style="color:#999;font-size:12px">Si ce n\'est pas toi, change ton mot de passe immédiatement.</p>',
+      'Nouvelle connexion à ton compte VidiGagne le ' + dt + ' (IP ' + (ip || 'inconnue') + '). Si ce n\'est pas toi, change ton mot de passe.').catch(() => {});
     await runSql('UPDATE users SET last_login_ip=? WHERE id=?', String(ip || ''), userId);
   } catch (e) { /* jamais bloquant : le login ne doit pas échouer à cause de l'alerte */ }
 }
@@ -3880,6 +3958,8 @@ app.post('/api/gifts', auth, async (req, res) => {
     await runSql('INSERT INTO gifts(from_id,to_id,video_id,gift,cost,created_at) VALUES(?,?,?,?,?,?)',
       req.userId, dest.id, video_id || null, g.id, g.cost, now());
     await notify(dest.id, 'gift', req.userId, video_id || null, g.emoji + ' ' + g.name + ' (+' + g.cost + ')'); // v2.31 : montant inclus
+    // v2.44-EQC-WH : cadeau → webhook gift.new (créateur pro)
+    fireWebhooks(dest.id, 'gift.new', { from: me.username, gift: g.id, coins: g.cost, video_id: video_id || null, at: Date.now() });
     await maybeGiftEmail(dest.id, me.username, g); // v2.33 : e-mail si gros cadeau (≥100 🪙)
     const balG = await get1('SELECT coins FROM users WHERE id=?', req.userId);
     res.json({ ok: true, coins: balG ? balG.coins : 0 });
@@ -4258,6 +4338,67 @@ app.get('/api/creator/stats', auth, async (req, res) => {
       .map(v => ({ id: v.id, desc: v.description, views: Number(v.views) })),
   });
 });
+// v2.47 : résoudre un payload de QR code (VIDIGAGNE:USER:pseudo) vers un utilisateur
+app.get('/api/qr/resolve', auth, async (req, res) => {
+  try {
+    const p = String(req.query.payload || '').trim();
+    const m = p.match(/^VIDIGAGNE:USER:([a-z0-9._]{1,30})$/i);
+    if (!m) return res.status(400).json({ error: 'QR invalide' });
+    const u = await get1('SELECT * FROM users WHERE username=?', m[1].toLowerCase());
+    if (!u) return res.status(404).json({ error: 'utilisateur introuvable' });
+    res.json({ ok: true, user: pubUser(u) });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// v2.44-EQB-QR : QR code SVG générique — GET /api/qr?text=...&size=256 (public, text ≤ 500 caractères)
+app.get('/api/qr', async (req, res) => {
+  try {
+    if (!QRGEN) return res.status(503).json({ error: 'génération QR indisponible' });
+    const text = String(req.query.text || '');
+    if (!text) return res.status(400).json({ error: 'paramètre text requis' });
+    if (text.length > 500) return res.status(400).json({ error: 'text limité à 500 caractères' });
+    let size = parseInt(req.query.size, 10);
+    if (!Number.isFinite(size) || size < 64) size = 256;
+    if (size > 1024) size = 1024;
+    const qr = QRGEN.QrCode.encodeText(text, QRGEN.QrCode.Ecc.MEDIUM);
+    const svg = qr.toSvgString(4).replace('<svg ', '<svg width="' + size + '" height="' + size + '" ');
+    res.set('Content-Type', 'image/svg+xml');
+    res.set('Cache-Control', 'public, max-age=86400');
+    res.send(svg);
+  } catch (e) { res.status(400).json({ error: 'QR impossible à générer' }); }
+});
+// v2.44-EQB-QR : QR code SVG du profil de l'utilisateur connecté (https://vidigagne.app/@pseudo)
+app.get('/api/me/qr', auth, async (req, res) => {
+  try {
+    if (!QRGEN) return res.status(503).json({ error: 'génération QR indisponible' });
+    const u = await get1('SELECT username FROM users WHERE id=?', req.userId);
+    if (!u) return res.status(404).json({ error: 'utilisateur introuvable' });
+    const qr = QRGEN.QrCode.encodeText('https://vidigagne.app/@' + u.username, QRGEN.QrCode.Ecc.MEDIUM);
+    const svg = qr.toSvgString(4).replace('<svg ', '<svg width="256" height="256" ');
+    res.set('Content-Type', 'image/svg+xml');
+    res.set('Cache-Control', 'private, max-age=3600');
+    res.send(svg);
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// v2.47 : d'où viennent mes abonnés — répartition par source d'acquisition
+app.get('/api/me/follower-sources', auth, async (req, res) => {
+  try {
+    const rows = await allRows(
+      `SELECT source, COUNT(*) AS c FROM follows WHERE followed_id=? GROUP BY source ORDER BY c DESC`,
+      req.userId);
+    const total = rows.reduce((a, r) => a + Number(r.c || 0), 0);
+    const labels = { profil: '👤 Profil', video: '🎬 Vidéo', search: '🔍 Recherche', suggestion: '💡 Suggestion', qr: '📱 QR code', live: '🔴 LIVE', other: '❓ Autre' };
+    res.json({
+      ok: true,
+      total,
+      sources: rows.map(r => ({
+        source: r.source || 'other',
+        label: labels[r.source] || labels.other,
+        count: Number(r.c),
+        pct: total ? Math.round(Number(r.c) / total * 100) : 0,
+      })),
+    });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
 // v2.34 : comparaison de périodes pour le dashboard créateur (7j vs 7 précédents par défaut)
 app.get('/api/creator/stats/compare', auth, async (req, res) => {
   try {
@@ -4327,8 +4468,65 @@ app.get('/api/account/export', auth, async (req, res) => {
     const liked_videos = await allRows('SELECT video_id, created_at FROM likes WHERE user_id=?', req.userId);
     const collections = await allRows('SELECT id,name,is_private,created_at FROM collections WHERE user_id=?', req.userId);
     const collection_items = await allRows('SELECT collection_id,video_id,added_at FROM collection_items WHERE collection_id IN (SELECT id FROM collections WHERE user_id=?)', req.userId);
+    // v2.44-EQB-RGPD : complétude — chaque table est lue sous try/catch pour ne jamais casser l'export si elle est absente
+    const safeRows = async (fn) => { try { return await fn(); } catch (e) { return []; } };
+    const safeRow = async (fn) => { try { return await fn() || {}; } catch (e) { return {}; } };
+    const conversations = await safeRows(() => allRows(
+      `SELECT c.id, c.created_at, c.updated_at,
+        CASE WHEN c.user1_id=? THEN c.user2_id ELSE c.user1_id END AS other_id,
+        u.username AS other_username
+       FROM conversations c LEFT JOIN users u ON u.id=CASE WHEN c.user1_id=? THEN c.user2_id ELSE c.user1_id END
+       WHERE c.user1_id=? OR c.user2_id=? ORDER BY c.updated_at DESC`, req.userId, req.userId, req.userId, req.userId));
+    const messages = await safeRows(() => allRows(
+      `SELECT m.id, m.conversation_id, m.sender_id, m.text, m.created_at FROM messages m
+       JOIN conversations c ON c.id=m.conversation_id
+       WHERE c.user1_id=? OR c.user2_id=? ORDER BY m.created_at DESC LIMIT 2000`, req.userId, req.userId));
+    const search_history = await safeRows(() => allRows(
+      'SELECT query, created_at FROM search_logs WHERE user_id=? ORDER BY created_at DESC LIMIT 1000', req.userId));
+    const watch_history = await safeRows(() => allRows(
+      'SELECT video_id, watched_at FROM watch_history WHERE user_id=? ORDER BY watched_at DESC LIMIT 2000', req.userId));
+    const video_views = await safeRows(() => allRows(
+      'SELECT video_id, created_at FROM video_views WHERE viewer_id=? ORDER BY created_at DESC LIMIT 2000', req.userId));
+    const notifications = await safeRows(() => allRows(
+      'SELECT id, type, actor_id, video_id, comment_id, text, title, is_read, created_at FROM notifications WHERE user_id=? ORDER BY created_at DESC LIMIT 500', req.userId));
+    // sessions = tokens actifs (token masqué — jamais exposé en clair dans un export)
+    const sessions = await safeRows(() => allRows(
+      "SELECT substr(token,1,8)||'...' AS token_masked, created_at FROM tokens WHERE user_id=? ORDER BY created_at DESC", req.userId));
+    // appareils : devices lie device_id ↔ user_ids (JSON) — on ne garde que ceux incluant cet utilisateur
+    let devices = [];
+    try {
+      const drows = await allRows('SELECT device_id, first_seen, last_seen, flagged, user_ids FROM devices');
+      devices = drows.filter(r => { try { return (JSON.parse(r.user_ids || '[]') || []).includes(req.userId); } catch (e) { return false; } })
+        .map(r => ({ device_id: r.device_id, first_seen: r.first_seen, last_seen: r.last_seen, flagged: !!r.flagged }));
+    } catch (e) {}
+    const privacy_settings = await safeRow(() => get1(
+      `SELECT is_private, activity_status, restricted_mode, dm_privacy, comment_privacy, mention_privacy,
+        download_privacy, liked_visibility, following_visibility, duet_policy, stitch_policy, discoverable,
+        notif_likes, notif_comments, notif_follows, notif_mentions, notif_lives, notif_loginalert,
+        notif_priority, notif_newvideos, campaign_notifs, quiet_start, quiet_end, comment_keywords
+       FROM users WHERE id=?`, req.userId));
+    const content_prefs = await safeRows(() => allRows(
+      'SELECT topic, pref, created_at FROM content_prefs WHERE user_id=?', req.userId));
+    const appeals = await safeRows(() => allRows(
+      'SELECT id, report_id, reason, status, created_at, decided_at FROM appeals WHERE user_id=? ORDER BY created_at DESC', req.userId));
+    const verification_requests = await safeRows(() => allRows(
+      `SELECT id, status, reason, created_at, reviewed_at, full_name, category, website, proof_links, activity,
+        reviewed_by, review_reason FROM verification_requests WHERE user_id=?`, req.userId));
+    const calls = await safeRows(() => allRows(
+      'SELECT id, caller_id, callee_id, ctype, status, created_at, ended_at FROM calls WHERE caller_id=? OR callee_id=? ORDER BY created_at DESC LIMIT 500', req.userId, req.userId));
+    // parrainage : mon parrain + mes filleuls + mon code
+    const referrals = await safeRow(async () => {
+      const me = await get1('SELECT ref_code, referred_by FROM users WHERE id=?', req.userId);
+      const parrain = me && me.referred_by
+        ? await get1('SELECT id, username FROM users WHERE id=?', me.referred_by) : null;
+      const filleuls = await allRows('SELECT id, username, created_at FROM users WHERE referred_by=?', req.userId);
+      return { ref_code: (me && me.ref_code) || null, parrain: parrain || null, filleuls };
+    });
     res.json({ user: u, videos, comments, stories, playlists, withdrawals, ledger,
-      following, followers, liked_videos, collections, collection_items, exported_at: now() });
+      following, followers, liked_videos, collections, collection_items,
+      conversations, messages, search_history, watch_history, video_views, notifications,
+      sessions, devices, privacy_settings, content_prefs, appeals, verification_requests, calls, referrals,
+      exported_at: now() });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 app.delete('/api/account', auth, async (req, res) => {
@@ -4388,6 +4586,7 @@ app.delete('/api/account', auth, async (req, res) => {
     await runSql('DELETE FROM like_rewards WHERE liker_id=?', uid);
     await runSql('DELETE FROM messages WHERE conversation_id IN (SELECT id FROM conversations WHERE user1_id=? OR user2_id=?)', uid, uid);
     await runSql('DELETE FROM conversation_reads WHERE user_id=? OR conversation_id IN (SELECT id FROM conversations WHERE user1_id=? OR user2_id=?)', uid, uid, uid);
+    await runSql('DELETE FROM conversation_mutes WHERE user_id=? OR conversation_id IN (SELECT id FROM conversations WHERE user1_id=? OR user2_id=?)', uid, uid, uid);
     await runSql('DELETE FROM conversations WHERE user1_id=? OR user2_id=?', uid, uid);
     await runSql('DELETE FROM message_requests WHERE from_user_id=? OR to_user_id=?', uid, uid);
     await runSql('DELETE FROM group_messages WHERE sender_id=?', uid);
@@ -5100,6 +5299,17 @@ app.post('/api/admin/fund/applications/:id', async (req, res) => {
       approve ? 'approved' : 'rejected', now(), a.id);
     await notify(a.user_id, 'system', null, null,
       approve ? '💰 Bienvenue dans le Fonds Créateurs !' : '💰 Ta candidature au Fonds Créateurs a été refusée.');
+    // v2.44-EQD-MAIL : e-mail de décision Fonds Créateurs (approuvée / refusée)
+    {
+      const fu = await get1('SELECT email, username FROM users WHERE id=?', a.user_id);
+      if (fu && fu.email) sendVidiEmail(fu.email,
+        approve ? '💰 Bienvenue dans le Fonds Créateurs — VidiGagne' : '💰 Fonds Créateurs — candidature refusée',
+        '<p style="font-size:18px">' + (approve ? '💰 Bienvenue dans le Fonds Créateurs !' : '💰 Candidature non retenue') + '</p>'
+        + '<p style="color:#ccc;font-size:14px">' + (approve
+          ? 'Félicitations @' + String(fu.username).replace(/</g, '&lt;') + ' ! Tu fais désormais partie du Fonds Créateurs VidiGagne : tu recevras ta part des revenus publicitaires.'
+          : 'Ta candidature au Fonds Créateurs n\'a pas été retenue pour le moment. Continue à publier et à faire grandir ta communauté, puis retente ta chance !') + '</p>',
+        approve ? 'Bienvenue dans le Fonds Créateurs VidiGagne !' : 'Ta candidature au Fonds Créateurs n\'a pas été retenue.').catch(() => {});
+    }
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
@@ -5760,7 +5970,9 @@ app.post('/api/videos/:id/watch-reward', auth, async (req, res) => {
           : 'INSERT OR IGNORE INTO watch_rewards(video_id,user_id,day,created_at) VALUES(?,?,?,?)',
         v.id, req.userId, day, now());
       if (!inserted) return { granted: 0, reason: 'already' };
-      const earned = Number((await get1(`SELECT COALESCE(SUM(amount),0) AS s FROM ledger WHERE user_id=? AND amount>0 AND created_at>=?`, req.userId, dayStart)).s);
+      // v2.45 : le plafond 100/jour ne compte QUE les récompenses de visionnage
+      // (comme les likes ne comptent que 'like reçu%') — pas les parrainages, défis, etc.
+      const earned = Number((await get1(`SELECT COALESCE(SUM(amount),0) AS s FROM ledger WHERE user_id=? AND reason LIKE 'vidéo regardée%' AND created_at>=?`, req.userId, dayStart)).s);
       if (earned >= 100) return { granted: 0, reason: 'daily-cap' };
       const grant = Math.min(10, 100 - earned);
       await runSql('UPDATE users SET coins=coins+? WHERE id=?', grant, req.userId);
@@ -6088,6 +6300,8 @@ app.get('/api/conversations', auth, async (req, res) => {
         last_text: last ? last.text : null,
         last_at: last ? Number(last.created_at) : Number(c.updated_at),
         unread: unread,
+        // v2.47 : conversation mise en sourdine par moi
+        muted: !!(await get1('SELECT 1 FROM conversation_mutes WHERE conversation_id=? AND user_id=?', c.id, req.userId)),
       });
     }
     res.json({ conversations: out, page, has_more: rows.length >= 20 });
@@ -6235,6 +6449,26 @@ app.post('/api/conversations/:id/read', auth, async (req, res) => {
     await runSql('UPDATE conversation_reads SET last_read_at=? WHERE conversation_id=? AND user_id=?',
       t, c.id, req.userId);
     res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// v2.47 : mettre une conversation en sourdine (ne pas déranger) — les messages arrivent
+// toujours mais sans notification push ni badge
+app.post('/api/conversations/:id/mute', auth, async (req, res) => {
+  try {
+    const c = await convOf(req.params.id, req.userId);
+    if (!c) return res.status(404).json({ error: 'conversation introuvable' });
+    await insertIgnore('INSERT OR IGNORE INTO conversation_mutes(conversation_id,user_id,created_at) VALUES(?,?,?)',
+      c.id, req.userId, now());
+    res.json({ ok: true, muted: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// v2.47 : réactiver les notifications d'une conversation
+app.delete('/api/conversations/:id/mute', auth, async (req, res) => {
+  try {
+    const c = await convOf(req.params.id, req.userId);
+    if (!c) return res.status(404).json({ error: 'conversation introuvable' });
+    await runSql('DELETE FROM conversation_mutes WHERE conversation_id=? AND user_id=?', c.id, req.userId);
+    res.json({ ok: true, muted: false });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 
@@ -7430,9 +7664,21 @@ app.post('/api/follow/:username', auth, async (req, res) => {
     await notify(u.id, 'follow_request', req.userId, null, '');
     return res.json({ following: false, requested: true });
   }
-  await insertIgnore('INSERT OR IGNORE INTO follows(follower_id,followed_id,created_at) VALUES(?,?,?)',
+  // v2.44-EQC-WH : nouveau follow → webhook follower.new (créateur pro)
+  const _fwNew = await insertIgnore('INSERT OR IGNORE INTO follows(follower_id,followed_id,created_at) VALUES(?,?,?)',
     req.userId, u.id, now());
+  // v2.47 : source d'acquisition (profil, video, search, suggestion, qr, live) pour les stats créateur
+  try {
+    const src = String((req.body || {}).source || '').slice(0, 20);
+    if (src && ['profil', 'video', 'search', 'suggestion', 'qr', 'live', 'other'].includes(src)) {
+      await runSql('UPDATE follows SET source=? WHERE follower_id=? AND followed_id=?', src, req.userId, u.id);
+    }
+  } catch (_) {}
   await notify(u.id, 'follow', req.userId, null, '');
+  if (_fwNew) {
+    const _fwMe = await get1('SELECT username FROM users WHERE id=?', req.userId);
+    fireWebhooks(u.id, 'follower.new', { follower_username: _fwMe ? _fwMe.username : '', followed_username: u.username, at: Date.now() });
+  }
   syncRisingStar(u.id).catch(() => {});
   res.json({ following: true });
 });
@@ -9081,6 +9327,20 @@ app.post('/api/videos/:id/tip', auth, async (req, res) => {
     await runSql('INSERT INTO tips(video_id,from_user_id,to_user_id,coins,created_at) VALUES(?,?,?,?,?)',
       v.id, req.userId, v.user_id, n, now());
     await notify(v.user_id, 'tip', req.userId, v.id, String(n));
+    // v2.44-EQC-WH : pourboire → webhook tip.new (créateur pro)
+    fireWebhooks(v.user_id, 'tip.new', { from: me.username, coins: n, video_id: v.id, at: Date.now() });
+    // v2.44-EQD-MAIL : e-mail de pourboire reçu (seuil anti-spam = même seuil que les cadeaux)
+    if (n >= GIFT_EMAIL_MIN_COINS) {
+      try {
+        const tu = await get1('SELECT email, username FROM users WHERE id=?', v.user_id);
+        if (tu && tu.email) sendVidiEmail(tu.email,
+          '🪙 Pourboire reçu sur VidiGagne !',
+          '<p style="font-size:18px">🪙 @' + String(me.username || 'un fan').replace(/</g, '&lt;') + ' t\'a envoyé un pourboire !</p>'
+          + '<p style="color:#ffd700;font-size:22px;font-weight:800">+' + n + ' 🪙</p>'
+          + '<p style="color:#ccc;font-size:14px">Merci pour ta vidéo — tes fans te soutiennent ! ✨</p>',
+          '@' + (me.username || 'un fan') + ' t\'a envoyé un pourboire de ' + n + ' pièces sur VidiGagne !').catch(() => {});
+      } catch (_) {}
+    }
     const balT = await get1('SELECT coins FROM users WHERE id=?', req.userId);
     res.json({ ok: true, coins: balT ? balT.coins : 0 });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
@@ -9636,11 +9896,12 @@ app.post('/api/shop/payout', auth, async (req, res) => {
   let amount = (req.body && req.body.coins != null) ? Math.floor(Number(req.body.coins)) : pending;
   if (!amount || amount < 1) return res.status(400).json({ error: 'montant invalide' });
   if (amount > pending) return res.status(400).json({ error: 'montant supérieur aux gains en attente' });
+  // FIX 2026-10-05 (audit économique) : les gains vendeur sont DÉJÀ crédités sur le
+  // solde à la commande ('vente boutique #'). Re-créditer ici DOUBLAIT les gains
+  // (création monétaire à partir de rien — prouvé : +270 pièces fantômes).
+  // Le versement n'est donc qu'un enregistrement de suivi, sans mouvement de pièces.
   await insertId('INSERT INTO seller_payouts(seller_id,coins,status,created_at) VALUES(?,?,?,?)',
     req.userId, amount, 'done', now());
-  await runSql('UPDATE users SET coins=coins+? WHERE id=?', amount, req.userId);
-  await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
-    req.userId, amount, 'versement vendeur', now());
   res.json({ ok: true, coins: amount });
 });
 
@@ -10397,6 +10658,107 @@ const _legal = (f) => (req, res) => {
 };
 app.get('/privacy', _legal('privacy.html'));
 app.get('/terms', _legal('terms.html'));
+
+// ==================== v2.44-EQA-OG : pages publiques de partage (OG tags) — Équipe A ====================
+// GET /v/:id, /u/:username, /@/:username, /live/:id → HTML avec Open Graph / Twitter Card
+// pour les aperçus WhatsApp / Facebook / X. Bouton "Ouvrir dans l'app" (deep link vidigagne://).
+// NOTE — PLACEHOLDERS À REMPLACER AVANT PUBLICATION (Kewin) :
+//   - sha256_cert_fingerprints : empreinte SHA-256 du keystore officiel de l'APK
+//   - TEAMID : identifiant d'équipe Apple Developer
+const escOg = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const ogBaseOf = req => (req.protocol + '://' + req.get('host')).replace(/\/$/, '');
+function ogHtml(req, o) {
+  // o = { title, desc, image?, video?, deep?, path?, notfound? }
+  const base = ogBaseOf(req);
+  const T = escOg(o.title), D = escOg(o.desc || "VidiGagne — Regarde des vidéos. Gagne de l'argent.");
+  const tags = ['<meta charset="utf-8">',
+    '<meta name="viewport" content="width=device-width,initial-scale=1">',
+    '<title>' + T + ' — VidiGagne</title>',
+    '<meta property="og:site_name" content="VidiGagne">',
+    '<meta property="og:type" content="' + (o.video ? 'video.other' : 'profile') + '">',
+    '<meta property="og:title" content="' + T + '">',
+    '<meta property="og:description" content="' + D + '">',
+    '<meta property="og:url" content="' + escOg(base + (o.path || req.path)) + '">',
+    '<meta name="twitter:card" content="' + (o.video ? 'player' : 'summary_large_image') + '">',
+    '<meta name="twitter:title" content="' + T + '">',
+    '<meta name="twitter:description" content="' + D + '">'];
+  if (o.image) tags.push('<meta property="og:image" content="' + escOg(o.image) + '">',
+    '<meta name="twitter:image" content="' + escOg(o.image) + '">');
+  if (o.video) tags.push('<meta property="og:video" content="' + escOg(o.video) + '">',
+    '<meta property="og:video:secure_url" content="' + escOg(o.video) + '">',
+    '<meta property="og:video:type" content="video/mp4">');
+  return '<!DOCTYPE html><html lang="fr"><head>' + tags.join('') + '</head>'
+    + '<body style="margin:0;background:#0b0b0f;color:#fff;font-family:system-ui,sans-serif;display:flex;min-height:100vh;align-items:center;justify-content:center;text-align:center">'
+    + '<div style="max-width:420px;padding:28px">'
+    + '<div style="font-size:40px;margin-bottom:10px">🎵</div>'
+    + '<div style="font-size:22px;font-weight:800;margin-bottom:6px">VidiGagne</div>'
+    + '<div style="font-size:16px;font-weight:700;margin-bottom:6px">' + T + '</div>'
+    + '<div style="color:#bbb;font-size:14px;margin-bottom:22px">' + D + '</div>'
+    + (o.notfound
+      ? "<p style=\"color:#888\">Ce contenu n'existe pas ou a été supprimé.</p>"
+      : '<a href="' + escOg(o.deep || '') + '" style="display:inline-block;background:#d4af37;color:#111;font-weight:800;font-size:17px;padding:14px 34px;border-radius:30px;text-decoration:none">📲 Ouvrir dans l\'app</a>'
+        + '<p style="color:#777;font-size:12px;margin-top:16px">Pas encore l\'app ? <a href="https://vidigagne.app" style="color:#d4af37">Découvrir VidiGagne</a></p>')
+    + '</div></body></html>';
+}
+function og404(req, res, title) {
+  res.status(404).type('html').send(ogHtml(req, { title: title || 'Contenu introuvable', notfound: true }));
+}
+app.get('/v/:id', async (req, res) => {
+  try {
+    if (!/^\d+$/.test(req.params.id)) return og404(req, res, 'Vidéo introuvable');
+    const v = await get1('SELECT v.id, v.description, v.file, u.username, u.avatar FROM videos v JOIN users u ON u.id=v.user_id WHERE v.id=?', Number(req.params.id));
+    if (!v) return og404(req, res, 'Vidéo introuvable');
+    const base = ogBaseOf(req);
+    const fu = fileUrl(v.file || '');
+    const absFu = /^https?:\/\//.test(fu) ? fu : base + fu;
+    const isVid = /\.(mp4|webm|mov)(\?|$)/i.test(absFu);
+    // NOTE : pas de miniature en base (colonne thumbnail absente) — og:image = avatar si c'est une URL,
+    // sinon seul og:video est fourni (lecteur intégré FB/X).
+    const av = /^https?:\/\//.test(v.avatar || '') ? v.avatar : null;
+    const desc = String(v.description || '').slice(0, 200) || 'Vidéo VidiGagne';
+    res.type('html').send(ogHtml(req, {
+      title: desc, desc: '@' + v.username + ' sur VidiGagne',
+      image: av, video: isVid ? absFu : null,
+      deep: 'vidigagne://video/' + v.id, path: '/v/' + v.id,
+    }));
+  } catch (e) { res.status(500).send('erreur serveur'); }
+});
+async function ogUserPage(req, res) {
+  try {
+    const un = String(req.params.username || '').toLowerCase();
+    if (!validUsername(un)) return og404(req, res, 'Profil introuvable');
+    const u = await get1('SELECT username, bio, avatar FROM users WHERE username=?', un);
+    if (!u) return og404(req, res, 'Profil introuvable');
+    const av = /^https?:\/\//.test(u.avatar || '') ? u.avatar : null;
+    res.type('html').send(ogHtml(req, {
+      title: '@' + u.username, desc: u.bio || 'Profil VidiGagne',
+      image: av, deep: 'vidigagne://user/' + encodeURIComponent(u.username), path: req.path,
+    }));
+  } catch (e) { res.status(500).send('erreur serveur'); }
+}
+app.get('/u/:username', ogUserPage);
+app.get('/@/:username', ogUserPage);
+app.get('/live/:id', async (req, res) => {
+  try {
+    if (!/^\d+$/.test(req.params.id)) return og404(req, res, 'Live introuvable');
+    const l = await get1('SELECT l.id, l.title, l.ended_at, u.username FROM lives l JOIN users u ON u.id=l.user_id WHERE l.id=?', Number(req.params.id));
+    if (!l) return og404(req, res, 'Live introuvable');
+    const live = !l.ended_at;
+    res.type('html').send(ogHtml(req, {
+      title: (live ? '🔴 LIVE en cours' : 'Live terminé') + ' — @' + l.username,
+      desc: l.title || 'Live VidiGagne',
+      deep: 'vidigagne://live/' + l.id, path: '/live/' + l.id,
+    }));
+  } catch (e) { res.status(500).send('erreur serveur'); }
+});
+const ASSETLINKS_EQA = [{ relation: ['delegate_permission/common.handle_all_urls'],
+  target: { namespace: 'android_app', package_name: 'com.vidigagne.app',
+    sha256_cert_fingerprints: ['AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11'] } }];
+const AAS_EQA = { applinks: { details: [{ appID: 'TEAMID.com.vidigagne.app',
+  paths: ['/v/*', '/@/*', '/u/*', '/live/*'] }] } };
+app.get('/.well-known/assetlinks.json', (req, res) => { res.type('application/json').send(JSON.stringify(ASSETLINKS_EQA)); });
+app.get('/.well-known/apple-app-site-association', (req, res) => { res.type('application/json').send(JSON.stringify(AAS_EQA)); });
+// ==================== fin v2.44-EQA-OG ====================
 function clientIp(req){
   // m10 : req.ip avec trust proxy (le premier segment de x-forwarded-for est falsifiable par le client)
   return (req.ip || req.socket.remoteAddress || '').trim().slice(0, 45);
@@ -11236,6 +11598,250 @@ async function notifyMentions(text, actorId, videoId, commentId) {
     }
   } catch (_) {}
 }
+
+// ---------- v2.44-EQC-WH : webhooks créateurs pro + API publique développeurs + badges/embeds ----------
+const WH_EVENTS = ['follower.new', 'tip.new', 'gift.new'];
+// URL webhook : https obligatoire ; exception dev : http://localhost et http://127.0.0.1 (tests)
+function whUrlOk(url) {
+  try {
+    const u = new URL(String(url));
+    if (u.protocol === 'https:') return true;
+    if (u.protocol === 'http:' && (u.hostname === 'localhost' || u.hostname === '127.0.0.1')) return true;
+    return false;
+  } catch (_) { return false; }
+}
+// Envoi fire-and-forget : ne fait JAMAIS échouer la requête principale.
+// Signature : HMAC-SHA256(secret, corps JSON brut) dans X-VG-Signature.
+async function fireWebhooks(userId, event, payload) {
+  try {
+    const hooks = await allRows('SELECT id, url, events, secret FROM creator_webhooks WHERE user_id=? AND active=1', userId);
+    for (const h of hooks) {
+      let evs = []; try { evs = JSON.parse(h.events || '[]'); } catch (_) {}
+      if (!Array.isArray(evs) || !evs.includes(event)) continue;
+      const body = JSON.stringify({ event, payload, at: Date.now() });
+      const sig = crypto.createHmac('sha256', h.secret || '').update(body).digest('hex');
+      const did = crypto.randomUUID();
+      const t = now();
+      try {
+        const ctl = new AbortController();
+        const to = setTimeout(() => ctl.abort(), 5000); // timeout 5 s
+        const r = await fetch(h.url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-VG-Event': event, 'X-VG-Signature': sig, 'X-VG-Delivery': did },
+          body, signal: ctl.signal
+        });
+        clearTimeout(to);
+        await runSql('INSERT INTO webhook_deliveries(hook_id,event,payload,status,created_at) VALUES(?,?,?,?,?)',
+          h.id, event, body.slice(0, 4000), r.ok ? 'sent' : 'failed:' + r.status, t);
+      } catch (e2) {
+        try { await runSql('INSERT INTO webhook_deliveries(hook_id,event,payload,status,created_at) VALUES(?,?,?,?,?)',
+          h.id, event, body.slice(0, 4000), 'failed', t); } catch (_) {}
+      }
+    }
+  } catch (_) {}
+}
+// --- webhooks : CRUD ---
+app.post('/api/webhooks', auth, async (req, res) => {
+  try {
+    const { url, events } = req.body || {};
+    if (!url || !whUrlOk(String(url))) return res.status(400).json({ error: 'url invalide (https requis)' });
+    const evs = Array.isArray(events) ? events.filter(e => WH_EVENTS.includes(e)) : [];
+    if (!evs.length) return res.status(400).json({ error: 'events invalide (' + WH_EVENTS.join(', ') + ')' });
+    const secret = crypto.randomBytes(32).toString('hex');
+    const id = await insertId('INSERT INTO creator_webhooks(user_id,url,events,secret,active,created_at) VALUES(?,?,?,?,1,?)',
+      req.userId, String(url).slice(0, 500), JSON.stringify(evs), secret, now());
+    res.json({ id, secret }); // secret montré une seule fois
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.get('/api/webhooks', auth, async (req, res) => {
+  try {
+    const rows = await allRows('SELECT id, url, events, active, created_at FROM creator_webhooks WHERE user_id=? ORDER BY created_at DESC', req.userId);
+    res.json({ webhooks: rows }); // secrets jamais renvoyés
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.delete('/api/webhooks/:id', auth, async (req, res) => {
+  try {
+    const h = await get1('SELECT id, user_id FROM creator_webhooks WHERE id=?', req.params.id);
+    if (!h) return res.status(404).json({ error: 'webhook introuvable' });
+    if (Number(h.user_id) !== Number(req.userId)) return res.status(403).json({ error: 'non autorisé' });
+    await runSql('DELETE FROM creator_webhooks WHERE id=?', h.id);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// --- clés API développeurs ---
+const _pubRate = new Map(); // rate-limit simple : 100 requêtes / 15 min par clé
+function pubRateLimited(k) {
+  const t = Date.now(); let a = _pubRate.get(k) || [];
+  a = a.filter(x => t - x < 15 * 60 * 1000);
+  if (a.length >= 100) return true;
+  a.push(t); _pubRate.set(k, a);
+  if (_pubRate.size > 5000) _pubRate.clear();
+  return false;
+}
+async function apiKeyAuth(req, res, next) {
+  try {
+    const k = String(req.headers['x-api-key'] || '');
+    if (!k) return res.status(401).json({ error: 'clé API requise (header X-API-Key)' });
+    const row = await get1('SELECT id, user_id FROM api_keys WHERE api_key=?', k);
+    if (!row) return res.status(401).json({ error: 'clé API invalide' });
+    if (pubRateLimited(k)) return res.status(429).json({ error: 'limite dépassée (100 requêtes / 15 min)' });
+    req.apiKeyId = row.id; req.apiUserId = row.user_id;
+    runSql('UPDATE api_keys SET last_used=? WHERE id=?', now(), row.id).catch(() => {});
+    next();
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+}
+app.post('/api/developer/keys', auth, async (req, res) => {
+  try {
+    const name = String((req.body || {}).name || '').slice(0, 60);
+    const key = 'vg_live_' + crypto.randomBytes(16).toString('hex');
+    const id = await insertId('INSERT INTO api_keys(user_id,api_key,name,scopes,created_at) VALUES(?,?,?,?,?)',
+      req.userId, key, name, 'read', now());
+    res.json({ id, key });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.get('/api/developer/keys', auth, async (req, res) => {
+  try {
+    const rows = await allRows('SELECT id, name, scopes, created_at, last_used, api_key FROM api_keys WHERE user_id=? ORDER BY created_at DESC', req.userId);
+    res.json({ keys: rows.map(r => ({ id: r.id, name: r.name, scopes: r.scopes, created_at: r.created_at,
+      last_used: r.last_used, key_preview: '••••' + String(r.api_key).slice(-4) })) });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.delete('/api/developer/keys/:id', auth, async (req, res) => {
+  try {
+    const k = await get1('SELECT id, user_id FROM api_keys WHERE id=?', req.params.id);
+    if (!k) return res.status(404).json({ error: 'clé introuvable' });
+    if (Number(k.user_id) !== Number(req.userId)) return res.status(403).json({ error: 'non autorisé' });
+    await runSql('DELETE FROM api_keys WHERE id=?', k.id);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// --- namespace public v1 (auth par X-API-Key) ---
+app.get('/api/public/v1/users/:username', apiKeyAuth, async (req, res) => {
+  try {
+    const u = await get1('SELECT id, username, bio, avatar, verified FROM users WHERE username=?', String(req.params.username).toLowerCase());
+    if (!u) return res.status(404).json({ error: 'utilisateur introuvable' });
+    const f = await get1('SELECT COUNT(*) AS c FROM follows WHERE followed_id=?', u.id);
+    res.json({ username: u.username, bio: u.bio, avatar: u.avatar, verified: Number(u.verified) === 1,
+      followers_count: Number(f.c) || 0 });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.get('/api/public/v1/videos/:id', apiKeyAuth, async (req, res) => {
+  try {
+    const v = await get1(`SELECT v.id, v.description, v.views, v.created_at, v.duration, u.username FROM videos v
+      JOIN users u ON u.id=v.user_id WHERE v.id=? AND v.hidden=0 AND v.is_private=0`, req.params.id);
+    if (!v) return res.status(404).json({ error: 'vidéo introuvable' });
+    const lk = await get1('SELECT COUNT(*) AS c FROM likes WHERE video_id=?', v.id);
+    res.json({ id: v.id, username: v.username, description: v.description, views: Number(v.views) || 0,
+      likes: Number(lk.c) || 0, duration: Number(v.duration) || 0, created_at: Number(v.created_at) });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.get('/api/public/v1/trending', apiKeyAuth, async (req, res) => {
+  try {
+    const rows = await allRows(`SELECT v.id, v.description, v.views, v.created_at, u.username FROM videos v
+      JOIN users u ON u.id=v.user_id WHERE v.hidden=0 AND v.is_private=0
+      AND (v.visibility='public' OR v.visibility='' OR v.visibility IS NULL)
+      ORDER BY v.views DESC LIMIT 20`, []);
+    res.json({ videos: rows.map(v => ({ id: v.id, username: v.username, description: v.description,
+      views: Number(v.views) || 0, created_at: Number(v.created_at) })) });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// --- page développeurs ---
+app.get('/developers', (req, res) => {
+  res.type('html').send(`<!DOCTYPE html>
+<html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>VidiGagne — API Développeurs</title>
+<style>body{font-family:system-ui,sans-serif;background:#0d0d0f;color:#eee;margin:0;padding:24px;max-width:860px}
+h1{color:#f5c542}h2{color:#f5c542;margin-top:32px}code{background:#1c1c20;padding:2px 6px;border-radius:4px;color:#ffd75e}
+pre{background:#1c1c20;padding:14px;border-radius:8px;overflow-x:auto;color:#cfe3ff}a{color:#f5c542}
+table{border-collapse:collapse;width:100%}td,th{border:1px solid #333;padding:8px;text-align:left}th{background:#1c1c20}
+.note{background:#1a1405;border:1px solid #f5c542;border-radius:8px;padding:12px;margin:16px 0}</style>
+</head><body>
+<h1>🎬 VidiGagne — API Développeurs</h1>
+<p>API publique en lecture seule pour intégrer les profils, vidéos et tendances VidiGagne dans vos applications.</p>
+<h2>1. Créer une clé API</h2>
+<p>Connectez-vous à VidiGagne, puis :</p>
+<pre>curl -X POST https://vidigagne-server-production.up.railway.app/api/developer/keys \\
+  -H "Authorization: Bearer VOTRE_JETON" \\
+  -H "Content-Type: application/json" \\
+  -d '{"name":"mon-app"}'
+# → {"id":1,"key":"vg_live_..."} — copiez la clé, elle n'est montrée qu'une fois.</pre>
+<h2>2. Endpoints</h2>
+<table><tr><th>Méthode</th><th>Endpoint</th><th>Description</th></tr>
+<tr><td>GET</td><td><code>/api/public/v1/users/:username</code></td><td>Profil public : username, bio, avatar, verified, followers_count</td></tr>
+<tr><td>GET</td><td><code>/api/public/v1/videos/:id</code></td><td>Métadonnées publiques d'une vidéo : description, views, likes, duration</td></tr>
+<tr><td>GET</td><td><code>/api/public/v1/trending</code></td><td>Top 20 des vidéos publiques par vues</td></tr></table>
+<h2>3. Exemple</h2>
+<pre>curl https://vidigagne-server-production.up.railway.app/api/public/v1/users/kewin \\
+  -H "X-API-Key: vg_live_VOTRE_CLE"</pre>
+<h2>4. Authentification &amp; limites</h2>
+<ul><li>Header <code>X-API-Key</code> requis sur chaque appel ; 401 si absent ou invalide.</li>
+<li>Rate-limit : <b>100 requêtes / 15 minutes par clé</b> (429 au-delà).</li>
+<li>Scope actuel : <code>read</code> (lecture seule).</li></ul>
+<h2>5. Webhooks créateurs pro</h2>
+<p>Recevez les événements en temps réel sur votre serveur :</p>
+<pre>curl -X POST https://vidigagne-server-production.up.railway.app/api/webhooks \\
+  -H "Authorization: Bearer VOTRE_JETON" \\
+  -H "Content-Type: application/json" \\
+  -d '{"url":"https://mon-site.com/vg-hook","events":["follower.new","tip.new","gift.new"]}'
+# → {"id":1,"secret":"..."} — le secret n'est montré qu'une fois.</pre>
+<table><tr><th>Événement</th><th>Déclenché quand</th><th>Payload</th></tr>
+<tr><td><code>follower.new</code></td><td>un nouvel abonné</td><td>follower_username, followed_username, at</td></tr>
+<tr><td><code>tip.new</code></td><td>un pourboire reçu</td><td>from, coins, video_id, at</td></tr>
+<tr><td><code>gift.new</code></td><td>un cadeau reçu</td><td>from, gift, coins, video_id, at</td></tr></table>
+<div class="note"><b>Signature :</b> chaque appel porte <code>X-VG-Event</code>, <code>X-VG-Delivery</code> (uuid)
+et <code>X-VG-Signature = HMAC-SHA256(secret, corps JSON brut)</code>. Vérifiez-la avant de traiter l'événement.
+Envois en fire-and-forget (timeout 5 s) : un échec de votre serveur ne bloque jamais VidiGagne.</div>
+<h2>6. Badges &amp; embeds</h2>
+<ul><li><code>/badge/:username.svg</code> — badge SVG 200×48 à intégrer sur votre site.</li>
+<li><code>/embed/:username</code> — carte profil HTML ; <code>/api/embed/:username</code> renvoie le code iframe.</li></ul>
+</body></html>`);
+});
+// --- badges & embeds ---
+function vgXmlEsc(s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
+app.get('/badge/:username.svg', async (req, res) => {
+  try {
+    const u = await get1('SELECT id, username FROM users WHERE username=?', String(req.params.username).toLowerCase());
+    if (!u) return res.status(404).type('image/svg+xml').send(
+      '<svg xmlns="http://www.w3.org/2000/svg" width="200" height="48"><rect width="200" height="48" rx="8" fill="#1a1a1a"/>' +
+      '<text x="100" y="28" text-anchor="middle" fill="#888" font-family="sans-serif" font-size="12">utilisateur introuvable</text></svg>');
+    const f = await get1('SELECT COUNT(*) AS c FROM follows WHERE followed_id=?', u.id);
+    const n = Number(f.c) || 0;
+    const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="200" height="48">' +
+      '<rect width="200" height="48" rx="8" fill="#0d0d0f"/>' +
+      '<rect x="0.5" y="0.5" width="199" height="47" rx="8" fill="none" stroke="#f5c542" stroke-width="1"/>' +
+      '<polygon points="14,14 14,34 30,24" fill="#f5c542"/>' +
+      '<text x="38" y="20" fill="#f5c542" font-family="sans-serif" font-size="11" font-weight="bold">Suivez-moi sur VidiGagne</text>' +
+      '<text x="38" y="36" fill="#ccc" font-family="sans-serif" font-size="11">@' + vgXmlEsc(u.username) + ' · ' + n + ' abonnés</text></svg>';
+    res.type('image/svg+xml').send(svg);
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.get('/api/embed/:username', async (req, res) => {
+  try {
+    const u = await get1('SELECT username FROM users WHERE username=?', String(req.params.username).toLowerCase());
+    if (!u) return res.status(404).json({ error: 'utilisateur introuvable' });
+    const proto = (req.headers['x-forwarded-proto'] || req.protocol || 'https').split(',')[0];
+    const host = req.get('host') || 'vidigagne-server-production.up.railway.app';
+    res.json({ html: '<iframe src="' + proto + '://' + host + '/embed/' + vgXmlEsc(u.username) +
+      '" width="300" height="120" frameborder="0" style="border-radius:12px" title="VidiGagne @' + vgXmlEsc(u.username) + '"></iframe>' });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.get('/embed/:username', async (req, res) => {
+  try {
+    const u = await get1('SELECT id, username, avatar, bio FROM users WHERE username=?', String(req.params.username).toLowerCase());
+    if (!u) return res.status(404).type('html').send('<!DOCTYPE html><html><body style="font-family:sans-serif">utilisateur introuvable</body></html>');
+    const f = await get1('SELECT COUNT(*) AS c FROM follows WHERE followed_id=?', u.id);
+    const n = Number(f.c) || 0;
+    res.type('html').send('<!DOCTYPE html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">' +
+      '<title>@' + vgXmlEsc(u.username) + ' sur VidiGagne</title></head>' +
+      '<body style="margin:0;font-family:system-ui,sans-serif;background:#0d0d0f;color:#eee;display:flex;align-items:center;justify-content:center;height:100vh">' +
+      '<div style="text-align:center;background:#16161a;border:1px solid #f5c542;border-radius:14px;padding:16px 24px">' +
+      '<div style="font-size:36px">' + vgXmlEsc(u.avatar || '🙂') + '</div>' +
+      '<div style="font-weight:bold;font-size:16px">@' + vgXmlEsc(u.username) + '</div>' +
+      '<div style="color:#aaa;font-size:12px;margin:4px 0 10px">' + n + ' abonnés · sur VidiGagne 🎬</div>' +
+      '<a href="https://vidigagne.app/@' + vgXmlEsc(u.username) + '" style="display:inline-block;background:#f5c542;color:#111;font-weight:bold;' +
+      'text-decoration:none;padding:8px 18px;border-radius:20px;font-size:14px">Suivre sur VidiGagne</a></div></body></html>');
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
 
 // ---------- téléchargement vidéo (si autorisé) ----------
 app.get('/api/videos/:id/download-url', auth, async (req, res) => {
