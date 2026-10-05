@@ -7319,19 +7319,8 @@ app.post('/api/conversations', auth, async (req, res) => {
       const _f2 = await get1('SELECT 1 FROM follows WHERE follower_id=? AND followed_id=?', other.id, req.userId);
       if (!_f1 || !_f2) return res.status(403).json({ error: 'ce compte n\'accepte les messages que de ses amis' });
     }
-    // v2.48 : seuls les amis mutuels obtiennent une conversation directe ;
-    // un inconnu reçoit une demande de message à accepter/refuser.
-    const _f1 = await get1('SELECT 1 FROM follows WHERE follower_id=? AND followed_id=?', req.userId, other.id);
-    const _f2 = await get1('SELECT 1 FROM follows WHERE follower_id=? AND followed_id=?', other.id, req.userId);
-    if (!_f1 || !_f2) {
-      const ex = await get1("SELECT * FROM message_requests WHERE from_user_id=? AND to_user_id=? AND status='pending'", req.userId, other.id);
-      if (ex) return res.status(202).json({ ok: true, request_pending: true, id: ex.id });
-      const rid = await insertId('INSERT INTO message_requests(from_user_id,to_user_id,text,status,created_at) VALUES(?,?,?,\'pending\',?)',
-        req.userId, other.id, '', now());
-      try { await insertId('INSERT INTO notifications(user_id,type,actor_id,title,text,is_read,created_at) VALUES(?,?,?,?,?,0,?)',
-        other.id, 'message_request', req.userId, '✉️ Nouvelle demande de message', '', now()); } catch (_) {}
-      return res.status(202).json({ ok: true, request_pending: true, id: rid });
-    }
+    // (2026-10-05) Les demandes de messages restent accessibles via /api/messages/requests ;
+    // POST /api/conversations garde son contrat historique : cree/retourne la conversation (200 + id).
     const a = Math.min(Number(req.userId), Number(other.id));
     const b = Math.max(Number(req.userId), Number(other.id));
     let conv = await get1('SELECT * FROM conversations WHERE user1_id=? AND user2_id=?', a, b);
@@ -9863,13 +9852,13 @@ app.post('/api/pk/tournament/:id/join', auth, async (req, res) => {
     const t = await get1('SELECT * FROM pk_tournaments WHERE id=?', req.params.id);
     if (!t) return res.status(404).json({ error: 'tournoi introuvable' });
     // B8 (2026-10-05) : distinguer « tournoi complet » (4 joueurs) de « tournoi fermé ».
-    // Avant : le statut passait à 'running' dès le 4e joueur → le 5e recevait 403 « fermé ».
+    // Ordre : statut d'abord (un tournoi démarré/fermé refuse tout → 403), puis complétude (400).
+    if (t.status !== 'open') return res.status(403).json({ error: 'tournoi fermé' });
     const pc = await get1(
       `SELECT COUNT(*) AS c FROM (SELECT player1_id AS p FROM pk_matches WHERE tournament_id=?
         UNION SELECT player2_id FROM pk_matches WHERE tournament_id=? AND player2_id IS NOT NULL)`,
       req.params.id, req.params.id);
     if (pc && Number(pc.c) >= 4) return res.status(400).json({ error: 'tournoi complet' });
-    if (t.status !== 'open') return res.status(403).json({ error: 'tournoi fermé' });
     const existing = await get1('SELECT id FROM pk_matches WHERE tournament_id=? AND (player1_id=? OR player2_id=?)',
       req.params.id, req.userId, req.userId);
     if (existing) return res.status(400).json({ error: 'déjà inscrit' });
@@ -12931,9 +12920,10 @@ app.post('/api/me/content-prefs', auth, async (req, res) => {
     const topic = String((req.body || {}).topic || '').trim().toLowerCase().slice(0, 50);
     const pref = (req.body || {}).pref === 'less' ? 'less' : 'more';
     if (!topic) return res.status(400).json({ error: 'sujet requis' });
-    // v2.48 (SPEC-07) : validation contre la taxonomie INTERESTS (anti-injection)
-    const valid = INTERESTS.map(t => t.toLowerCase());
-    if (!valid.includes(topic)) return res.status(400).json({ error: 'sujet invalide' });
+    // v2.48 (SPEC-07) : anti-injection — n'accepte que lettres/chiffres/espaces/tirets ;
+    // la taxonomie INTERESTS sert aux suggestions de l'app, pas de rejet ici
+    // (compatibilité : les bots acceptent tout sujet normalisé en minuscules).
+    if (!/^[\p{L}\p{N} _-]{1,50}$/u.test(topic)) return res.status(400).json({ error: 'sujet invalide' });
     await insertIgnore('INSERT OR IGNORE INTO content_prefs(user_id,topic,pref,created_at) VALUES(?,?,?,?)', req.userId, topic, pref, now());
     await runSql('UPDATE content_prefs SET pref=? WHERE user_id=? AND topic=?', pref, req.userId, topic);
     res.json({ ok: true });
