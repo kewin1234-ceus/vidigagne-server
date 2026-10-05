@@ -209,6 +209,26 @@ CREATE TABLE IF NOT EXISTS like_rewards(
   created_at BIGINT NOT NULL,
   PRIMARY KEY(liker_id, video_id)
 );
+CREATE TABLE IF NOT EXISTS login_streaks(
+  user_id INTEGER PRIMARY KEY,
+  streak INTEGER NOT NULL DEFAULT 0,
+  last_day TEXT NOT NULL DEFAULT '',
+  updated_at BIGINT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS quest_claims(
+  user_id INTEGER NOT NULL,
+  quest_key TEXT NOT NULL,
+  day TEXT NOT NULL,
+  created_at BIGINT NOT NULL,
+  PRIMARY KEY(user_id, quest_key, day)
+);
+CREATE TABLE IF NOT EXISTS coin_transfers(
+  id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+  from_id INTEGER NOT NULL,
+  to_id INTEGER NOT NULL,
+  coins INTEGER NOT NULL,
+  created_at BIGINT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS ad_daily(
   day TEXT PRIMARY KEY,
   points_distributed INTEGER NOT NULL DEFAULT 0,
@@ -301,6 +321,24 @@ CREATE INDEX IF NOT EXISTS notif_user_idx ON notifications(user_id, created_at);
 CREATE TABLE IF NOT EXISTS reports(
   id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
   reporter_id INTEGER NOT NULL,
+  target_type TEXT NOT NULL,
+  target_id INTEGER NOT NULL,
+  reason TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'pending',
+  created_at BIGINT NOT NULL
+);
+-- modération v2.39 : appels contre une sanction + file de modération auto
+CREATE TABLE IF NOT EXISTS appeals(
+  id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+  user_id INTEGER NOT NULL,
+  report_id INTEGER NOT NULL,
+  reason TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'pending',
+  created_at BIGINT NOT NULL,
+  decided_at BIGINT
+);
+CREATE TABLE IF NOT EXISTS mod_queue(
+  id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
   target_type TEXT NOT NULL,
   target_id INTEGER NOT NULL,
   reason TEXT NOT NULL DEFAULT '',
@@ -440,6 +478,56 @@ CREATE TABLE IF NOT EXISTS live_guests(
   UNIQUE(live_id, user_id)
 );
 CREATE INDEX IF NOT EXISTS live_guests_idx ON live_guests(live_id, status);
+-- ==================== v2.38 : lives programmés ====================
+CREATE TABLE IF NOT EXISTS live_scheduled(
+  id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+  user_id INTEGER NOT NULL,
+  title TEXT NOT NULL DEFAULT '',
+  scheduled_at BIGINT NOT NULL,
+  notified INTEGER NOT NULL DEFAULT 0,
+  started_live_id INTEGER,
+  cancelled INTEGER NOT NULL DEFAULT 0,
+  created_at BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS live_sched_idx ON live_scheduled(user_id, scheduled_at);
+-- ==================== v2.38 : tournois PK ====================
+CREATE TABLE IF NOT EXISTS pk_tournaments(
+  id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+  creator_id INTEGER NOT NULL,
+  title TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'open',
+  winner_id INTEGER,
+  reward_coins INTEGER NOT NULL DEFAULT 0,
+  created_at BIGINT NOT NULL,
+  finished_at BIGINT
+);
+CREATE TABLE IF NOT EXISTS pk_matches(
+  id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+  tournament_id INTEGER NOT NULL,
+  round TEXT NOT NULL DEFAULT 'semi1',
+  player1_id INTEGER,
+  player2_id INTEGER,
+  winner_id INTEGER,
+  player1_score INTEGER NOT NULL DEFAULT 0,
+  player2_score INTEGER NOT NULL DEFAULT 0,
+  live_id INTEGER,
+  status TEXT NOT NULL DEFAULT 'pending',
+  created_at BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS pk_match_idx ON pk_matches(tournament_id, round);
+-- ==================== v2.38 : Q&R live ====================
+CREATE TABLE IF NOT EXISTS live_questions(
+  id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+  live_id INTEGER NOT NULL,
+  user_id INTEGER NOT NULL,
+  username TEXT NOT NULL DEFAULT '',
+  question TEXT NOT NULL DEFAULT '',
+  answer TEXT NOT NULL DEFAULT '',
+  answered_at BIGINT,
+  likes INTEGER NOT NULL DEFAULT 0,
+  created_at BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS live_q_idx ON live_questions(live_id, created_at);
 CREATE TABLE IF NOT EXISTS live_gifts(
   id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
   live_id INTEGER NOT NULL,
@@ -563,6 +651,25 @@ CREATE TABLE IF NOT EXISTS video_products(
   product_id INTEGER NOT NULL,
   PRIMARY KEY(video_id, product_id)
 );
+CREATE TABLE IF NOT EXISTS shop_reviews(
+  id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+  product_id INTEGER NOT NULL,
+  user_id INTEGER NOT NULL,
+  rating INTEGER NOT NULL,
+  comment TEXT NOT NULL DEFAULT '',
+  created_at BIGINT NOT NULL,
+  UNIQUE(product_id, user_id)
+);
+CREATE TABLE IF NOT EXISTS shop_refunds(
+  id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+  order_id INTEGER NOT NULL,
+  buyer_id INTEGER NOT NULL,
+  seller_id INTEGER,
+  reason TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'pending',
+  created_at BIGINT NOT NULL,
+  decided_at BIGINT
+);
 CREATE TABLE IF NOT EXISTS coupons(
   id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
   code TEXT UNIQUE NOT NULL,
@@ -680,6 +787,31 @@ CREATE TABLE IF NOT EXISTS series_purchases(
   created_at BIGINT NOT NULL,
   UNIQUE(series_id, user_id)
 );
+-- ==================== V13 : PROMOTION VIDÉO (TikTok Studio : promouvoir) ====================
+CREATE TABLE IF NOT EXISTS video_promos(
+  id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+  video_id INTEGER NOT NULL,
+  user_id INTEGER NOT NULL,
+  budget_coins INTEGER NOT NULL DEFAULT 0,
+  spent_coins INTEGER NOT NULL DEFAULT 0,
+  impressions INTEGER NOT NULL DEFAULT 0,
+  clicks INTEGER NOT NULL DEFAULT 0,
+  target TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'active',
+  created_at BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS video_promos_video_idx ON video_promos(video_id);
+-- ==================== V13 : COLLABORATIONS (TikTok Studio : vidéo co-signée) ====================
+CREATE TABLE IF NOT EXISTS collab_invites(
+  id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+  video_id INTEGER NOT NULL,
+  inviter_id INTEGER NOT NULL,
+  invitee_id INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  revenue_share_pct INTEGER NOT NULL DEFAULT 50,
+  created_at BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS collab_invites_video_idx ON collab_invites(video_id);
 -- ==================== V12 : ALGO POUR TOI ====================
 CREATE TABLE IF NOT EXISTS watch_events(
   id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
@@ -770,6 +902,18 @@ CREATE TABLE IF NOT EXISTS family_settings(
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS storage_bytes BIGINT DEFAULT 0`); // v1.54 : quota stockage
     await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS audio_url TEXT DEFAULT ''`); // v1.57 : messages vocaux
     await pool.query(`ALTER TABLE group_messages ADD COLUMN IF NOT EXISTS audio_url TEXT DEFAULT ''`);
+    // v2.38 : messages image/vidéo + suppression pour tous
+    for (const t of ['messages', 'group_messages']) {
+      await pool.query(`ALTER TABLE ${t} ADD COLUMN IF NOT EXISTS image_url TEXT DEFAULT ''`);
+      await pool.query(`ALTER TABLE ${t} ADD COLUMN IF NOT EXISTS video_url TEXT DEFAULT ''`);
+      await pool.query(`ALTER TABLE ${t} ADD COLUMN IF NOT EXISTS deleted_for_all INTEGER DEFAULT 0`);
+    }
+    await pool.query(`CREATE TABLE IF NOT EXISTS message_reactions(
+      id SERIAL PRIMARY KEY, message_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+      emoji TEXT NOT NULL, created_at BIGINT NOT NULL, UNIQUE(message_id, user_id))`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS call_participants(
+      id SERIAL PRIMARY KEY, call_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+      status TEXT NOT NULL DEFAULT 'invited', joined_at BIGINT, UNIQUE(call_id, user_id))`);
     await pool.query(`ALTER TABLE videos ADD COLUMN IF NOT EXISTS phash TEXT DEFAULT ''`);
     await pool.query(`ALTER TABLE videos ADD COLUMN IF NOT EXISTS target_countries TEXT DEFAULT ''`);
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS country TEXT DEFAULT ''`);
@@ -887,6 +1031,7 @@ app.post('/api/admin/verification/:id', async (req, res) => {
       approve ? 'approved' : 'rejected', now(), r.id);
     if (approve) {
       await runSql('UPDATE users SET verified=1 WHERE id=?', r.user_id);
+      await insertIgnore('INSERT OR IGNORE INTO user_badges(user_id,badge,awarded_at) VALUES(?,?,?)', r.user_id, 'verified', now());
       await notify(r.user_id, 'system', null, null, '✔️ Ton compte est maintenant vérifié !');
     } else {
       await notify(r.user_id, 'system', null, null, 'Ta demande de badge vérifié a été refusée.');
@@ -990,6 +1135,44 @@ app.post('/api/challenges/:id/claim', auth, async (req, res) => {
     await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
       req.userId, Number(c.bonus_coins), 'défi créateur : ' + c.title, t);
     res.json({ ok: true, bonus: Number(c.bonus_coins) });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// v2.38 : page défi — vidéos participantes (hashtag) + classement par vues
+app.get('/api/challenges/:id', async (req, res) => {
+  try {
+    const c = await get1('SELECT * FROM challenges WHERE id=?', req.params.id);
+    if (!c) return res.status(404).json({ error: 'défi introuvable' });
+    const meId = await optUserId(req);
+    const tag = String(c.hashtag || '').toLowerCase().replace(/^#/, '').trim();
+    let videos = [];
+    if (tag) {
+      const rows = await allRows(
+        `SELECT * FROM videos WHERE hidden=0 AND created_at>=? AND created_at<=?
+         AND (LOWER(description) LIKE ? OR LOWER(tags) LIKE ?)
+         ORDER BY views DESC, created_at DESC LIMIT 50`,
+        Number(c.start_at), Number(c.end_at), '%#' + tag + '%', '%' + tag + '%');
+      for (const v of rows) {
+        if (await canSeeVideo(v, meId)) { const j = await videoJSON(v, meId); if (j) videos.push(j); }
+      }
+    }
+    const pset = new Set();
+    for (const j of videos) { const un = j.user && (j.user.username || j.user.name); if (un) pset.add(String(un)); }
+    let progress = 0, claimed = false;
+    if (meId) {
+      if (c.goal_type === 'videos') {
+        const r = await get1('SELECT COUNT(*) AS n FROM videos WHERE user_id=? AND created_at>=? AND hidden=0', meId, c.start_at);
+        progress = Number(r.n) || 0;
+      } else if (c.goal_type === 'views') {
+        const r = await get1('SELECT COALESCE(SUM(views),0) AS s FROM videos WHERE user_id=? AND hidden=0', meId);
+        progress = Number(r.s) || 0;
+      } else if (c.goal_type === 'followers') {
+        const r = await get1('SELECT COUNT(*) AS n FROM follows WHERE followed_id=?', meId);
+        progress = Number(r.n) || 0;
+      }
+      claimed = !!(await get1('SELECT 1 FROM challenge_claims WHERE challenge_id=? AND user_id=?', c.id, meId));
+    }
+    res.json({ ok: true, challenge: { ...c, progress, done: progress >= Number(c.goal_value), claimed },
+      participants: pset.size, videos });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 // v1.67 : historique des gains + export
@@ -1179,6 +1362,9 @@ app.post('/api/calls/start', auth, async (req, res) => {
     const tu = await get1('SELECT id,username FROM users WHERE LOWER(username)=LOWER(?)', targetName);
     if (!tu) return res.status(404).json({ error: 'utilisateur introuvable' });
     if (Number(tu.id) === Number(req.userId)) return res.status(400).json({ error: 'impossible de s’appeler soi-même' });
+    // v2.38 : appel bloqué si l'un a bloqué l'autre
+    if (await isBlocked(req.userId, tu.id) || await isBlocked(tu.id, req.userId))
+      return res.status(403).json({ error: 'appel impossible' });
     const busy = await get1(`SELECT id FROM calls WHERE status IN ('ringing','active')
       AND (caller_id=? OR callee_id=? OR caller_id=? OR callee_id=?) LIMIT 1`,
       req.userId, req.userId, tu.id, tu.id);
@@ -1224,6 +1410,13 @@ app.post('/api/calls/:id/end', auth, async (req, res) => {
     if (Number(c.caller_id) !== Number(req.userId) && Number(c.callee_id) !== Number(req.userId))
       return res.status(403).json({ error: 'non autorisé' });
     await runSql(`UPDATE calls SET status='ended', ended_at=? WHERE id=? AND status IN ('ringing','active')`, now(), c.id);
+    // v2.38 : appel manqué → notif pour le destinataire si l'appel n'a jamais été décroché
+    if (c.status === 'ringing' && Number(c.callee_id) === Number(req.userId)) {
+      try { await notify(c.caller_id, 'call_missed', req.userId, null, '📞 Appel manqué'); } catch (_) {}
+    }
+    if (c.status === 'ringing' && Number(c.caller_id) === Number(req.userId)) {
+      try { await notify(c.callee_id, 'call_missed', req.userId, null, '📞 Appel manqué'); } catch (_) {}
+    }
     try {
       const other = Number(c.caller_id) === Number(req.userId) ? c.callee_id : c.caller_id;
       const ws = pushSockets.get(Number(other));
@@ -1248,7 +1441,7 @@ app.post('/api/calls/:id/signal', auth, async (req, res) => {
     if (!c || c.status === 'ended') return res.status(404).json({ error: 'appel introuvable' });
     const b = req.body || {};
     const kind = String(b.kind || '');
-    if (!['offer', 'answer', 'candidate'].includes(kind)) return res.status(400).json({ error: 'kind invalide' });
+    if (!['offer', 'answer', 'candidate', 'screen'].includes(kind)) return res.status(400).json({ error: 'kind invalide' });
     const to = Number(c.caller_id) === Number(req.userId) ? c.callee_id : c.caller_id;
     await runSql(`INSERT INTO call_signals(call_id,to_user_id,from_user_id,kind,payload,created_at)
       VALUES(?,?,?,?,?,?)`, c.id, to, req.userId, kind, String(b.payload || '').slice(0, 20000), now());
@@ -1264,6 +1457,67 @@ app.get('/api/calls/:id/signal', auth, async (req, res) => {
     const rows = await allRows(`SELECT * FROM call_signals WHERE call_id=? AND id>? AND to_user_id=?
       ORDER BY id ASC LIMIT 50`, c.id, since, req.userId);
     res.json({ signals: rows.map(s => ({ id: s.id, kind: s.kind, from: s.from_user_id, payload: s.payload })) });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// v2.38 : appel de groupe — création (créateur + liste de pseudos invités)
+app.post('/api/calls/group/start', auth, async (req, res) => {
+  try {
+    const ctype = String((req.body || {}).ctype || 'video') === 'audio' ? 'audio' : 'video';
+    const names = Array.isArray((req.body || {}).usernames) ? (req.body || {}).usernames : [];
+    if (names.length < 1 || names.length > 6) return res.status(400).json({ error: '1 à 6 invités requis' });
+    const busy = await get1(`SELECT id FROM calls WHERE status IN ('ringing','active') AND (caller_id=? OR callee_id=?) LIMIT 1`,
+      req.userId, req.userId);
+    if (busy) return res.status(400).json({ error: 'ligne occupée' });
+    const invited = [];
+    for (const n of names) {
+      const u = await get1('SELECT id,username FROM users WHERE LOWER(username)=LOWER(?)', String(n).trim().replace(/^@/, ''));
+      if (!u || Number(u.id) === Number(req.userId)) continue;
+      if (await isBlocked(req.userId, u.id) || await isBlocked(u.id, req.userId)) continue;
+      if (!invited.find(x => Number(x.id) === Number(u.id))) invited.push(u);
+    }
+    if (!invited.length) return res.status(400).json({ error: 'aucun invité valide' });
+    const me = await get1('SELECT username FROM users WHERE id=?', req.userId);
+    const id = await insertId(`INSERT INTO calls(caller_id,callee_id,ctype,status,created_at)
+      VALUES(?,?,?,?,?)`, req.userId, invited[0].id, ctype, 'ringing', now());
+    await runSql('INSERT INTO call_participants(call_id,user_id,status,joined_at) VALUES(?,?,?,?)',
+      id, req.userId, 'active', now());
+    for (const u of invited) {
+      await runSql('INSERT INTO call_participants(call_id,user_id,status) VALUES(?,?,?)', id, u.id, 'invited');
+      try {
+        const ws = pushSockets.get(Number(u.id));
+        if (ws && ws.readyState === 1)
+          ws.send(JSON.stringify({ t: 'push', type: 'call', call_id: id, ctype, group: true,
+            actor: me ? me.username : '', text: 'Appel de groupe entrant' }));
+      } catch (_) {}
+      await notify(u.id, 'call', req.userId, null, '📞 Appel de groupe entrant');
+    }
+    res.json({ ok: true, call_id: id, invited: invited.map(u => u.username) });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// v2.38 : rejoindre un appel de groupe
+app.post('/api/calls/:id/join', auth, async (req, res) => {
+  try {
+    const c = await get1('SELECT * FROM calls WHERE id=?', req.params.id);
+    if (!c || !['ringing', 'active'].includes(c.status)) return res.status(404).json({ error: 'appel introuvable' });
+    const p = await get1('SELECT * FROM call_participants WHERE call_id=? AND user_id=?', c.id, req.userId);
+    if (!p) return res.status(403).json({ error: 'non invité' });
+    await runSql(`UPDATE call_participants SET status='active', joined_at=? WHERE call_id=? AND user_id=?`,
+      now(), c.id, req.userId);
+    await runSql(`UPDATE calls SET status='active' WHERE id=? AND status='ringing'`, c.id);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// v2.38 : participants d'un appel
+app.get('/api/calls/:id/participants', auth, async (req, res) => {
+  try {
+    const c = await get1('SELECT * FROM calls WHERE id=?', req.params.id);
+    if (!c) return res.status(404).json({ error: 'appel introuvable' });
+    const mine = await get1('SELECT 1 FROM call_participants WHERE call_id=? AND user_id=?', c.id, req.userId)
+      || (Number(c.caller_id) === Number(req.userId) || Number(c.callee_id) === Number(req.userId));
+    if (!mine) return res.status(403).json({ error: 'non autorisé' });
+    const rows = await allRows(`SELECT cp.user_id, cp.status, u.username FROM call_participants cp
+      JOIN users u ON u.id=cp.user_id WHERE cp.call_id=?`, c.id);
+    res.json({ participants: rows.map(r => ({ user_id: r.user_id, username: r.username, status: r.status })) });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 // v1.62 : import en masse de musiques libres de droits (admin)
@@ -1427,6 +1681,21 @@ app.get('/api/search/insights', async (req, res) => {
       const mc = lite.prepare(`PRAGMA table_info(${t})`).all().map(c => c.name);
       if (!mc.includes('audio_url')) lite.exec(`ALTER TABLE ${t} ADD COLUMN audio_url TEXT DEFAULT ''`);
     }
+    // v2.38 : messages image/vidéo + suppression pour tous
+    for (const t of ['messages', 'group_messages']) {
+      const mc2 = lite.prepare(`PRAGMA table_info(${t})`).all().map(c => c.name);
+      if (!mc2.includes('image_url')) lite.exec(`ALTER TABLE ${t} ADD COLUMN image_url TEXT DEFAULT ''`);
+      if (!mc2.includes('video_url')) lite.exec(`ALTER TABLE ${t} ADD COLUMN video_url TEXT DEFAULT ''`);
+      if (!mc2.includes('deleted_for_all')) lite.exec(`ALTER TABLE ${t} ADD COLUMN deleted_for_all INTEGER DEFAULT 0`);
+    }
+    lite.exec(`CREATE TABLE IF NOT EXISTS message_reactions(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, message_id INTEGER NOT NULL,
+      user_id INTEGER NOT NULL, emoji TEXT NOT NULL, created_at BIGINT NOT NULL,
+      UNIQUE(message_id, user_id))`);
+    lite.exec(`CREATE TABLE IF NOT EXISTS call_participants(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, call_id INTEGER NOT NULL,
+      user_id INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'invited',
+      joined_at BIGINT, UNIQUE(call_id, user_id))`);
     // v1.58 : recherche par image (hash perceptuel)
     lite.exec(`CREATE TABLE IF NOT EXISTS verification_requests(
       id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL UNIQUE, status TEXT NOT NULL DEFAULT 'pending',
@@ -1517,6 +1786,8 @@ app.get('/api/search/insights', async (req, res) => {
   await mig('videos', 'tts_text', `TEXT`);
   await mig('videos', 'tts_voice', `TEXT`);
   await mig('videos', 'tts_rate', `REAL NOT NULL DEFAULT 1`);
+  // v2.39 : la sanction appliquée lors du traitement d'un signalement (pour les appels)
+  await mig('reports', 'action', `TEXT NOT NULL DEFAULT ''`);
   await mig('comments', 'audio_url', `TEXT`);
   await mig('qa_questions', 'asker_id', `INTEGER`);
   // v1.84 : fonctionnalités TikTok — historique recherche, épingles, duos/collages,
@@ -1549,6 +1820,9 @@ app.get('/api/search/insights', async (req, res) => {
   await mig('users', 'notif_follows', `INTEGER NOT NULL DEFAULT 1`);
   await mig('users', 'notif_mentions', `INTEGER NOT NULL DEFAULT 1`);
   await mig('users', 'notif_lives', `INTEGER NOT NULL DEFAULT 1`);
+  // v2.34 : alertes de connexion (login_alert) + mémoire de la dernière IP de connexion
+  await mig('users', 'notif_loginalert', `INTEGER NOT NULL DEFAULT 1`);
+  await mig('users', 'last_login_ip', `TEXT NOT NULL DEFAULT ''`);
   await mig('users', 'dm_privacy', `TEXT NOT NULL DEFAULT 'everyone'`);
   // PARITÉ TIKTOK 2026-10-04 : politiques duo/collage par compte + PIN mode restreint + flag sensible
   await mig('users', 'duet_policy', `TEXT NOT NULL DEFAULT 'everyone'`);
@@ -1559,6 +1833,30 @@ app.get('/api/search/insights', async (req, res) => {
   await mig('users', 'download_privacy', `TEXT NOT NULL DEFAULT 'everyone'`);
   await mig('users', 'liked_visibility', `TEXT NOT NULL DEFAULT 'me'`);
   await mig('users', 'following_visibility', `TEXT NOT NULL DEFAULT 'me'`);
+  // v2.32 : graphe social — synchronisation des contacts (hash de téléphone)
+  await mig('users', 'phone_hash', `TEXT NOT NULL DEFAULT ''`);
+  // v2.38 (bots découverte) : hashtag sur les défis créateurs + scores de tags « Pour toi » (signal likes)
+  await mig('challenges', 'hashtag', `TEXT NOT NULL DEFAULT ''`);
+  // v2.40 (bots profil/social avancés) : bannière profil, pronoms, liens
+  await mig('users', 'cover', `TEXT NOT NULL DEFAULT ''`);
+  await mig('users', 'pronouns', `TEXT NOT NULL DEFAULT ''`);
+  await mig('users', 'links', `TEXT NOT NULL DEFAULT '[]'`);
+  try {
+    const _frt = `CREATE TABLE IF NOT EXISTS follow_requests(id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'}, requester_id INTEGER NOT NULL, target_id INTEGER NOT NULL, created_at BIGINT NOT NULL, UNIQUE(requester_id, target_id))`;
+    if (USE_PG) await pool.query(_frt); else lite.exec(_frt);
+  } catch (e) {}
+  try {
+    const _ubt = `CREATE TABLE IF NOT EXISTS user_badges(id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'}, user_id INTEGER NOT NULL, badge TEXT NOT NULL, awarded_at BIGINT NOT NULL, UNIQUE(user_id, badge))`;
+    if (USE_PG) await pool.query(_ubt); else lite.exec(_ubt);
+  } catch (e) {}
+  try {
+    const _sht = `CREATE TABLE IF NOT EXISTS suggestion_hidden(user_id INTEGER NOT NULL, hidden_id INTEGER NOT NULL, created_at BIGINT NOT NULL, PRIMARY KEY(user_id, hidden_id))`;
+    if (USE_PG) await pool.query(_sht); else lite.exec(_sht);
+  } catch (e) {}
+  try {
+    const _uts = `CREATE TABLE IF NOT EXISTS user_tag_scores(user_id INTEGER NOT NULL, tag TEXT NOT NULL, score INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(user_id, tag))`;
+    if (USE_PG) await pool.query(_uts); else lite.exec(_uts);
+  } catch (e) {}
   // Tables TikTok
   if (USE_PG) {
     await pool.query(`CREATE TABLE IF NOT EXISTS video_pins(
@@ -1575,6 +1873,11 @@ app.get('/api/search/insights', async (req, res) => {
     await pool.query(`CREATE TABLE IF NOT EXISTS live_moderators(
       id SERIAL PRIMARY KEY, live_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
       added_at BIGINT NOT NULL, UNIQUE(live_id, user_id))`);
+    // v2.33 : bannissements / sourdines d'un live (kind='ban'|'mute') — imposés par l'hôte ou un modérateur
+    await pool.query(`CREATE TABLE IF NOT EXISTS live_bans(
+      id SERIAL PRIMARY KEY, live_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+      kind TEXT NOT NULL DEFAULT 'ban', created_at BIGINT NOT NULL,
+      UNIQUE(live_id, user_id, kind))`);
     await pool.query(`CREATE TABLE IF NOT EXISTS content_prefs(
       id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL, topic TEXT NOT NULL,
       pref TEXT NOT NULL DEFAULT 'more', created_at BIGINT NOT NULL,
@@ -1604,6 +1907,11 @@ app.get('/api/search/insights', async (req, res) => {
     lite.exec(`CREATE TABLE IF NOT EXISTS live_moderators(
       id INTEGER PRIMARY KEY AUTOINCREMENT, live_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
       added_at BIGINT NOT NULL, UNIQUE(live_id, user_id))`);
+    // v2.33 : bannissements / sourdines d'un live (kind='ban'|'mute') — imposés par l'hôte ou un modérateur
+    lite.exec(`CREATE TABLE IF NOT EXISTS live_bans(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, live_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+      kind TEXT NOT NULL DEFAULT 'ban', created_at BIGINT NOT NULL,
+      UNIQUE(live_id, user_id, kind))`);
     lite.exec(`CREATE TABLE IF NOT EXISTS content_prefs(
       id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, topic TEXT NOT NULL,
       pref TEXT NOT NULL DEFAULT 'more', created_at BIGINT NOT NULL,
@@ -1614,6 +1922,28 @@ app.get('/api/search/insights', async (req, res) => {
     lite.exec(`CREATE TABLE IF NOT EXISTS effect_favs(
       id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, effect_id INTEGER NOT NULL,
       created_at BIGINT NOT NULL, UNIQUE(user_id, effect_id))`);
+  }
+  // v2.32 : graphe social — invitations personnalisées + traces d'invitations par contacts
+  if (USE_PG) {
+    await pool.query(`CREATE TABLE IF NOT EXISTS invites(
+      id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL, code TEXT UNIQUE NOT NULL,
+      label TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'pending',
+      invited_user_id INTEGER, created_at BIGINT NOT NULL)`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS contact_invites(
+      id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL, phone_hash TEXT NOT NULL,
+      name TEXT NOT NULL DEFAULT '', created_at BIGINT NOT NULL,
+      UNIQUE(user_id, phone_hash))`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_invites_user ON invites(user_id)`);
+  } else {
+    lite.exec(`CREATE TABLE IF NOT EXISTS invites(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, code TEXT UNIQUE NOT NULL,
+      label TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'pending',
+      invited_user_id INTEGER, created_at BIGINT NOT NULL)`);
+    lite.exec(`CREATE TABLE IF NOT EXISTS contact_invites(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, phone_hash TEXT NOT NULL,
+      name TEXT NOT NULL DEFAULT '', created_at BIGINT NOT NULL,
+      UNIQUE(user_id, phone_hash))`);
+    lite.exec(`CREATE INDEX IF NOT EXISTS idx_invites_user ON invites(user_id)`);
   }
   // Tables Q&A
   if (USE_PG) {
@@ -1657,6 +1987,22 @@ app.get('/api/search/insights', async (req, res) => {
       PRIMARY KEY(collection_id, video_id)
     )`);
   }
+  // v2.37 : historique des vues de profil (une ligne par couple viewer/viewed)
+  if (USE_PG) {
+    await pool.query(`CREATE TABLE IF NOT EXISTS profile_views(
+      viewer_id INTEGER NOT NULL, viewed_id INTEGER NOT NULL,
+      viewed_at BIGINT NOT NULL,
+      PRIMARY KEY(viewer_id, viewed_id)
+    )`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_pv_viewed ON profile_views(viewed_id)`);
+  } else {
+    lite.exec(`CREATE TABLE IF NOT EXISTS profile_views(
+      viewer_id INTEGER NOT NULL, viewed_id INTEGER NOT NULL,
+      viewed_at BIGINT NOT NULL,
+      PRIMARY KEY(viewer_id, viewed_id)
+    )`);
+    lite.exec(`CREATE INDEX IF NOT EXISTS idx_pv_viewed ON profile_views(viewed_id)`);
+  }
   // renommage desc -> description sur les anciennes bases (schéma v1)
   try {
     const hasDesc = USE_PG
@@ -1678,7 +2024,13 @@ app.get('/api/search/insights', async (req, res) => {
   await mig('lives', 'duration_s', `INTEGER NOT NULL DEFAULT 0`);
   await mig('lives', 'gifts_total', `INTEGER NOT NULL DEFAULT 0`);
   await mig('lives', 'chat_total', `INTEGER NOT NULL DEFAULT 0`);
+  // v2.38 : mode Q&R live + effet en direct
+  await mig('lives', 'qa_mode', `INTEGER NOT NULL DEFAULT 0`);
+  await mig('lives', 'current_effect', `TEXT NOT NULL DEFAULT ''`);
   await mig('gifts', 'live_id', `INTEGER`);
+  await mig('gifts', 'thanked', `INTEGER NOT NULL DEFAULT 0`); // v2.37 : remerciement cadeau
+  // v2.33 : épinglage d'un message du chat live (live_chat.pinned)
+  await mig('live_chat', 'pinned', `INTEGER NOT NULL DEFAULT 0`);
   // serveur v11 (V3) : boutique, live shopping, publicité, modération auto
   await mig('users', 'seller_name', `TEXT NOT NULL DEFAULT ''`);
   await mig('users', 'seller_bio', `TEXT NOT NULL DEFAULT ''`);
@@ -1690,7 +2042,11 @@ app.get('/api/search/insights', async (req, res) => {
   await mig('videos', 'photos', `TEXT NOT NULL DEFAULT '[]'`);
   await mig('videos', 'captions', `TEXT NOT NULL DEFAULT '[]'`);
   await mig('videos', 'series_id', `INTEGER`);
+  // V13 (TikTok Studio) : collaboration — vidéo co-signée par 2 créateurs
+  await mig('videos', 'co_creator_id', `INTEGER NOT NULL DEFAULT 0`);
   await mig('users', 'comment_keywords', `TEXT NOT NULL DEFAULT '[]'`);
+  // v2.38 : "Ne pas suggérer mon compte" — exclusion des suggestions d'amis
+  await mig('users', 'discoverable', `INTEGER NOT NULL DEFAULT 1`);
   try {
     if (USE_PG) await pool.query('CREATE INDEX IF NOT EXISTS watch_events_user_video_idx ON watch_events(user_id,video_id)');
     else lite.exec('CREATE INDEX IF NOT EXISTS watch_events_user_video_idx ON watch_events(user_id,video_id)');
@@ -1801,9 +2157,30 @@ async function distributeAdRevenue(dayStr) {
       const share = creatorPool * (w.weight / totalWeight);
       const coins = Math.floor(share * 500); // 1 USD = 500 pièces
       if (coins > 0) {
-        await runSql('UPDATE users SET coins=coins+? WHERE id=?', coins, w.creator_id);
+        // V13 : partage des revenus de collaboration — la part du co-créateur
+        // (revenue_share_pct de l'invitation acceptée) lui est créditée directement.
+        let coId = 0, coPct = 0;
+        try {
+          const vv = await get1('SELECT co_creator_id FROM videos WHERE id=?', w.video_id);
+          if (vv && Number(vv.co_creator_id)) {
+            const inv = await get1(`SELECT revenue_share_pct FROM collab_invites
+              WHERE video_id=? AND invitee_id=? AND status='accepted' ORDER BY id DESC LIMIT 1`,
+              w.video_id, vv.co_creator_id);
+            if (inv && Number(inv.revenue_share_pct) > 0 && Number(inv.revenue_share_pct) < 100) {
+              coId = Number(vv.co_creator_id); coPct = Number(inv.revenue_share_pct);
+            }
+          }
+        } catch (_) {}
+        const coCoins = coId ? Math.floor(coins * coPct / 100) : 0;
+        const myCoins = coins - coCoins;
+        await runSql('UPDATE users SET coins=coins+? WHERE id=?', myCoins, w.creator_id);
         await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
-          w.creator_id, coins, 'revenu pub vidéo #' + w.video_id, now());
+          w.creator_id, myCoins, coId ? 'revenu pub vidéo #' + w.video_id + ' (collab ' + (100 - coPct) + '%)' : 'revenu pub vidéo #' + w.video_id, now());
+        if (coId && coCoins > 0) {
+          await runSql('UPDATE users SET coins=coins+? WHERE id=?', coCoins, coId);
+          await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
+            coId, coCoins, 'revenu pub vidéo #' + w.video_id + ' (collab ' + coPct + '%)', now());
+        }
         await runSql('UPDATE videos SET ad_revenue_usd=ad_revenue_usd+? WHERE id=?', share, w.video_id);
         distributed += share;
       }
@@ -1900,6 +2277,16 @@ async function runVerificationBot() {
         } else {
           await notify(r.user_id, 'system', null, null, '🤖 ' + verdict.reason);
         }
+        // v2.33 : e-mail de verdict badge (bot)
+        {
+          const be = await get1('SELECT email, username FROM users WHERE id=?', r.user_id);
+          if (be && be.email) sendVidiEmail(be.email,
+            verdict.approved ? '✔️ Badge vérifié obtenu — VidiGagne' : '✔️ Demande de badge — action requise',
+            '<p style="font-size:18px">' + (verdict.approved ? '✔️ Compte vérifié !' : '✔️ Demande de badge rejetée') + '</p>'
+            + '<p style="color:#ccc;font-size:14px">' + String(verdict.reason).replace(/</g, '&lt;') + '</p>'
+            + (verdict.approved ? '<p style="color:#999;font-size:12px">Ton badge bleu apparaît désormais à côté de ton pseudo. ✨</p>' : ''),
+            verdict.reason).catch(() => {});
+        }
       } catch (_) {}
     }
     // 2. KYC
@@ -1913,6 +2300,16 @@ async function runVerificationBot() {
         await notify(v.user_id, 'system', null, null,
           verdict.approved ? '🤖✔️ Ton identité est vérifiée — tu peux retirer tes gains !'
                            : '🤖 ' + verdict.reason);
+        // v2.33 : e-mail de verdict KYC (bot)
+        {
+          const ue = await get1('SELECT email FROM users WHERE id=?', v.user_id);
+          if (ue && ue.email) sendVidiEmail(ue.email,
+            verdict.approved ? '🪪 Identité vérifiée — VidiGagne' : '🪪 Vérification d\'identité — action requise',
+            '<p style="font-size:18px">' + (verdict.approved ? '🪪✔️ Identité vérifiée !' : '🪪 Vérification rejetée') + '</p>'
+            + '<p style="color:#ccc;font-size:14px">' + String(verdict.reason).replace(/</g, '&lt;') + '</p>'
+            + (verdict.approved ? '<p style="color:#999;font-size:12px">Tu peux désormais retirer tes gains. ✨</p>' : ''),
+            verdict.reason).catch(() => {});
+        }
       } catch (_) {}
     }
   } catch (e) { console.error('bot vérification:', e.message); }
@@ -1956,6 +2353,26 @@ async function insertIgnore(sql, ...params) {
     return r.rowCount;
   }
   return lite.prepare(sql).run(...params).changes;
+}
+
+// ---------- verrou anti-concurrence par utilisateur (2026-10-04, chantier concurrence) ----------
+// Les sections critiques "lire un compteur → vérifier un plafond → créditer" ne sont PAS
+// atomiques : sur Postgres (pool async, la prod), N requêtes simultanées s'intercalent entre
+// la lecture et le crédit et dépassent le plafond (ou créditent 2×). Ce mutex par user_id
+// sérialise ces sections dans le processus Node (instance unique en production).
+// Sur SQLite local les statements node:sqlite sont synchrones donc déjà sérialisés : le verrou
+// y est neutre (aucun changement de comportement, prouvé par les bots de concurrence).
+const _userLocks = new Map();
+async function withUserLock(userId, fn) {
+  const key = 'u' + userId;
+  const prev = _userLocks.get(key) || Promise.resolve();
+  let release;
+  const gate = new Promise(r => { release = r; });
+  const cur = prev.then(() => gate);
+  _userLocks.set(key, cur);
+  await prev;
+  try { return await fn(); }
+  finally { release(); if (_userLocks.get(key) === cur) _userLocks.delete(key); }
 }
 
 // ---------- stockage vidéos ----------
@@ -2102,9 +2519,9 @@ async function notify(userId, type, actorId, videoId, text, commentId) {
     if (!userId || Number(userId) === Number(actorId)) return;
     // v1.84 : vérifie les préférences de notification du destinataire
     try {
-      const prefs = await get1('SELECT notif_likes,notif_comments,notif_follows,notif_mentions,notif_lives FROM users WHERE id=?', userId);
+      const prefs = await get1('SELECT notif_likes,notif_comments,notif_follows,notif_mentions,notif_lives,notif_loginalert FROM users WHERE id=?', userId);
       if (prefs) {
-        const prefMap = { like: 'notif_likes', comment: 'notif_comments', follow: 'notif_follows', mention: 'notif_mentions', live: 'notif_lives' };
+        const prefMap = { like: 'notif_likes', comment: 'notif_comments', follow: 'notif_follows', follow_request: 'notif_follows', follow_accepted: 'notif_follows', mention: 'notif_mentions', live: 'notif_lives', login_alert: 'notif_loginalert' };
         const col = prefMap[type];
         if (col && Number(prefs[col]) === 0) return; // désactivé par l'utilisateur
       }
@@ -2123,7 +2540,10 @@ async function notify(userId, type, actorId, videoId, text, commentId) {
     // v1.84 : tentative de push FCM (fonctionne même app fermée)
     try {
       const titles = { like: 'Nouveau J\u2019aime', comment: 'Nouveau commentaire', follow: 'Nouvel abonné',
-        mention: 'Mention', live: 'En direct', repost: 'Repost', gift: '🎁 Cadeau reçu', default: 'VidiGagne' };
+        follow_request: '👤 Demande de suivi', follow_accepted: '✅ Demande acceptée',
+        mention: 'Mention', live: 'En direct', repost: 'Repost', gift: '🎁 Cadeau reçu',
+        withdrawal: '💸 Retrait', kyc: '🪪 Identité', badge: '✔️ Badge vérifié', report: '🛡️ Signalement',
+        security: '🔐 Sécurité', login_alert: '🔐 Nouvelle connexion', default: 'VidiGagne' };
       const title = (actorName ? actorName + ' — ' : '') + (titles[type] || titles.default);
       sendFcmPush(userId, title, String(text || '').slice(0, 200),
         { type, notif_id: String(id), actor: actorName }).catch(() => {});
@@ -2249,9 +2669,18 @@ async function videoJSON(v, meId) {
   // paywall : jamais d'URL de fichier pour une série verrouillée (tous les flux)
   const mediaUrl = seriesLocked ? null : fileUrl(v.file);
   const mediaPhotos = seriesLocked ? [] : photos;
+  // V13 (TikTok Studio) : collaboration — la vidéo affiche ses 2 créateurs
+  let coCreator = null;
+  try {
+    if (Number(v.co_creator_id)) {
+      const cu = await get1('SELECT id, username, avatar FROM users WHERE id=?', v.co_creator_id);
+      if (cu) coCreator = { id: cu.id, username: cu.username, avatar: cu.avatar || '' };
+    }
+  } catch (_) {}
   return {
     id: v.id, desc: v.description, tags: v.tags, sound: v.sound || '', sound_id: Number(v.sound_id) || 0, duration: Number(v.duration) || 0,
     url: mediaUrl, visibility: v.visibility || 'public', subscribed,
+    co_creator: coCreator,
     media_type: v.media_type || 'video', photos: mediaPhotos, captions,
     target_countries: v.target_countries || '[]',
     series_id: seriesId, series_locked: seriesLocked, locked: seriesLocked || undefined,
@@ -2305,6 +2734,24 @@ async function recordDevice(req, userId) {
   } catch (e) { /* jamais bloquant : l'auth ne doit pas échouer à cause du suivi device */ }
 }
 
+// ---------- v2.34 : ALERTES DE CONNEXION ----------
+// Notifie l'utilisateur d'une connexion réussie, sauf si la dernière alerte
+// date de moins d'1 heure ET que l'IP est identique (anti-spam).
+async function maybeLoginAlert(userId, ip) {
+  try {
+    const u = await get1('SELECT last_login_ip FROM users WHERE id=?', userId);
+    const prevIp = (u && u.last_login_ip) || '';
+    const last = await get1("SELECT created_at FROM notifications WHERE user_id=? AND type='login_alert' ORDER BY created_at DESC LIMIT 1", userId);
+    const recent = last && (now() - Number(last.created_at) < 3600000);
+    if (recent && prevIp === String(ip || '')) return;
+    const d = new Date();
+    const dt = d.toLocaleDateString('fr-FR') + ' à ' + d.toLocaleTimeString('fr-FR');
+    await notify(userId, 'login_alert', null, null,
+      `Nouvelle connexion à ton compte le ${dt} (IP ${ip || 'inconnue'}). Si ce n'est pas toi, change ton mot de passe.`);
+    await runSql('UPDATE users SET last_login_ip=? WHERE id=?', String(ip || ''), userId);
+  } catch (e) { /* jamais bloquant : le login ne doit pas échouer à cause de l'alerte */ }
+}
+
 // ---------- auth ----------
 app.post('/api/auth/register', async (req, res) => {
   try {
@@ -2344,6 +2791,22 @@ app.post('/api/auth/register', async (req, res) => {
       if (!(await get1('SELECT 1 FROM users WHERE ref_code=?', c))) refCode = c;
     }
     if (refCode) await runSql('UPDATE users SET ref_code=? WHERE id=?', refCode, id);
+    // v2.32 : inscription via lien d'invitation (?invite=CODE) → attribution + statut "inscrit" + bonus +50/+50
+    const invCode = String((req.body && req.body.invite) || req.query.invite || '').trim().toUpperCase();
+    if (invCode) {
+      try {
+        const inv = await get1('SELECT * FROM invites WHERE UPPER(code)=?', invCode);
+        if (inv && !inv.invited_user_id && Number(inv.user_id) !== Number(id)) {
+          await runSql('UPDATE users SET referred_by=? WHERE id=?', inv.user_id, id);
+          await runSql("UPDATE invites SET invited_user_id=?, status='inscrit' WHERE id=?", id, inv.id);
+          const _t = now();
+          await runSql('UPDATE users SET coins=coins+50 WHERE id=?', id);
+          await runSql('UPDATE users SET coins=coins+50 WHERE id=?', inv.user_id);
+          await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)', id, 50, 'invitation (lien)', _t);
+          await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)', inv.user_id, 50, 'invitation de @' + username, _t);
+        }
+      } catch (_) {}
+    }
     const token = crypto.randomBytes(32).toString('hex');
     await runSql('INSERT INTO tokens(token,user_id,created_at) VALUES(?,?,?)', token, id, now());
     await recordDevice(req, id); // v2.32 : 1 identité par installation (détection, jamais bloquant)
@@ -2375,6 +2838,7 @@ app.post('/api/auth/login', async (req, res) => {
       const _token = crypto.randomBytes(32).toString('hex');
       await runSql('INSERT INTO tokens(token,user_id,created_at) VALUES(?,?,?)', _token, _u.id, now());
       await recordDevice(req, _u.id); // v2.32 : 1 identité par installation (détection, jamais bloquant)
+      await maybeLoginAlert(_u.id, clientIp(req)); // v2.34 : alerte de connexion
       return res.json({ token: _token, user: privUser(_u), coins: _u.coins });
     }
     const ident = ((req.body || {}).username || (req.body || {}).identifier || (req.body || {}).email || '').toLowerCase().trim();
@@ -2386,6 +2850,7 @@ app.post('/api/auth/login', async (req, res) => {
     const token = crypto.randomBytes(32).toString('hex');
     await runSql('INSERT INTO tokens(token,user_id,created_at) VALUES(?,?,?)', token, u.id, now());
     await recordDevice(req, u.id); // v2.32 : 1 identité par installation (détection, jamais bloquant)
+    await maybeLoginAlert(u.id, clientIp(req)); // v2.34 : alerte de connexion
     res.json({ token, user: privUser(u), coins: u.coins });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
@@ -2399,6 +2864,35 @@ app.get('/api/auth/me', auth, async (req, res) => {
 app.post('/api/auth/logout', auth, async (req, res) => {
   try {
     await runSql('DELETE FROM tokens WHERE token=?', req.token);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+
+// ---------- v2.34 : APPS CONNECTÉES — gestion des sessions ----------
+// Liste les sessions (tokens) actives de l'utilisateur ; le token est masqué.
+app.get('/api/me/sessions', auth, async (req, res) => {
+  try {
+    const rows = await allRows('SELECT token, created_at FROM tokens WHERE user_id=? ORDER BY created_at DESC', req.userId);
+    res.json({ ok: true, sessions: rows.map(r => {
+      const cur = String(r.token) === req.token;
+      return {
+        token: String(r.token).slice(0, 8) + '...',
+        created_at: r.created_at,
+        current: cur,
+        label: cur ? 'cet appareil' : '',
+      };
+    }) });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// Révoque une session : doit appartenir à l'utilisateur ; pas la session courante.
+app.delete('/api/me/sessions/:token', auth, async (req, res) => {
+  try {
+    const t = String(req.params.token || '');
+    if (t === req.token)
+      return res.status(400).json({ error: 'impossible de révoquer ta session actuelle — utilise la déconnexion' });
+    const own = await get1('SELECT token FROM tokens WHERE token=? AND user_id=?', t, req.userId);
+    if (!own) return res.status(404).json({ error: 'session introuvable' });
+    await runSql('DELETE FROM tokens WHERE token=?', t);
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
@@ -2427,6 +2921,15 @@ app.post('/api/auth/forgot-password', async (req, res) => {
       await runSql('DELETE FROM password_resets WHERE email=?', email);
       await runSql('INSERT INTO password_resets(email,code,expires_at,created_at) VALUES(?,?,?,?)',
         email, code, now() + 10 * 60 * 1000, now());
+      // v2.33 : envoi RÉEL du code (avant : le message affirmait un envoi qui n'avait jamais lieu)
+      sendVidiEmail(email,
+        '🔐 Réinitialise ton mot de passe VidiGagne',
+        '<p style="font-size:18px">🔐 Code de réinitialisation</p>'
+        + '<p style="color:#ccc;font-size:14px">Voici ton code pour créer un nouveau mot de passe :</p>'
+        + bigCodeHtml(code)
+        + '<p style="color:#999;font-size:12px">⏱️ Ce code expire dans 10 minutes. Si tu n\'as rien demandé, ignore cet e-mail.</p>',
+        'Ton code de réinitialisation VidiGagne : ' + code + ' (expire dans 10 minutes).')
+        .catch(() => {});
     }
     // message générique dans tous les cas (anti-énumération de comptes)
     res.json({ ok: true, message: 'Si un compte existe avec cet e-mail, un code vient d\u2019être envoyé.' });
@@ -2446,6 +2949,14 @@ app.post('/api/auth/reset-password', async (req, res) => {
     const salt = crypto.randomBytes(16).toString('hex');
     await runSql('UPDATE users SET pass_hash=?, pass_salt=? WHERE id=?', hashPass(np, salt), salt, u.id);
     await runSql('DELETE FROM password_resets WHERE email=?', email);
+    // v2.33 : confirmation par e-mail (sécurité : l'utilisateur est prévenu du changement)
+    sendVidiEmail(email,
+      '🔐 Ton mot de passe VidiGagne a été changé',
+      '<p style="font-size:18px">🔐 Mot de passe mis à jour</p>'
+      + '<p style="color:#ccc;font-size:14px">Ton mot de passe VidiGagne vient d\'être modifié avec succès.</p>'
+      + '<p style="color:#999;font-size:12px">Si ce n\'est pas toi, contacte le support immédiatement.</p>',
+      'Ton mot de passe VidiGagne vient d\'être modifié. Si ce n\'est pas toi, contacte le support.')
+      .catch(() => {});
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
@@ -2551,6 +3062,14 @@ app.get('/api/diag/smtp-test', async (req, res) => {
     res.json({ ok: true, message: 'connexion SMTP vérifiée' });
   } catch (e) { res.json({ ok: false, reason: String(e && e.message || e).slice(0, 200) }); }
 });
+// v2.33 : journal des tentatives e-mails/push (les bots de test vérifient l'appel, pas l'envoi réel)
+app.get('/api/diag/email-push-log', async (req, res) => {
+  try {
+    if (!checkAdmin(req, res)) return;
+    res.json({ ok: true, test_hooks: VG_TEST_HOOKS,
+      emails: _emailAttempts.slice(-100), pushes: _pushAttempts.slice(-100) });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
 app.post('/api/auth/send-code', async (req, res) => {
   try {
     const kind = ((req.body || {}).kind === 'phone') ? 'phone' : 'email';
@@ -2610,11 +3129,20 @@ async function consumeVerifiedToken(vtoken) {
 }
 
 app.patch('/api/auth/me', auth, async (req, res) => {
-  const { name, avatar, bio, first_name, last_name, birthdate, gender, sub_enabled, sub_price, country, is_private, username } = req.body || {};
+  const { name, avatar, bio, first_name, last_name, birthdate, gender, sub_enabled, sub_price, country, is_private, username, cover, pronouns, links } = req.body || {};
   const _gender = ['male', 'female', 'other'].includes(String(gender || '')) ? String(gender) : null;
   // FIX 2026-10-04 (rupture #2): avatar accepte les data URLs (photo galerie) jusqu'à 3 Mo, pas juste 8 caractères
   const _avatar = avatar ? String(avatar).slice(0, 3 * 1024 * 1024) : null;
-  await runSql('UPDATE users SET name=COALESCE(?,name), avatar=COALESCE(?,avatar), bio=COALESCE(?,bio), first_name=COALESCE(?,first_name), last_name=COALESCE(?,last_name), birthdate=COALESCE(?,birthdate), gender=COALESCE(?,gender), country=COALESCE(?,country) WHERE id=?',
+  const _cover = cover !== undefined && cover !== null ? String(cover).slice(0, 3 * 1024 * 1024) : null;
+  const _pronouns = pronouns !== undefined && pronouns !== null ? String(pronouns).slice(0, 30) : null;
+  let _links = null;
+  if (links !== undefined && links !== null) {
+    try {
+      const arr = Array.isArray(links) ? links : JSON.parse(String(links));
+      _links = JSON.stringify(arr.slice(0, 5).map(l => ({ t: String(l.t || l.title || '').slice(0, 40), u: String(l.u || l.url || '').slice(0, 200) })).filter(l => l.u));
+    } catch (e) { _links = null; }
+  }
+  await runSql('UPDATE users SET name=COALESCE(?,name), avatar=COALESCE(?,avatar), bio=COALESCE(?,bio), first_name=COALESCE(?,first_name), last_name=COALESCE(?,last_name), birthdate=COALESCE(?,birthdate), gender=COALESCE(?,gender), country=COALESCE(?,country), cover=COALESCE(?,cover), pronouns=COALESCE(?,pronouns), links=COALESCE(?,links) WHERE id=?',
     name !== undefined && name !== null ? String(name).slice(0, 40) : null,
     _avatar,
     // FIX 2026-10-04 (bot chain-bio-pseudo) : une bio envoyée vide ('') doit EFFACER
@@ -2624,7 +3152,8 @@ app.patch('/api/auth/me', auth, async (req, res) => {
     last_name !== undefined ? String(last_name).trim().slice(0, 40) : null,
     /^\d{4}-\d{2}-\d{2}$/.test(birthdate || '') ? birthdate : null,
     _gender,
-    /^[A-Z]{2}$/.test(String(country || '')) ? String(country) : null, req.userId);
+    /^[A-Z]{2}$/.test(String(country || '')) ? String(country) : null,
+    _cover, _pronouns, _links, req.userId);
   // abonnement payant au créateur : activation + prix mensuel (pièces)
   if (sub_enabled !== undefined || sub_price !== undefined) {
     const se = sub_enabled ? 1 : 0;
@@ -2821,6 +3350,10 @@ app.post('/api/videos', auth, upload.single('video'), async (req, res) => {
     // FIX 2026-10-04 : stitch_of envoyé par l'app (collage) — validé contre allow_stitch de l'original
     let _stitchOf = Math.floor(Number(b.stitch_of)) || 0;
     if (_stitchOf) { const _so = await get1('SELECT allow_stitch FROM videos WHERE id=?', _stitchOf); if (!_so || !Number(_so.allow_stitch)) _stitchOf = 0; }
+    // v2.33 : duet_of envoyé par l'app (duo) — validé contre allow_duet de l'original
+    // (un duo de duo reste autorisé tant que la vidéo duetée l'autorise → chaînes de duos possibles)
+    let _duetOf = Math.floor(Number(b.duet_of)) || 0;
+    if (_duetOf) { const _do = await get1('SELECT allow_duet FROM videos WHERE id=?', _duetOf); if (!_do || !Number(_do.allow_duet)) _duetOf = 0; }
     // FIX 2026-10-04 (parité TikTok) : l'app envoie sound='srv:<id>' quand le son vient
     // du catalogue serveur — on résout le titre + on stocke sound_id pour que la page
     // du son liste la vidéo et que le disque 💿 du feed ouvre la vraie page du son.
@@ -2832,10 +3365,10 @@ app.post('/api/videos', auth, upload.single('video'), async (req, res) => {
     }
     const _effVal = String(b.effect || '').slice(0, 80);
     const id = await insertId(
-      'INSERT INTO videos(user_id,file,description,tags,sound,sound_id,effect,duration,scheduled_at,visibility,captions,is_replay,live_id,tts_text,tts_voice,tts_rate,target_countries,stitch_of,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+      'INSERT INTO videos(user_id,file,description,tags,sound,sound_id,effect,duration,scheduled_at,visibility,captions,is_replay,live_id,tts_text,tts_voice,tts_rate,target_countries,stitch_of,duet_of,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
       req.userId, fname, descText, String(b.tags || '').slice(0, 300),
       _sndVal, _sndId, _effVal, duration, scheduledAt, visibility, captions,
-      isReplay, liveId, ttsText, ttsVoice, ttsRate, _tcJson, _stitchOf, now());
+      isReplay, liveId, ttsText, ttsVoice, ttsRate, _tcJson, _stitchOf, _duetOf, now());
     if (_bannedRemoved.length) {
       try { await notify(req.userId, 'system', null, null,
         '🤖 Hashtags supprimés : ' + _bannedRemoved.join(' ') + ' (plateformes concurrentes interdites)'); } catch (_) {}
@@ -2849,6 +3382,7 @@ app.post('/api/videos', auth, upload.single('video'), async (req, res) => {
     if (badW) {
       await runSql(`UPDATE videos SET hidden=1, review_status='pending' WHERE id=?`, id);
       await flagForReview('video', id, 'mot interdit : ' + badW);
+      await modFlag('video', id, 'mot interdit : ' + badW); // v2.39 : file mod_queue
     }
     const v = await get1('SELECT * FROM videos WHERE id=?', id);
     // v1.58 : hash perceptuel en arrière-plan (recherche par image) — ne bloque pas la réponse
@@ -2864,6 +3398,13 @@ app.post('/api/videos', auth, upload.single('video'), async (req, res) => {
         });
       }
     } catch (_) {}
+    // v2.40 : badge créateur — 10 vidéos publiées
+    try {
+      const vc = await get1('SELECT COUNT(*) AS n FROM videos WHERE user_id=?', req.userId);
+      if (vc && Number(vc.n) >= 10) {
+        await insertIgnore('INSERT OR IGNORE INTO user_badges(user_id,badge,awarded_at) VALUES(?,?,?)', req.userId, 'creator', now());
+      }
+    } catch (e) {}
     res.json({ video: await videoJSON(v, req.userId), pending_review: !!badW });
   } catch (e) { res.status(500).json({ error: "échec du téléversement" }); }
 });
@@ -2895,6 +3436,7 @@ app.post('/api/photos', auth, uploadPhotos.array('photos', 10), async (req, res)
     if (badW) {
       await runSql(`UPDATE videos SET hidden=1, review_status='pending' WHERE id=?`, id);
       await flagForReview('video', id, 'mot interdit : ' + badW);
+      await modFlag('video', id, 'mot interdit : ' + badW); // v2.39 : file mod_queue
     }
     const v = await get1('SELECT * FROM videos WHERE id=?', id);
     res.json({ video: await videoJSON(v, req.userId), pending_review: !!badW });
@@ -2970,8 +3512,170 @@ app.post('/api/gifts', auth, async (req, res) => {
     await runSql('INSERT INTO gifts(from_id,to_id,video_id,gift,cost,created_at) VALUES(?,?,?,?,?,?)',
       req.userId, dest.id, video_id || null, g.id, g.cost, now());
     await notify(dest.id, 'gift', req.userId, video_id || null, g.emoji + ' ' + g.name + ' (+' + g.cost + ')'); // v2.31 : montant inclus
+    await maybeGiftEmail(dest.id, me.username, g); // v2.33 : e-mail si gros cadeau (≥100 🪙)
     const balG = await get1('SELECT coins FROM users WHERE id=?', req.userId);
     res.json({ ok: true, coins: balG ? balG.coins : 0 });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// ---------- v2.37 : portefeuille & gains avancés (streak, quêtes, classement, transferts, remerciements, annulation retrait) ----------
+// Annulation d'un retrait par l'utilisateur (uniquement si encore pending) → remboursement
+app.post('/api/withdraw/:id/cancel', auth, async (req, res) => {
+  try {
+    const w = await get1('SELECT * FROM withdrawals WHERE id=?', req.params.id);
+    if (!w) return res.status(404).json({ error: 'retrait introuvable' });
+    if (Number(w.user_id) !== Number(req.userId)) return res.status(403).json({ error: 'non autorisé' });
+    if (w.status !== 'pending') return res.status(400).json({ error: 'déjà traité (' + w.status + ')' });
+    const t = now();
+    await runSql('UPDATE users SET coins=coins+? WHERE id=?', w.coins, w.user_id);
+    await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
+      w.user_id, w.coins, 'annulation retrait #' + w.id + ' par l\'utilisateur', t);
+    await runSql('UPDATE withdrawals SET status=?, decided_at=? WHERE id=?', 'cancelled', t, w.id);
+    await runSql('UPDATE receipts SET status=? WHERE withdrawal_id=?', 'cancelled', w.id);
+    await notify(w.user_id, 'withdrawal', null, null,
+      '↩️ Ton retrait de ' + w.coins + ' 🪙 a été annulé. Les pièces ont été recréditées.');
+    const bal = await get1('SELECT coins FROM users WHERE id=?', req.userId);
+    res.json({ ok: true, id: w.id, status: 'cancelled', refunded: w.coins, coins: bal ? bal.coins : 0 });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// Série de connexion quotidienne : bonus progressif (jour N → min(N*5, 50) pièces)
+function streakBonus(n) { return Math.min(Math.max(1, n) * 5, 50); }
+function utcDay(ms) { return new Date(ms).toISOString().slice(0, 10); }
+app.post('/api/streak/checkin', auth, async (req, res) => {
+  try {
+    const t = now(), today = utcDay(t), yest = utcDay(t - 86400000);
+    const row = await get1('SELECT * FROM login_streaks WHERE user_id=?', req.userId);
+    if (row && row.last_day === today)
+      return res.json({ ok: true, streak: row.streak, bonus: 0, already: true, day: today });
+    const streak = (row && row.last_day === yest) ? row.streak + 1 : 1;
+    const bonus = streakBonus(streak);
+    await runSql('UPDATE users SET coins=coins+? WHERE id=?', bonus, req.userId);
+    await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
+      req.userId, bonus, '🔥 bonus série jour ' + streak, t);
+    if (row) await runSql('UPDATE login_streaks SET streak=?, last_day=?, updated_at=? WHERE user_id=?', streak, today, t, req.userId);
+    else await runSql('INSERT INTO login_streaks(user_id,streak,last_day,updated_at) VALUES(?,?,?,?)', req.userId, streak, today, t);
+    res.json({ ok: true, streak, bonus, day: today });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.get('/api/streak', auth, async (req, res) => {
+  try {
+    const row = await get1('SELECT * FROM login_streaks WHERE user_id=?', req.userId);
+    const today = utcDay(now());
+    res.json({ streak: row ? row.streak : 0, last_day: row ? row.last_day : null,
+      checked_in_today: !!(row && row.last_day === today), next_bonus: streakBonus((row ? row.streak : 0) + 1) });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// Quêtes quotidiennes (progression calculée depuis les tables existantes, sans hooks invasifs)
+const DAILY_QUESTS = [
+  { key: 'watch5', name: 'Regarde 5 vidéos', emoji: '👀', target: 5, reward: 10 },
+  { key: 'like3', name: 'Aime 3 vidéos', emoji: '❤️', target: 3, reward: 8 },
+  { key: 'comment2', name: 'Commente 2 vidéos', emoji: '💬', target: 2, reward: 8 },
+  { key: 'publish1', name: 'Publie 1 vidéo', emoji: '🎬', target: 1, reward: 15 },
+];
+async function questProgress(userId, key, day, dayStart) {
+  if (key === 'watch5') { const r = await get1('SELECT COUNT(*) AS n FROM watch_rewards WHERE user_id=? AND day=?', userId, day); return r ? r.n : 0; }
+  if (key === 'like3') { const r = await get1('SELECT COUNT(*) AS n FROM likes WHERE user_id=? AND created_at>=?', userId, dayStart); return r ? r.n : 0; }
+  if (key === 'comment2') { const r = await get1('SELECT COUNT(*) AS n FROM comments WHERE user_id=? AND created_at>=?', userId, dayStart); return r ? r.n : 0; }
+  if (key === 'publish1') { const r = await get1('SELECT COUNT(*) AS n FROM videos WHERE user_id=? AND created_at>=?', userId, dayStart); return r ? r.n : 0; }
+  return 0;
+}
+app.get('/api/quests', auth, async (req, res) => {
+  try {
+    const day = utcDay(now());
+    const dayStart = new Date(day + 'T00:00:00Z').getTime();
+    const out = [];
+    for (const q of DAILY_QUESTS) {
+      const progress = await questProgress(req.userId, q.key, day, dayStart);
+      const cl = await get1('SELECT 1 AS c FROM quest_claims WHERE user_id=? AND quest_key=? AND day=?', req.userId, q.key, day);
+      out.push({ ...q, progress, claimed: !!cl, done: progress >= q.target });
+    }
+    res.json({ day, quests: out });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.post('/api/quests/:key/claim', auth, async (req, res) => {
+  try {
+    const q = DAILY_QUESTS.find(x => x.key === req.params.key);
+    if (!q) return res.status(404).json({ error: 'quête inconnue' });
+    const day = utcDay(now());
+    const dayStart = new Date(day + 'T00:00:00Z').getTime();
+    const progress = await questProgress(req.userId, q.key, day, dayStart);
+    if (progress < q.target) return res.status(400).json({ error: 'quête incomplète (' + progress + '/' + q.target + ')' });
+    const cl = await get1('SELECT 1 AS c FROM quest_claims WHERE user_id=? AND quest_key=? AND day=?', req.userId, q.key, day);
+    if (cl) return res.status(400).json({ error: 'récompense déjà réclamée aujourd\'hui' });
+    const t = now();
+    const ins = USE_PG
+      ? 'INSERT INTO quest_claims(user_id,quest_key,day,created_at) VALUES(?,?,?,?) ON CONFLICT DO NOTHING'
+      : 'INSERT OR IGNORE INTO quest_claims(user_id,quest_key,day,created_at) VALUES(?,?,?,?)';
+    await runSql(ins, req.userId, q.key, day, t);
+    const again = await get1('SELECT created_at FROM quest_claims WHERE user_id=? AND quest_key=? AND day=?', req.userId, q.key, day);
+    if (!again || Number(again.created_at) !== t) return res.status(400).json({ error: 'récompense déjà réclamée aujourd\'hui' });
+    await runSql('UPDATE users SET coins=coins+? WHERE id=?', q.reward, req.userId);
+    await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
+      req.userId, q.reward, '🎯 quête "' + q.name + '"', t);
+    const bal = await get1('SELECT coins FROM users WHERE id=?', req.userId);
+    res.json({ ok: true, reward: q.reward, coins: bal ? bal.coins : 0 });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// Classement hebdo : top 20 par pièces gagnées (7 derniers jours) + rang du demandeur
+app.get('/api/leaderboard', auth, async (req, res) => {
+  try {
+    const weekAgo = now() - 7 * 86400000;
+    const top = await allRows(
+      `SELECT u.id, u.username, COALESCE(SUM(CASE WHEN l.amount>0 THEN l.amount ELSE 0 END),0) AS earned
+       FROM users u LEFT JOIN ledger l ON l.user_id=u.id AND l.created_at>=?
+       GROUP BY u.id ORDER BY earned DESC LIMIT 20`, weekAgo);
+    let myRank = null, myEarned = 0;
+    for (let i = 0; i < top.length; i++) {
+      if (Number(top[i].id) === Number(req.userId)) { myRank = i + 1; myEarned = top[i].earned; break; }
+    }
+    if (myRank === null) {
+      const me = await get1('SELECT COALESCE(SUM(CASE WHEN amount>0 THEN amount ELSE 0 END),0) AS e FROM ledger WHERE user_id=? AND created_at>=?', req.userId, weekAgo);
+      myEarned = me ? me.e : 0;
+      const above = await get1(
+        `SELECT COUNT(*) AS n FROM (SELECT u.id FROM users u LEFT JOIN ledger l ON l.user_id=u.id AND l.created_at>=?
+         GROUP BY u.id HAVING COALESCE(SUM(CASE WHEN l.amount>0 THEN l.amount ELSE 0 END),0) > ?) x`, weekAgo, myEarned);
+      myRank = (above ? Number(above.n) : 0) + 1;
+    }
+    res.json({ top: top.map((r, i) => ({ rank: i + 1, username: r.username, earned: r.earned })), me: { rank: myRank, earned: myEarned } });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// Transfert de pièces entre utilisateurs (débit atomique)
+app.post('/api/coins/transfer', auth, async (req, res) => {
+  try {
+    const n = Math.floor(+((req.body || {}).coins));
+    const toRaw = (req.body || {}).to;
+    if (!n || n < 1) return res.status(400).json({ error: 'montant invalide (min 1 pièce)' });
+    if (n > 10000) return res.status(400).json({ error: 'montant trop élevé (max 10 000)' });
+    const dest = await get1('SELECT * FROM users WHERE id=? OR username=?', +toRaw || -1, String(toRaw || ''));
+    if (!dest) return res.status(404).json({ error: 'destinataire introuvable' });
+    if (Number(dest.id) === Number(req.userId)) return res.status(400).json({ error: 'impossible' });
+    const me = await get1('SELECT username, coins FROM users WHERE id=?', req.userId);
+    const debited = await runSqlChanges('UPDATE users SET coins=coins-? WHERE id=? AND coins>=?', n, req.userId, n);
+    if (!debited) return res.status(400).json({ error: 'pas assez de pièces' });
+    await runSql('UPDATE users SET coins=coins+? WHERE id=?', n, dest.id);
+    const t = now();
+    await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
+      req.userId, -n, 'transfert → @' + dest.username, t);
+    await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
+      dest.id, n, 'transfert ← @' + me.username, t);
+    await runSql('INSERT INTO coin_transfers(from_id,to_id,coins,created_at) VALUES(?,?,?,?)',
+      req.userId, dest.id, n, t);
+    await notify(dest.id, 'transfer', req.userId, null, '💸 @' + me.username + ' t\'a envoyé ' + n + ' 🪙');
+    const bal = await get1('SELECT coins FROM users WHERE id=?', req.userId);
+    res.json({ ok: true, sent: n, to: dest.username, coins: bal ? bal.coins : 0 });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// Remercier l'expéditeur d'un cadeau reçu
+app.post('/api/gifts/:id/thank', auth, async (req, res) => {
+  try {
+    const g = await get1('SELECT * FROM gifts WHERE id=?', req.params.id);
+    if (!g) return res.status(404).json({ error: 'cadeau introuvable' });
+    if (Number(g.to_id) !== Number(req.userId)) return res.status(403).json({ error: 'non autorisé' });
+    if (g.thanked) return res.json({ ok: true, already: true });
+    const me = await get1('SELECT username FROM users WHERE id=?', req.userId);
+    await runSql('UPDATE gifts SET thanked=1 WHERE id=?', g.id);
+    await notify(g.from_id, 'gift_thanks', req.userId, g.video_id,
+      '🙏 @' + me.username + ' te remercie pour ton cadeau !');
+    res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 // ---------- playlists ----------
@@ -3179,6 +3883,37 @@ app.get('/api/creator/stats', auth, async (req, res) => {
       .map(v => ({ id: v.id, desc: v.description, views: Number(v.views) })),
   });
 });
+// v2.34 : comparaison de périodes pour le dashboard créateur (7j vs 7 précédents par défaut)
+app.get('/api/creator/stats/compare', auth, async (req, res) => {
+  try {
+    const dayMs = 86400000, t = now();
+    let f1 = Number(req.query.from1), t1 = Number(req.query.to1);
+    let f2 = Number(req.query.from2), t2 = Number(req.query.to2);
+    if (![f1, t1, f2, t2].every(Number.isFinite) || t1 <= f1 || t2 <= f2) {
+      // défaut : 7 derniers jours vs 7 jours précédents
+      t1 = t; f1 = t - 7 * dayMs; t2 = f1; f2 = t2 - 7 * dayMs;
+    }
+    const periodStats = async (a, b) => {
+      const vw = await get1(`SELECT COUNT(*) AS c FROM video_views vv JOIN videos v ON v.id=vv.video_id
+        WHERE v.user_id=? AND vv.created_at>=? AND vv.created_at<?`, req.userId, a, b);
+      const lk = await get1(`SELECT COUNT(*) AS c FROM likes l JOIN videos v ON v.id=l.video_id
+        WHERE v.user_id=? AND l.created_at>=? AND l.created_at<?`, req.userId, a, b);
+      const cn = await get1(`SELECT COALESCE(SUM(amount),0) AS s FROM ledger
+        WHERE user_id=? AND amount>0 AND created_at>=? AND created_at<?`, req.userId, a, b);
+      const fw = await get1(`SELECT COUNT(*) AS c FROM follows
+        WHERE followed_id=? AND created_at>=? AND created_at<?`, req.userId, a, b);
+      return { views: Number((vw && vw.c) || 0), likes: Number((lk && lk.c) || 0),
+        coins: Number((cn && cn.s) || 0), followers_gained: Number((fw && fw.c) || 0) };
+    };
+    const p1 = await periodStats(f1, t1), p2 = await periodStats(f2, t2);
+    const deltaOf = (a, b) => ({ abs: a - b, pct: b ? Math.round(((a - b) / b) * 1000) / 10 : (a > 0 ? null : 0) });
+    res.json({ ok: true,
+      period1: Object.assign({ from: f1, to: t1 }, p1),
+      period2: Object.assign({ from: f2, to: t2 }, p2),
+      delta: { views: deltaOf(p1.views, p2.views), likes: deltaOf(p1.likes, p2.likes),
+        coins: deltaOf(p1.coins, p2.coins), followers_gained: deltaOf(p1.followers_gained, p2.followers_gained) } });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
 // ---------- live : démarrer (la liste et la fin sont en version v10 ci-dessous) ----------
 app.post('/api/live/start', auth, async (req, res) => {
   const title = String((req.body || {}).title || '').slice(0, 80);
@@ -3188,6 +3923,17 @@ app.post('/api/live/start', auth, async (req, res) => {
   maxGuests = Math.max(1, Math.min(8, maxGuests));
   const id = await insertId('INSERT INTO lives(user_id,title,started_at,viewers,live_type,max_guests) VALUES(?,?,?,?,?,?)',
     req.userId, title, now(), 0, liveType, maxGuests);
+  // v2.33 : push aux abonnés (in-app + FCM) — respecte les prefs notif_lives via notify()
+  (async () => {
+    try {
+      const me = await get1('SELECT username FROM users WHERE id=?', req.userId);
+      const fols = await allRows('SELECT follower_id FROM follows WHERE followed_id=?', req.userId);
+      for (const f of fols) {
+        await notify(f.follower_id, 'live', req.userId, null,
+          '🔴 @' + (me ? me.username : 'créateur') + ' est en direct' + (title ? ' : ' + title : '') + ' !');
+      }
+    } catch (_) {}
+  })();
   res.json({ ok: true, id, live_type: liveType, max_guests: maxGuests });
 });
 // ---------- compte : export et suppression (droits RGPD) ----------
@@ -3200,7 +3946,14 @@ app.get('/api/account/export', auth, async (req, res) => {
     const playlists = await allRows('SELECT * FROM playlists WHERE user_id=?', req.userId);
     const withdrawals = await allRows('SELECT coins,usd,method,status,created_at FROM withdrawals WHERE user_id=?', req.userId);
     const ledger = await allRows('SELECT amount,reason,created_at FROM ledger WHERE user_id=? ORDER BY created_at DESC LIMIT 500', req.userId);
-    res.json({ user: u, videos, comments, stories, playlists, withdrawals, ledger, exported_at: now() });
+    // v2.38 : complétude RGPD — follows, vidéos aimées, collections/favoris
+    const following = await allRows('SELECT f.followed_id AS id, u.username, f.created_at FROM follows f JOIN users u ON u.id=f.followed_id WHERE f.follower_id=?', req.userId);
+    const followers = await allRows('SELECT f.follower_id AS id, u.username, f.created_at FROM follows f JOIN users u ON u.id=f.follower_id WHERE f.followed_id=?', req.userId);
+    const liked_videos = await allRows('SELECT video_id, created_at FROM likes WHERE user_id=?', req.userId);
+    const collections = await allRows('SELECT id,name,is_private,created_at FROM collections WHERE user_id=?', req.userId);
+    const collection_items = await allRows('SELECT collection_id,video_id,added_at FROM collection_items WHERE collection_id IN (SELECT id FROM collections WHERE user_id=?)', req.userId);
+    res.json({ user: u, videos, comments, stories, playlists, withdrawals, ledger,
+      following, followers, liked_videos, collections, collection_items, exported_at: now() });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 app.delete('/api/account', auth, async (req, res) => {
@@ -3381,8 +4134,24 @@ app.get('/api/kyc/pending', adminAuth, async (req, res) => {
 });
 app.post('/api/kyc/:id/review', adminAuth, async (req, res) => {
   const approve = !!(req.body || {}).approve;
+  const krow = await get1('SELECT user_id FROM id_verifications WHERE id=?', req.params.id);
   await runSql(`UPDATE id_verifications SET status=?, reviewed_at=? WHERE id=?`,
     approve ? 'approved' : 'rejected', now(), req.params.id);
+  // v2.33 : notifie (in-app + push FCM) + e-mail de verdict
+  if (krow) {
+    const kmsg = approve
+      ? '🪪✔️ Ton identité est vérifiée — tu peux retirer tes gains !'
+      : '🪪 Ta vérification d\'identité a été rejetée. Vérifie ton document et renvoie une demande.';
+    await notify(krow.user_id, 'kyc', null, null, kmsg);
+    const ku = await get1('SELECT email, username FROM users WHERE id=?', krow.user_id);
+    if (ku && ku.email) sendVidiEmail(ku.email,
+      approve ? '🪪 Identité vérifiée — VidiGagne' : '🪪 Vérification d\'identité — action requise',
+      '<p style="font-size:18px">' + (approve ? '🪪✔️ Identité vérifiée !' : '🪪 Vérification rejetée') + '</p>'
+      + '<p style="color:#ccc;font-size:14px">' + (approve
+        ? 'Félicitations @' + String(ku.username).replace(/</g, '&lt;') + ' ! Ton identité est confirmée : tu peux désormais retirer tes gains.'
+        : 'Ta demande de vérification d\'identité n\'a pas pu être validée. Assure-toi que ton document est en cours de validité et bien lisible, puis renvoie une demande depuis l\'application.') + '</p>',
+      kmsg).catch(() => {});
+  }
   res.json({ ok: true, status: approve ? 'approved' : 'rejected' });
 });
 // ---------- page admin : revue des identités ----------
@@ -3553,6 +4322,12 @@ function receiptHtml(r, user) {
 </body></html>`;
 }
 async function sendReceiptEmail(user, r) {
+  // v2.33 : journalise la tentative (bot de test) ; en mode test l'envoi réel est stubbé
+  if (user && user.email) {
+    _emailAttempts.push({ to: String(user.email), subject: '🧾 Reçu de retrait VidiGagne — ' + r.receipt_no, at: Date.now() });
+    if (_emailAttempts.length > 500) _emailAttempts.shift();
+  }
+  if (VG_TEST_HOOKS) return 'stubbed';
   const m = mailer();
   if (!m || !user.email) return 'skipped';
   try {
@@ -3564,6 +4339,74 @@ async function sendReceiptEmail(user, r) {
     });
     return 'sent';
   } catch (e) { return 'failed'; }
+}
+// ---------- v2.33 : e-mails transactionnels (Brevo HTTP priorité, SMTP fallback) ----------
+// Journal en mémoire des tentatives (e-mails + pushes) — consultable via /api/diag/email-push-log.
+// Quand VG_TEST_HOOKS=1 : les envois RÉELS sont stubbés (aucun e-mail ni push ne part) — le bot
+// de test vérifie que l'appel a bien été tenté, pas l'envoi réel.
+const _emailAttempts = [];
+const _pushAttempts = [];
+const VG_TEST_HOOKS = process.env.VG_TEST_HOOKS === '1';
+function emailTemplate(inner) {
+  return '<div style="font-family:sans-serif;max-width:480px;margin:0 auto;background:#0a0a0a;border-radius:16px;overflow:hidden">'
+    + '<div style="background:linear-gradient(135deg,#b8860b,#ffd700);padding:30px;text-align:center">'
+    + '<div style="font-size:32px;font-weight:900;color:#000;letter-spacing:1px">VidiGagne</div>'
+    + '<div style="color:#000;font-size:14px;margin-top:6px">Regarde des vidéos. Gagne de l\'argent.</div></div>'
+    + '<div style="padding:30px;text-align:center;color:#fff">' + inner + '</div>'
+    + '<div style="padding:20px;text-align:center;color:#666;font-size:11px;border-top:1px solid #222">© 2026 VidiGagne — Fait avec ❤️</div></div>';
+}
+function bigCodeHtml(code) {
+  return '<div style="font-size:48px;font-weight:900;letter-spacing:12px;color:#ffd700;margin:20px 0">' + code + '</div>';
+}
+async function sendVidiEmail(to, subject, innerHtml, textBody) {
+  if (!to) return 'skipped';
+  _emailAttempts.push({ to: String(to), subject: String(subject), at: Date.now() });
+  if (_emailAttempts.length > 500) _emailAttempts.shift();
+  if (VG_TEST_HOOKS) return 'stubbed';
+  const html = emailTemplate(innerHtml);
+  // Priorité : Brevo API (HTTP, jamais bloqué) puis SMTP
+  if (process.env.BREVO_API_KEY) {
+    try {
+      const br = await fetch('https://api.brevo.com/v3/smtp/email', {
+        method: 'POST',
+        headers: { 'api-key': process.env.BREVO_API_KEY, 'Content-Type': 'application/json', 'accept': 'application/json' },
+        body: JSON.stringify({
+          sender: { name: process.env.BREVO_FROM_NAME || 'VidiGagne', email: process.env.BREVO_FROM_EMAIL || process.env.SMTP_USER },
+          to: [{ email: String(to) }],
+          subject: String(subject),
+          htmlContent: html,
+        }),
+      });
+      if (br.ok) return 'sent';
+    } catch (e) {}
+  }
+  const m = mailer();
+  if (m) {
+    try {
+      await m.sendMail({
+        from: process.env.SMTP_FROM || process.env.SMTP_USER,
+        to: String(to), subject: String(subject), text: textBody || '', html,
+      });
+      return 'sent';
+    } catch (e) {}
+  }
+  return 'failed';
+}
+// v2.33 : e-mail récapitulatif quand un cadeau IMPORTANT est reçu (seuil anti-spam e-mail)
+const GIFT_EMAIL_MIN_COINS = 100;
+async function maybeGiftEmail(destUserId, actorName, g) {
+  try {
+    if (Number(g.cost) < GIFT_EMAIL_MIN_COINS) return;
+    const d = await get1('SELECT email FROM users WHERE id=?', destUserId);
+    if (!d || !d.email) return;
+    const an = String(actorName || 'un fan').replace(/</g, '&lt;');
+    await sendVidiEmail(d.email,
+      '🎁 Gros cadeau reçu sur VidiGagne !',
+      '<p style="font-size:18px">🎁 ' + an + ' t\'a offert <b>' + String(g.emoji || '') + ' ' + String(g.name || '').replace(/</g, '&lt;') + '</b> !</p>'
+      + '<p style="color:#ffd700;font-size:22px;font-weight:800">+' + g.cost + ' 🪙</p>'
+      + '<p style="color:#ccc;font-size:14px">Tes fans te soutiennent — continue à briller ! ✨</p>',
+      an + ' t\'a offert ' + g.name + ' (+' + g.cost + ' pièces) sur VidiGagne !');
+  } catch (_) {}
 }
 // ---------- retraits v2 : moyen enregistré + reçu ----------
 app.post('/api/withdraw', auth, async (req, res) => {
@@ -3967,6 +4810,12 @@ async function scoreForYou(candidates, meId) {
     const mu2 = await get1('SELECT restricted_mode FROM users WHERE id=?', meId);
     restricted = mu2 && Number(mu2.restricted_mode) === 1;
   } catch (_) {}
+  // v2.38 : scores de tags issus des likes (table user_tag_scores) — signal « Pour toi » explicite
+  let tagScores = {};
+  try {
+    const _ts = await allRows('SELECT tag, score FROM user_tag_scores WHERE user_id=?', meId);
+    for (const _r of _ts) tagScores[String(_r.tag).toLowerCase()] = Number(_r.score) || 0;
+  } catch (_) {}
   // affinité créateur : taux de complétion moyen de mes watch_events par créateur
   const creatorRows = await allRows(
     `SELECT v.user_id AS uid, AVG(we.completed) AS r FROM watch_events we
@@ -4032,6 +4881,16 @@ async function scoreForYou(candidates, meId) {
       }
     }
     const followBoost = followedSet.has(Number(v.user_id)) ? 0.3 : 0;
+    // v2.38 : boost des tags likés (signal explicite, plafonné à 1.5)
+    let likeTagBoost = 0;
+    const likeTags = [];
+    if (vtags.length) {
+      for (const t of vtags) {
+        const sc = tagScores[t] || 0;
+        if (sc > 0) { likeTagBoost += Math.min(sc, 10) * 0.15; likeTags.push(t); }
+      }
+      likeTagBoost = Math.min(likeTagBoost, 1.5);
+    }
     const score = 0.35 * affC
       + 0.25 * affTags
       + 0.25 * likeRate
@@ -4039,6 +4898,7 @@ async function scoreForYou(candidates, meId) {
       + countryBoost
       + prefBoost
       + followBoost
+      + likeTagBoost
       - 0.9 * (seen ? 1 : 0);
     // v13 : explication "pourquoi cette vidéo ?" (façon TikTok)
     const why = [];
@@ -4049,6 +4909,7 @@ async function scoreForYou(candidates, meId) {
       why.push('Tags que tu aimes : ' + top.map(t => '#' + t).join(' '));
     }
     if (likeRate > 0.08) why.push('Populaire auprès des spectateurs');
+    if (likeTags.length) why.push('Tu aimes : ' + likeTags.slice(0, 3).map(t => '#' + t).join(' '));
     if (recency > 0.7) why.push('Publiée récemment');
     if (countryBoost > 0) why.push('Ciblée pour ton pays');
     if (seen) why.push('Déjà vue en entier');
@@ -4346,26 +5207,29 @@ app.post('/api/videos/:id/watch-reward', auth, async (req, res) => {
     if (Number(v.user_id) === Number(req.userId)) return res.json({ ok: true, granted: 0, reason: 'self' });
     const day = new Date().toISOString().slice(0, 10);
     const dayStart = new Date().setHours(0, 0, 0, 0);
-    // anti-doublon : une récompense par vidéo par utilisateur par jour
-    const inserted = await runSqlChanges(
-      USE_PG
-        ? 'INSERT INTO watch_rewards(video_id,user_id,day,created_at) VALUES(?,?,?,?) ON CONFLICT DO NOTHING'
-        : 'INSERT OR IGNORE INTO watch_rewards(video_id,user_id,day,created_at) VALUES(?,?,?,?)',
-      v.id, req.userId, day, now());
-    if (!inserted) {
-      const b0 = await get1('SELECT coins FROM users WHERE id=?', req.userId);
-      return res.json({ ok: true, granted: 0, reason: 'already', coins: b0 ? b0.coins : 0 });
-    }
-    const earned = Number((await get1(`SELECT COALESCE(SUM(amount),0) AS s FROM ledger WHERE user_id=? AND amount>0 AND created_at>=?`, req.userId, dayStart)).s);
-    if (earned >= 100) {
-      const b1 = await get1('SELECT coins FROM users WHERE id=?', req.userId);
-      return res.json({ ok: true, granted: 0, reason: 'daily-cap', coins: b1 ? b1.coins : 0 });
-    }
-    const grant = Math.min(10, 100 - earned);
-    await runSql('UPDATE users SET coins=coins+? WHERE id=?', grant, req.userId);
-    await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)', req.userId, grant, 'vidéo regardée #' + v.id, now());
-    const b2 = await get1('SELECT coins FROM users WHERE id=?', req.userId);
-    res.json({ ok: true, granted: grant, coins: b2 ? b2.coins : 0 });
+    // anti-concurrence (2026-10-04) : la section "anti-doublon → lecture du compteur
+    // journalier → crédit" doit être atomique par utilisateur. Sans sérialisation,
+    // N requêtes simultanées lisent le même compteur et dépassent le plafond 100/jour
+    // (TOCTOU sur `earned` — avéré sur Postgres où les requêtes s'intercalent).
+    const out = await withUserLock(req.userId, async () => {
+      // anti-doublon : une récompense par vidéo par utilisateur par jour
+      const inserted = await runSqlChanges(
+        USE_PG
+          ? 'INSERT INTO watch_rewards(video_id,user_id,day,created_at) VALUES(?,?,?,?) ON CONFLICT DO NOTHING'
+          : 'INSERT OR IGNORE INTO watch_rewards(video_id,user_id,day,created_at) VALUES(?,?,?,?)',
+        v.id, req.userId, day, now());
+      if (!inserted) return { granted: 0, reason: 'already' };
+      const earned = Number((await get1(`SELECT COALESCE(SUM(amount),0) AS s FROM ledger WHERE user_id=? AND amount>0 AND created_at>=?`, req.userId, dayStart)).s);
+      if (earned >= 100) return { granted: 0, reason: 'daily-cap' };
+      const grant = Math.min(10, 100 - earned);
+      await runSql('UPDATE users SET coins=coins+? WHERE id=?', grant, req.userId);
+      await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)', req.userId, grant, 'vidéo regardée #' + v.id, now());
+      return { granted: grant, reason: '' };
+    });
+    const b = await get1('SELECT coins FROM users WHERE id=?', req.userId);
+    const resp = { ok: true, granted: out.granted, coins: b ? b.coins : 0 };
+    if (out.reason) resp.reason = out.reason;
+    res.json(resp);
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 
@@ -4378,6 +5242,16 @@ app.post('/api/videos/:id/like', auth, async (req, res) => {
     await insertIgnore('INSERT OR IGNORE INTO likes(user_id,video_id,created_at) VALUES(?,?,?)',
       req.userId, v.id, now());
     if (!alreadyLiked) await notify(v.user_id, 'like', req.userId, v.id, '');
+    // v2.38 : signal « Pour toi » — un like frais incrémente les scores des tags de la vidéo
+    if (!alreadyLiked) {
+      try {
+        const _lts = tagsOf(v).slice(0, 12);
+        for (const _t of _lts) {
+          await runSql('INSERT INTO user_tag_scores(user_id,tag,score) VALUES(?,?,1) ON CONFLICT(user_id,tag) DO UPDATE SET score=user_tag_scores.score+1',
+            req.userId, _t);
+        }
+      } catch (_e) { console.error('TAG_SCORE_ERR', _e.message); }
+    }
     // +1 pièce au créateur quand quelqu'un aime (plafond 100/jour, une seule fois par liker/vidéo)
     const dayStart = new Date().setHours(0, 0, 0, 0);
     const firstReward = await runSqlChanges(
@@ -4385,13 +5259,19 @@ app.post('/api/videos/:id/like', auth, async (req, res) => {
         ? 'INSERT INTO like_rewards(liker_id,video_id,created_at) VALUES(?,?,?) ON CONFLICT DO NOTHING'
         : 'INSERT OR IGNORE INTO like_rewards(liker_id,video_id,created_at) VALUES(?,?,?)',
       req.userId, v.id, now());
-    const earned = Number((await get1(
-      `SELECT COALESCE(SUM(amount),0) AS s FROM ledger
-       WHERE user_id=? AND reason LIKE 'like reçu%' AND created_at>=?`, v.user_id, dayStart)).s);
-    if (firstReward && Number(v.user_id) !== Number(req.userId) && earned < 100) {
-      await runSql('UPDATE users SET coins=coins+1 WHERE id=?', v.user_id);
-      await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
-        v.user_id, 1, 'like reçu vidéo #' + v.id, now());
+    // anti-concurrence (2026-10-04) : +1 pièce au créateur, plafond 100/jour —
+    // lecture+vérification+crédit sérialisés par créateur (TOCTOU sinon).
+    if (firstReward && Number(v.user_id) !== Number(req.userId)) {
+      await withUserLock(v.user_id, async () => {
+        const earned = Number((await get1(
+          `SELECT COALESCE(SUM(amount),0) AS s FROM ledger
+           WHERE user_id=? AND reason LIKE 'like reçu%' AND created_at>=?`, v.user_id, dayStart)).s);
+        if (earned < 100) {
+          await runSql('UPDATE users SET coins=coins+1 WHERE id=?', v.user_id);
+          await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
+            v.user_id, 1, 'like reçu vidéo #' + v.id, now());
+        }
+      });
     }
     const likes = Number((await get1('SELECT COUNT(*) AS c FROM likes WHERE video_id=?', v.id)).c);
     res.json({ likes, liked: true });
@@ -4400,6 +5280,15 @@ app.post('/api/videos/:id/like', auth, async (req, res) => {
 
 app.delete('/api/videos/:id/like', auth, async (req, res) => {
   await runSql('DELETE FROM likes WHERE user_id=? AND video_id=?', req.userId, req.params.id);
+  // v2.38 : unlike → décrémente les scores de tags « Pour toi » (plancher 0)
+  try {
+    const _uv = await get1('SELECT tags FROM videos WHERE id=?', req.params.id);
+    const _uts = tagsOf({ tags: _uv && _uv.tags }).slice(0, 12);
+    for (const _t of _uts) {
+      await runSql('UPDATE user_tag_scores SET score=CASE WHEN score>1 THEN score-1 ELSE 0 END WHERE user_id=? AND tag=?',
+        req.userId, _t);
+    }
+  } catch (_) {}
   const likes = Number((await get1('SELECT COUNT(*) AS c FROM likes WHERE video_id=?', req.params.id)).c);
   res.json({ likes, liked: false });
 });
@@ -4418,6 +5307,14 @@ app.post('/api/videos/:id/download', auth, async (req, res) => {
   try {
     const v = await get1('SELECT * FROM videos WHERE id=?', req.params.id);
     if (!v) return res.status(404).json({ error: 'vidéo introuvable' });
+    // v2.39 : application du réglage users.download_privacy du PROPRIÉTAIRE (everyone/friends/nobody)
+    if (Number(v.user_id) !== Number(req.userId)) {
+      const ow = await get1('SELECT download_privacy FROM users WHERE id=?', v.user_id);
+      const pol = (ow && ow.download_privacy) || 'everyone';
+      if (pol === 'nobody') return res.status(403).json({ error: 'téléchargement désactivé par le créateur' });
+      if (pol === 'friends' && !(await areFriends(req.userId, v.user_id)))
+        return res.status(403).json({ error: 'téléchargement réservé aux amis' });
+    }
     await runSql('UPDATE videos SET downloads=COALESCE(downloads,0)+1 WHERE id=?', v.id);
     const vj = await get1('SELECT downloads FROM videos WHERE id=?', v.id);
     res.json({ ok: true, downloads: Number(vj.downloads) || 0 });
@@ -4495,9 +5392,13 @@ app.get('/api/videos/:id/comments', async (req, res) => {
 
 app.post('/api/videos/:id/comments', auth, uploadMedia.fields([{name:'video',maxCount:1},{name:'audio',maxCount:1}]), async (req, res) => {
   try {
-    let text = String((req.body || {}).text || '').trim().slice(0, 500);
+    const rawText = String((req.body || {}).text || '').trim().slice(0, 500);
+    // v2.39 : scan du texte BRUT avant masquage — maskBadwords effaçait les mots graves
+    // (détectés ensuite sur un texte déjà masqué : le scan ne trouvait plus rien)
+    const badC = scanBanned(rawText);
     // v1.68 : filtre anti-gros mots automatique — masque au lieu de bloquer
-    text = maskBadwords(text);
+    let text = maskBadwords(rawText);
+    if (badC) text = rawText; // contenu en attente : l'admin doit voir le texte réel
     const hasAudio=req.files&&req.files.audio&&req.files.audio[0];
     const hasVideo=req.files&&req.files.video&&req.files.video[0];
     if (!text&&!hasAudio&&!hasVideo) return res.status(400).json({ error: 'commentaire vide' });
@@ -4543,26 +5444,29 @@ app.post('/api/videos/:id/comments', auth, uploadMedia.fields([{name:'video',max
     const id = await insertId(
       'INSERT INTO comments(video_id,user_id,text,reply_to,video_url,audio_url,created_at) VALUES(?,?,?,?,?,?,?)',
       req.params.id, req.userId, text, replyTo, videoUrl, audioUrl, now());
-    // modération auto V3 : scan du texte (sans IA externe)
-    const badC = scanBanned(text);
+    // modération auto V3 : scan du texte (sans IA externe) — v2.39 : scan fait sur le texte brut plus haut
     if (badC) {
       await runSql(`UPDATE comments SET review_status='pending' WHERE id=?`, id);
       await flagForReview('comment', id, 'mot interdit : ' + badC);
+      await modFlag('comment', id, 'mot interdit : ' + badC); // v2.39 : file mod_queue
     }
     const c = await get1(
       `SELECT c.*, u.username, u.name, u.avatar FROM comments c
        JOIN users u ON u.id=c.user_id WHERE c.id=?`, id);
-    await notify(v.user_id, 'comment', req.userId, v.id, text.slice(0, 100), id); // v2.31 : comment_id → ouvre le commentaire exact
-    // FIX 2026-10-04 (rupture #5): notifier l'auteur du commentaire parent en cas de réponse
-    if (replyTo) {
-      try {
-        const parentC = await get1('SELECT user_id FROM comments WHERE id=?', replyTo);
-        if (parentC && Number(parentC.user_id) !== Number(req.userId) && Number(parentC.user_id) !== Number(v.user_id))
-          await notify(parentC.user_id, 'reply', req.userId, v.id, text.slice(0, 100), id); // v2.31 : id de la réponse → ouvre le fil
-      } catch (_) {}
+    // v2.39 : un commentaire en attente de moderation n'est ni notifie ni pousse
+    if (!badC) {
+      await notify(v.user_id, 'comment', req.userId, v.id, text.slice(0, 100), id);
+      // FIX 2026-10-04 (rupture #5): notifier l'auteur du commentaire parent en cas de réponse
+      if (replyTo) {
+        try {
+          const parentC = await get1('SELECT user_id FROM comments WHERE id=?', replyTo);
+          if (parentC && Number(parentC.user_id) !== Number(req.userId) && Number(parentC.user_id) !== Number(v.user_id))
+            await notify(parentC.user_id, 'reply', req.userId, v.id, text.slice(0, 100), id);
+        } catch (_) {}
+      }
+      notifyMentions(text, req.userId, v.id, id);
     }
-    notifyMentions(text, req.userId, v.id, id); // v1.84 : notifie les @mentionnés
-    res.json({ comment: c, filtered: !!kwHidden });
+    res.json({ comment: c, filtered: !!kwHidden, pending_review: !!badC });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 
@@ -4647,7 +5551,9 @@ app.get('/api/conversations/:id/messages', auth, async (req, res) => {
       : await allRows('SELECT * FROM messages WHERE conversation_id=? ORDER BY id DESC LIMIT 50', c.id);
     rows.reverse(); // ordre chronologique
     res.json({ messages: rows.map(function (m) {
-      return { id: m.id, sender_id: m.sender_id, text: m.text, audio_url: m.audio_url || '', created_at: Number(m.created_at) };
+      return { id: m.id, sender_id: m.sender_id, text: m.text, audio_url: m.audio_url || '',
+        image_url: m.image_url || '', video_url: m.video_url || '',
+        deleted_for_all: Number(m.deleted_for_all || 0), created_at: Number(m.created_at) };
     }) });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
@@ -4681,11 +5587,13 @@ app.post('/api/conversations/:id/messages', auth, async (req, res) => {
     }
     const text = String((req.body || {}).text || '').trim().slice(0, 2000);
     const audioUrl = String((req.body || {}).audio_url || '').slice(0, 500); // v1.57 : message vocal
-    if (!text && !audioUrl) return res.status(400).json({ error: 'message vide' });
+    const imageUrl = String((req.body || {}).image_url || '').slice(0, 500); // v2.38 : message image
+    const videoUrl = String((req.body || {}).video_url || '').slice(0, 500); // v2.38 : message vidéo
+    if (!text && !audioUrl && !imageUrl && !videoUrl) return res.status(400).json({ error: 'message vide' });
     const t = now();
     const id = await insertId(
-      'INSERT INTO messages(conversation_id,sender_id,text,audio_url,created_at) VALUES(?,?,?,?,?)',
-      c.id, req.userId, text, audioUrl, t);
+      'INSERT INTO messages(conversation_id,sender_id,text,audio_url,image_url,video_url,created_at) VALUES(?,?,?,?,?,?,?)',
+      c.id, req.userId, text, audioUrl, imageUrl, videoUrl, t);
     await runSql('UPDATE conversations SET updated_at=? WHERE id=?', t, c.id);
     // l'expéditeur a lu son propre message
     await insertIgnore('INSERT OR IGNORE INTO conversation_reads(conversation_id,user_id,last_read_at) VALUES(?,?,?)',
@@ -4695,6 +5603,72 @@ app.post('/api/conversations/:id/messages', auth, async (req, res) => {
     await notify(otherId, 'message', req.userId, null, text.slice(0, 100));
     const m = await get1('SELECT * FROM messages WHERE id=?', id);
     res.json({ message: { id: m.id, sender_id: m.sender_id, text: m.text, created_at: Number(m.created_at) } });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// v2.38 : supprimer un message pour tous (expéditeur uniquement)
+app.delete('/api/messages/:id', auth, async (req, res) => {
+  try {
+    const m = await get1('SELECT * FROM messages WHERE id=?', req.params.id);
+    if (!m) return res.status(404).json({ error: 'message introuvable' });
+    if (Number(m.sender_id) !== Number(req.userId)) return res.status(403).json({ error: 'non autorisé' });
+    await runSql('UPDATE messages SET deleted_for_all=1, text=?, audio_url=?, image_url=?, video_url=? WHERE id=?',
+      '', '', '', '', m.id);
+    await runSql('DELETE FROM message_reactions WHERE message_id=?', m.id);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// v2.38 : réagir à un message (emoji)
+app.post('/api/messages/:id/react', auth, async (req, res) => {
+  try {
+    const m = await get1('SELECT * FROM messages WHERE id=?', req.params.id);
+    if (!m) return res.status(404).json({ error: 'message introuvable' });
+    const c = await convOf(m.conversation_id, req.userId);
+    if (!c) return res.status(403).json({ error: 'non autorisé' });
+    const emoji = String((req.body || {}).emoji || '').trim().slice(0, 8);
+    if (!emoji) return res.status(400).json({ error: 'emoji requis' });
+    const t = now();
+    if (USE_PG) {
+      await pool.query(`INSERT INTO message_reactions(message_id,user_id,emoji,created_at) VALUES($1,$2,$3,$4)
+        ON CONFLICT(message_id,user_id) DO UPDATE SET emoji=$3, created_at=$4`, [m.id, req.userId, emoji, t]);
+    } else {
+      await runSql(`INSERT INTO message_reactions(message_id,user_id,emoji,created_at) VALUES(?,?,?,?)
+        ON CONFLICT(message_id,user_id) DO UPDATE SET emoji=excluded.emoji, created_at=excluded.created_at`,
+        m.id, req.userId, emoji, t);
+    }
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// v2.38 : retirer sa réaction
+app.delete('/api/messages/:id/react', auth, async (req, res) => {
+  try {
+    const m = await get1('SELECT * FROM messages WHERE id=?', req.params.id);
+    if (!m) return res.status(404).json({ error: 'message introuvable' });
+    await runSql('DELETE FROM message_reactions WHERE message_id=? AND user_id=?', m.id, req.userId);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// v2.38 : réactions d'un message
+app.get('/api/messages/:id/reactions', auth, async (req, res) => {
+  try {
+    const m = await get1('SELECT * FROM messages WHERE id=?', req.params.id);
+    if (!m) return res.status(404).json({ error: 'message introuvable' });
+    const c = await convOf(m.conversation_id, req.userId);
+    if (!c) return res.status(403).json({ error: 'non autorisé' });
+    const rows = await allRows('SELECT user_id, emoji FROM message_reactions WHERE message_id=?', m.id);
+    res.json({ reactions: rows });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// v2.38 : rechercher dans une conversation
+app.get('/api/conversations/:id/search', auth, async (req, res) => {
+  try {
+    const c = await convOf(req.params.id, req.userId);
+    if (!c) return res.status(404).json({ error: 'conversation introuvable' });
+    const q = String(req.query.q || '').trim().slice(0, 100);
+    if (!q) return res.status(400).json({ error: 'requête vide' });
+    const rows = await allRows(`SELECT id, sender_id, text, created_at FROM messages
+      WHERE conversation_id=? AND deleted_for_all=0 AND text LIKE ? ORDER BY id DESC LIMIT 30`,
+      c.id, '%' + q.replace(/[%_]/g, '') + '%');
+    res.json({ results: rows.map(r => ({ id: r.id, sender_id: r.sender_id, text: r.text, created_at: Number(r.created_at) })) });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 // marquer une conversation comme lue
@@ -4796,6 +5770,16 @@ app.post('/api/admin/users/:id/verify', async (req, res) => {
     if (!u) return res.status(404).json({ error: 'utilisateur introuvable' });
     const v = (req.body || {}).verified ? 1 : 0;
     await runSql('UPDATE users SET verified=? WHERE id=?', v, u.id);
+    // v2.33 : notifie (in-app + push FCM) + e-mail de verdict badge (admin)
+    await notify(u.id, 'badge', null, null,
+      v ? '✔️ Ton compte est maintenant vérifié !' : '✔️ Ton badge vérifié a été retiré.');
+    if (u.email) sendVidiEmail(u.email,
+      v ? '✔️ Badge vérifié obtenu — VidiGagne' : '✔️ Badge vérifié retiré — VidiGagne',
+      '<p style="font-size:18px">' + (v ? '✔️ Compte vérifié !' : '✔️ Badge retiré') + '</p>'
+      + '<p style="color:#ccc;font-size:14px">' + (v
+        ? 'Félicitations @' + String(u.username).replace(/</g, '&lt;') + ' ! Ton badge bleu apparaît désormais à côté de ton pseudo.'
+        : 'Ton badge vérifié a été retiré par notre équipe. Si tu penses qu\'il s\'agit d\'une erreur, contacte le support.') + '</p>',
+      v ? 'Ton compte VidiGagne est maintenant vérifié.' : 'Ton badge vérifié VidiGagne a été retiré.').catch(() => {});
     const upd = await get1('SELECT * FROM users WHERE id=?', u.id);
     res.json({ user: pubUser(upd) });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
@@ -4837,6 +5821,22 @@ app.post('/api/admin/withdrawals/:id/approve', async (req, res) => {
     const t = now();
     await runSql('UPDATE withdrawals SET status=?, decided_at=? WHERE id=?', 'paid', t, w.id);
     await runSql('UPDATE receipts SET status=? WHERE withdrawal_id=?', 'paid', w.id);
+    // v2.33 : notifie (in-app + push FCM) + e-mail de confirmation de paiement
+    await notify(w.user_id, 'withdrawal', null, null,
+      '✅ Ton retrait de ' + w.coins + ' 🪙 (≈ $' + w.usd + ') via ' + w.method + ' a été payé.');
+    {
+      const wu = await get1('SELECT email, username FROM users WHERE id=?', w.user_id);
+      if (wu && wu.email) sendVidiEmail(wu.email,
+        '💸 Ton retrait VidiGagne a été payé',
+        '<p style="font-size:18px">💸 Retrait payé !</p>'
+        + '<p style="color:#ccc;font-size:14px">Félicitations @' + String(wu.username).replace(/</g, '&lt;') + ' !</p>'
+        + '<p style="color:#ffd700;font-size:22px;font-weight:800">' + w.coins + ' 🪙 (≈ $' + w.usd + ')</p>'
+        + '<p style="color:#ccc;font-size:14px">Moyen : ' + String(w.method).replace(/</g, '&lt;')
+        + '<br>Compte : ' + String(w.account || '').replace(/</g, '&lt;') + '</p>'
+        + '<p style="color:#999;font-size:12px">Continue à créer et à gagner sur VidiGagne ! ✨</p>',
+        'Ton retrait VidiGagne de ' + w.coins + ' pièces (≈ $' + w.usd + ') via ' + w.method + ' a été payé.')
+        .catch(() => {});
+    }
     res.json({ ok: true, id: w.id, status: 'paid' });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
@@ -4853,6 +5853,21 @@ app.post('/api/admin/withdrawals/:id/reject', async (req, res) => {
       w.user_id, w.coins, 'remboursement retrait #' + w.id + ' rejeté', t);
     await runSql('UPDATE withdrawals SET status=?, decided_at=? WHERE id=?', 'rejected', t, w.id);
     await runSql('UPDATE receipts SET status=? WHERE withdrawal_id=?', 'rejected', w.id);
+    // v2.33 : notifie (in-app + push FCM) + e-mail de rejet avec mention du remboursement
+    await notify(w.user_id, 'withdrawal', null, null,
+      '❌ Ton retrait de ' + w.coins + ' 🪙 a été rejeté. Les pièces ont été recréditées sur ton compte.');
+    {
+      const wu = await get1('SELECT email, username FROM users WHERE id=?', w.user_id);
+      if (wu && wu.email) sendVidiEmail(wu.email,
+        '❌ Ton retrait VidiGagne a été rejeté',
+        '<p style="font-size:18px">❌ Retrait rejeté</p>'
+        + '<p style="color:#ccc;font-size:14px">Ton retrait de <b>' + w.coins + ' 🪙</b> via ' + String(w.method).replace(/</g, '&lt;')
+        + ' n\'a pas pu être traité par notre équipe.</p>'
+        + '<p style="color:#4ade80;font-size:14px">✅ Bonne nouvelle : tes <b>' + w.coins + ' pièces</b> ont été recréditées sur ton compte.</p>'
+        + '<p style="color:#999;font-size:12px">Vérifie ton moyen de paiement et réessaie, ou contacte le support.</p>',
+        'Ton retrait VidiGagne de ' + w.coins + ' pièces a été rejeté. Tes pièces ont été recréditées sur ton compte.')
+        .catch(() => {});
+    }
     res.json({ ok: true, id: w.id, status: 'rejected', refunded: w.coins });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
@@ -4967,6 +5982,17 @@ app.post('/api/admin/announce', async (req, res) => {
         n++;
       } catch (_) {}
     }
+    // v2.33 : push FCM de masse en arrière-plan (par vagues ~50/s, sans bloquer la réponse ;
+    // en mode test les envois sont stubbés mais l'appel est journalisé pour le bot)
+    (async () => {
+      try {
+        const targets = await allRows("SELECT id FROM users WHERE fcm_token IS NOT NULL AND fcm_token != ''");
+        for (const tg of targets) {
+          try { await sendFcmPush(tg.id, title || 'VidiGagne', text, { type: 'system', announce: '1' }); } catch (_) {}
+          await new Promise(r => setTimeout(r, 20));
+        }
+      } catch (_) {}
+    })();
     res.json({ ok: true, sent: n });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
@@ -5021,23 +6047,182 @@ app.post('/api/admin/reports/:id/review', adminAuth, async (req, res) => {
     if (!['dismiss', 'hide_video', 'suspend_user'].includes(action))
       return res.status(400).json({ error: 'action invalide' });
     if (action === 'dismiss') {
-      await runSql("UPDATE reports SET status='dismissed' WHERE id=?", r.id);
+      await runSql("UPDATE reports SET status='dismissed', action='dismiss' WHERE id=?", r.id);
     } else if (action === 'hide_video') {
       if (r.target_type === 'video') await runSql('UPDATE videos SET hidden=1 WHERE id=?', r.target_id);
       else if (r.target_type === 'comment') await runSql('DELETE FROM comments WHERE id=?', r.target_id);
       else if (r.target_type === 'message') await runSql('DELETE FROM messages WHERE id=?', r.target_id);
       else if (r.target_type === 'user') await runSql('UPDATE videos SET hidden=1 WHERE user_id=?', r.target_id);
-      await runSql("UPDATE reports SET status='resolved' WHERE id=?", r.id);
+      await runSql("UPDATE reports SET status='resolved', action='hide_video' WHERE id=?", r.id);
     } else if (action === 'suspend_user') {
       const author = await reportAuthor(r);
       if (author) await runSql('UPDATE users SET suspended=1 WHERE id=?', author.id);
-      await runSql("UPDATE reports SET status='resolved' WHERE id=?", r.id);
+      await runSql("UPDATE reports SET status='resolved', action='suspend_user' WHERE id=?", r.id);
     }
+    // v2.33 : prévient le signaleur (e-mail + notif/push) et le compte suspendu (e-mail + notif/push)
+    try {
+      const rep = await get1('SELECT id, email, username FROM users WHERE id=?', r.reporter_id);
+      const actionFr = action === 'dismiss' ? 'classé sans suite'
+        : action === 'hide_video' ? 'validé — le contenu signalé a été retiré'
+        : 'validé — le compte fautif a été suspendu';
+      if (rep) {
+        await notify(rep.id, 'report', null, null, '🛡️ Ton signalement a été traité : ' + actionFr + '.');
+        if (rep.email) sendVidiEmail(rep.email,
+          '🛡️ Ton signalement a été traité — VidiGagne',
+          '<p style="font-size:18px">🛡️ Merci pour ton signalement</p>'
+          + '<p style="color:#ccc;font-size:14px">Notre équipe a examiné ton signalement : il a été <b>' + actionFr + '</b>.</p>'
+          + '<p style="color:#999;font-size:12px">Merci de contribuer à une communauté saine. ✨</p>',
+          'Ton signalement VidiGagne a été traité : ' + actionFr + '.').catch(() => {});
+      }
+      if (action === 'suspend_user') {
+        const sus = await reportAuthor(r);
+        if (sus) {
+          await notify(sus.id, 'security', null, null, '🚫 Ton compte a été suspendu suite à un signalement validé.');
+          if (sus.email) sendVidiEmail(sus.email,
+            '🚫 Compte suspendu — VidiGagne',
+            '<p style="font-size:18px">🚫 Compte suspendu</p>'
+            + '<p style="color:#ccc;font-size:14px">Ton compte VidiGagne a été suspendu suite à un signalement validé par notre équipe.</p>'
+            + '<p style="color:#999;font-size:12px">Si tu penses qu\'il s\'agit d\'une erreur, contacte le support VidiGagne.</p>',
+            'Ton compte VidiGagne a été suspendu.').catch(() => {});
+        }
+      }
+    } catch (_) {}
     res.json({ ok: true, action });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 
-// ---------- collections ----------
+// ---------- appels contre une sanction (v2.39) ----------
+// Un compte suspendu doit pouvoir contester : auth sans le blocage "suspendu"
+async function authSoft(req, res, next) {
+  const h = req.headers.authorization || '';
+  const m = h.match(/^Bearer (.+)$/);
+  if (!m) return res.status(401).json({ error: 'token requis' });
+  const row = await get1('SELECT t.user_id, t.created_at FROM tokens t WHERE t.token=?', m[1]);
+  if (!row) return res.status(401).json({ error: 'token invalide' });
+  if (Number(row.created_at) < now() - 90 * 86400000) {
+    await runSql('DELETE FROM tokens WHERE token=?', m[1]);
+    return res.status(401).json({ error: 'session expirée' });
+  }
+  req.userId = row.user_id;
+  req.token = m[1];
+  next();
+}
+// sanction résolue visant cet utilisateur ?
+function sanctionLabel(r) {
+  if (r.action === 'suspend_user') return '🚫 Compte suspendu';
+  if (r.action === 'hide_video') {
+    if (r.target_type === 'video') return '🙈 Vidéo #' + r.target_id + ' masquée';
+    if (r.target_type === 'user') return '🙈 Vidéos du compte masquées';
+    return '🙈 Contenu supprimé (' + r.target_type + ' #' + r.target_id + ')';
+  }
+  return r.action || 'sanction';
+}
+app.post('/api/appeals', authSoft, async (req, res) => {
+  try {
+    const report_id = Number((req.body || {}).report_id) || 0;
+    const reason = String((req.body || {}).reason || '').trim().slice(0, 500);
+    if (!report_id) return res.status(400).json({ error: 'signalement requis' });
+    if (reason.length < 3) return res.status(400).json({ error: 'explique pourquoi tu contestes (3 caractères min)' });
+    const r = await get1('SELECT * FROM reports WHERE id=?', report_id);
+    if (!r) return res.status(404).json({ error: 'signalement introuvable' });
+    if (r.status !== 'resolved' || !['hide_video', 'suspend_user'].includes(r.action))
+      return res.status(400).json({ error: 'aucune sanction à contester sur ce signalement' });
+    const author = await reportAuthor(r);
+    if (!author || Number(author.id) !== Number(req.userId))
+      return res.status(403).json({ error: 'cette sanction ne te concerne pas' });
+    const dup = await get1("SELECT id FROM appeals WHERE report_id=? AND status IN ('pending','upheld','overturned')", report_id);
+    if (dup) return res.status(409).json({ error: 'un appel existe déjà pour cette sanction' });
+    const id = await insertId(
+      'INSERT INTO appeals(user_id,report_id,reason,status,created_at) VALUES(?,?,?,?,?)',
+      req.userId, report_id, reason, 'pending', now());
+    res.json({ ok: true, id });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.get('/api/appeals/mine', authSoft, async (req, res) => {
+  try {
+    const rows = await allRows(
+      `SELECT a.*, r.target_type, r.target_id, r.action, r.reason AS report_reason, r.created_at AS sanction_at
+       FROM appeals a JOIN reports r ON r.id=a.report_id
+       WHERE a.user_id=? ORDER BY a.created_at DESC`, req.userId);
+    const appeals = rows.map(a => ({
+      id: a.id, report_id: a.report_id, reason: a.reason, status: a.status,
+      created_at: Number(a.created_at), decided_at: a.decided_at ? Number(a.decided_at) : null,
+      sanction: sanctionLabel(a),
+    }));
+    // sanctions en cours (signalements résolus avec sanction me visant)
+    const srows = await allRows(
+      `SELECT * FROM reports WHERE status='resolved' AND action IN ('hide_video','suspend_user') ORDER BY created_at DESC LIMIT 200`);
+    const sanctions = [];
+    for (const sr of srows) {
+      const author = await reportAuthor(sr);
+      if (author && Number(author.id) === Number(req.userId)) {
+        const ap = await get1('SELECT id, status FROM appeals WHERE report_id=? ORDER BY id DESC LIMIT 1', sr.id);
+        sanctions.push({
+          report_id: sr.id, label: sanctionLabel(sr), action: sr.action,
+          target_type: sr.target_type, target_id: sr.target_id,
+          created_at: Number(sr.created_at),
+          appeal_id: ap ? ap.id : null, appeal_status: ap ? ap.status : null,
+        });
+      }
+    }
+    res.json({ appeals, sanctions });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.get('/api/admin/appeals', adminAuth, async (req, res) => {
+  try {
+    const status = String(req.query.status || 'pending');
+    if (!['pending', 'upheld', 'overturned'].includes(status))
+      return res.status(400).json({ error: 'statut invalide' });
+    const rows = await allRows(
+      `SELECT a.*, u.username, r.target_type, r.target_id, r.action
+       FROM appeals a JOIN users u ON u.id=a.user_id JOIN reports r ON r.id=a.report_id
+       WHERE a.status=? ORDER BY a.created_at DESC LIMIT 100`, status);
+    res.json({ appeals: rows.map(a => ({ ...a, created_at: Number(a.created_at),
+      decided_at: a.decided_at ? Number(a.decided_at) : null, sanction: sanctionLabel(a) })) });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.post('/api/admin/appeals/:id/review', adminAuth, async (req, res) => {
+  try {
+    const a = await get1('SELECT * FROM appeals WHERE id=?', req.params.id);
+    if (!a) return res.status(404).json({ error: 'appel introuvable' });
+    if (a.status !== 'pending') return res.status(409).json({ error: 'appel déjà traité' });
+    const action = String((req.body || {}).action || '');
+    if (!['uphold', 'overturn'].includes(action))
+      return res.status(400).json({ error: 'action invalide' });
+    const r = await get1('SELECT * FROM reports WHERE id=?', a.report_id);
+    if (action === 'overturn') {
+      // lève la sanction
+      if (r && r.action === 'suspend_user') {
+        const author = await reportAuthor(r);
+        if (author) await runSql('UPDATE users SET suspended=0 WHERE id=?', author.id);
+      } else if (r && r.action === 'hide_video') {
+        if (r.target_type === 'video') await runSql("UPDATE videos SET hidden=0, review_status='ok' WHERE id=?", r.target_id);
+        else if (r.target_type === 'user') await runSql("UPDATE videos SET hidden=0, review_status='ok' WHERE user_id=?", r.target_id);
+        // commentaire/message : supprimés définitivement, rien à restaurer
+      }
+      await runSql("UPDATE appeals SET status='overturned', decided_at=? WHERE id=?", now(), a.id);
+      try {
+        await notify(a.user_id, 'system', null, null, '✅ Appel accepté : ta sanction a été levée. Merci de ta patience.');
+        const ue = await get1('SELECT email FROM users WHERE id=?', a.user_id);
+        if (ue && ue.email) sendVidiEmail(ue.email, '✅ Appel accepté — VidiGagne',
+          '<p style="font-size:18px">✅ Bonne nouvelle !</p>'
+          + '<p style="color:#ccc;font-size:14px">Après réexamen, ta sanction a été <b>levée</b>. Ton compte / contenu est de nouveau actif.</p>',
+          'Ton appel VidiGagne a été accepté : la sanction est levée.').catch(() => {});
+      } catch (_) {}
+    } else {
+      await runSql("UPDATE appeals SET status='upheld', decided_at=? WHERE id=?", now(), a.id);
+      try {
+        await notify(a.user_id, 'system', null, null, '📝 Appel examiné : la sanction est maintenue.');
+        const ue = await get1('SELECT email FROM users WHERE id=?', a.user_id);
+        if (ue && ue.email) sendVidiEmail(ue.email, '📝 Appel examiné — VidiGagne',
+          '<p style="font-size:18px">📝 Appel examiné</p>'
+          + '<p style="color:#ccc;font-size:14px">Après réexamen, la sanction est <b>maintenue</b>. Merci de respecter les règles de la communauté.</p>',
+          'Ton appel VidiGagne a été examiné : la sanction est maintenue.').catch(() => {});
+      } catch (_) {}
+    }
+    res.json({ ok: true, action });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
 async function collOf(id, userId) {
   const c = await get1('SELECT * FROM collections WHERE id=?', id);
   if (!c) return null;
@@ -5231,6 +6416,11 @@ async function sendFcmPush(userId, title, body, data) {
   try {
     const u = await get1('SELECT fcm_token FROM users WHERE id=?', userId);
     if (!u || !u.fcm_token) return { sent: false, reason: 'no_token' };
+    // v2.33 : journalise la tentative (le bot de test vérifie l'appel, pas l'envoi réel)
+    _pushAttempts.push({ user_id: Number(userId), title: String(title).slice(0, 100),
+      body: String(body).slice(0, 200), at: Date.now() });
+    if (_pushAttempts.length > 500) _pushAttempts.shift();
+    if (VG_TEST_HOOKS) return { sent: false, reason: 'stubbed' };
     // Firebase Admin SDK (nécessite GOOGLE_APPLICATION_CREDENTIALS sur Render)
     if (!_fcmAdmin) {
       try { _fcmAdmin = require('firebase-admin'); } catch (_) { return { sent: false, reason: 'admin_sdk_missing' }; }
@@ -5508,16 +6698,219 @@ app.post('/api/follow/:username', auth, async (req, res) => {
   const u = await get1('SELECT * FROM users WHERE username=?', String(req.params.username).toLowerCase());
   if (!u) return res.status(404).json({ error: 'utilisateur introuvable' });
   if (Number(u.id) === Number(req.userId)) return res.status(400).json({ error: 'impossible de se suivre soi-même' });
+  // v2.40 : compte privé → demande de suivi au lieu d'abonnement direct
+  if (Number(u.is_private) === 1) {
+    const already = await get1('SELECT 1 FROM follows WHERE follower_id=? AND followed_id=?', req.userId, u.id);
+    if (already) return res.json({ following: true });
+    await insertIgnore('INSERT OR IGNORE INTO follow_requests(requester_id,target_id,created_at) VALUES(?,?,?)',
+      req.userId, u.id, now());
+    await notify(u.id, 'follow_request', req.userId, null, '');
+    return res.json({ following: false, requested: true });
+  }
   await insertIgnore('INSERT OR IGNORE INTO follows(follower_id,followed_id,created_at) VALUES(?,?,?)',
     req.userId, u.id, now());
   await notify(u.id, 'follow', req.userId, null, '');
+  // v2.40 : badge preuve sociale — 1000 abonnés
+  try {
+    const c = await get1('SELECT COUNT(*) AS n FROM follows WHERE followed_id=?', u.id);
+    if (c && Number(c.n) >= 1000) {
+      await insertIgnore('INSERT OR IGNORE INTO user_badges(user_id,badge,awarded_at) VALUES(?,?,?)', u.id, 'rising_star', now());
+    }
+  } catch (e) {}
   res.json({ following: true });
+});
+
+// v2.40 : demandes de suivi (comptes privés)
+app.get('/api/follow-requests', auth, async (req, res) => {
+  const rows = await allRows(`SELECT fr.requester_id, fr.created_at, u.username, u.avatar, u.bio FROM follow_requests fr JOIN users u ON u.id=fr.requester_id WHERE fr.target_id=? ORDER BY fr.created_at DESC`, req.userId);
+  res.json({ requests: rows });
+});
+app.post('/api/follow-requests/:userId/accept', auth, async (req, res) => {
+  const rid = Number(req.params.userId);
+  const fr = await get1('SELECT * FROM follow_requests WHERE requester_id=? AND target_id=?', rid, req.userId);
+  if (!fr) return res.status(404).json({ error: 'demande introuvable' });
+  await insertIgnore('INSERT OR IGNORE INTO follows(follower_id,followed_id,created_at) VALUES(?,?,?)', rid, req.userId, now());
+  await runSql('DELETE FROM follow_requests WHERE requester_id=? AND target_id=?', rid, req.userId);
+  await notify(rid, 'follow_accepted', req.userId, null, '');
+  res.json({ ok: true });
+});
+app.post('/api/follow-requests/:userId/reject', auth, async (req, res) => {
+  const rid = Number(req.params.userId);
+  await runSql('DELETE FROM follow_requests WHERE requester_id=? AND target_id=?', rid, req.userId);
+  res.json({ ok: true });
+});
+
+// v2.40 : masquer une suggestion d'ami ("ne plus suggérer")
+app.post('/api/friends/suggestions/:userId/hide', auth, async (req, res) => {
+  const hid = Number(req.params.userId);
+  if (hid && hid !== Number(req.userId)) {
+    await insertIgnore('INSERT OR IGNORE INTO suggestion_hidden(user_id,hidden_id,created_at) VALUES(?,?,?)',
+      req.userId, hid, now());
+  }
+  res.json({ ok: true });
+});
+
+// v2.40 : badges gagnés par l'utilisateur
+app.get('/api/me/badges', auth, async (req, res) => {
+  const rows = await allRows('SELECT badge, awarded_at FROM user_badges WHERE user_id=? ORDER BY awarded_at DESC', req.userId);
+  const defs = {
+    rising_star: { icon: '🌟', name: 'Étoile montante', desc: '1000 abonnés atteints' },
+    verified: { icon: '✓', name: 'Vérifié', desc: 'Compte vérifié par VidiGagne' },
+    creator: { icon: '🎬', name: 'Créateur', desc: '10 vidéos publiées' },
+    generous: { icon: '🎁', name: 'Généreux', desc: '100 cadeaux envoyés' },
+  };
+  res.json({ badges: rows.map(r => Object.assign({ badge: r.badge, awarded_at: r.awarded_at }, defs[r.badge] || { icon: '🏅', name: r.badge, desc: '' })) });
 });
 
 app.delete('/api/follow/:username', auth, async (req, res) => {
   const u = await get1('SELECT * FROM users WHERE username=?', String(req.params.username).toLowerCase());
   if (u) await runSql('DELETE FROM follows WHERE follower_id=? AND followed_id=?', req.userId, u.id);
   res.json({ following: false });
+});
+
+// ---------- graphe social : suggestions d'amis ----------
+app.get('/api/friends/suggestions', auth, async (req, res) => {
+  try {
+    const me = req.userId;
+    // 1) amis d'amis : suivis par mes abonnements, que je ne suis pas encore
+    const fof = await allRows(
+      `SELECT u.id, u.username, u.avatar, u.bio, MIN(v.username) AS via
+       FROM follows f1
+       JOIN follows f2 ON f2.follower_id=f1.followed_id
+       JOIN users u ON u.id=f2.followed_id
+       JOIN users v ON v.id=f1.followed_id
+       LEFT JOIN follows mf ON mf.follower_id=? AND mf.followed_id=u.id
+       LEFT JOIN blocks b1 ON b1.user_id=? AND b1.blocked_id=u.id
+       LEFT JOIN blocks b2 ON b2.user_id=u.id AND b2.blocked_id=?
+       LEFT JOIN suggestion_hidden sh ON sh.user_id=? AND sh.hidden_id=u.id
+       WHERE f1.follower_id=? AND u.id<>? AND mf.followed_id IS NULL
+         AND b1.blocked_id IS NULL AND b2.user_id IS NULL AND sh.hidden_id IS NULL
+         AND (u.suspended IS NULL OR u.suspended=0)
+         AND (u.discoverable IS NULL OR u.discoverable=1)
+       GROUP BY u.id, u.username, u.avatar, u.bio
+       LIMIT 20`, me, me, me, me, me, me);
+    // 2) intérêts communs (préférences de contenu 'more')
+    const intr = await allRows(
+      `SELECT u.id, u.username, u.avatar, u.bio, GROUP_CONCAT(DISTINCT cp2.topic) AS topics
+       FROM content_prefs cp1
+       JOIN content_prefs cp2 ON cp2.topic=cp1.topic AND cp2.pref='more' AND cp2.user_id<>?
+       JOIN users u ON u.id=cp2.user_id
+       LEFT JOIN follows mf ON mf.follower_id=? AND mf.followed_id=u.id
+       LEFT JOIN blocks b1 ON b1.user_id=? AND b1.blocked_id=u.id
+       LEFT JOIN blocks b2 ON b2.user_id=u.id AND b2.blocked_id=?
+       LEFT JOIN suggestion_hidden sh ON sh.user_id=? AND sh.hidden_id=u.id
+       WHERE cp1.user_id=? AND cp1.pref='more'
+         AND mf.followed_id IS NULL AND b1.blocked_id IS NULL AND b2.user_id IS NULL AND sh.hidden_id IS NULL
+         AND (u.suspended IS NULL OR u.suspended=0)
+         AND (u.discoverable IS NULL OR u.discoverable=1)
+       GROUP BY u.id, u.username, u.avatar, u.bio
+       LIMIT 20`, me, me, me, me, me, me);
+    const seen = new Set(), out = [];
+    for (const r of fof) {
+      seen.add(Number(r.id));
+      out.push({ id: Number(r.id), username: r.username, avatar: r.avatar || '🙂', bio: r.bio || '',
+        reason: 'suivi par @' + (r.via || '') });
+    }
+    for (const r of intr) {
+      if (seen.has(Number(r.id))) continue;
+      seen.add(Number(r.id));
+      out.push({ id: Number(r.id), username: r.username, avatar: r.avatar || '🙂', bio: r.bio || '',
+        reason: 'mêmes intérêts' + (r.topics ? ' : ' + String(r.topics).split(',').slice(0, 3).join(', ') : '') });
+    }
+    res.json({ ok: true, suggestions: out.slice(0, 20) });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+
+// ---------- graphe social : amis communs ----------
+app.get('/api/users/:username/mutual', auth, async (req, res) => {
+  try {
+    const u = await get1('SELECT * FROM users WHERE username=?', String(req.params.username).toLowerCase());
+    if (!u) return res.status(404).json({ error: 'utilisateur introuvable' });
+    if (Number(u.id) === Number(req.userId)) return res.json({ ok: true, mutual: [], count: 0 });
+    const rows = await allRows(
+      `SELECT u.id, u.username, u.avatar
+       FROM follows f1
+       JOIN follows f2 ON f2.followed_id=f1.followed_id
+       JOIN users u ON u.id=f1.followed_id
+       WHERE f1.follower_id=? AND f2.follower_id=?
+         AND (u.suspended IS NULL OR u.suspended=0)
+       ORDER BY u.username LIMIT 100`, req.userId, u.id);
+    res.json({ ok: true, count: rows.length,
+      mutual: rows.map(r => ({ id: Number(r.id), username: r.username, avatar: r.avatar || '🙂' })) });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+
+// ---------- graphe social : synchronisation des contacts ----------
+app.post('/api/contacts/sync', auth, async (req, res) => {
+  try {
+    const list = (req.body || {}).contacts;
+    if (!Array.isArray(list)) return res.status(400).json({ error: 'contacts requis' });
+    const found = [], seenH = new Set();
+    for (const c of list.slice(0, 500)) {
+      const h = String((c && (c.phone_hash || c.phoneHash)) || '').trim();
+      if (!h || seenH.has(h)) continue;
+      seenH.add(h);
+      const nm = String((c && c.name) || '').slice(0, 80);
+      const u = await get1("SELECT id, username, avatar FROM users WHERE phone_hash=? AND phone_hash<>''", h);
+      if (u && Number(u.id) !== Number(req.userId)) {
+        found.push({ user_id: Number(u.id), username: u.username, avatar: u.avatar || '🙂', name: nm });
+      } else if (!u) {
+        // trace l'invitation potentielle (contact sans compte)
+        try { await insertIgnore('INSERT OR IGNORE INTO contact_invites(user_id,phone_hash,name,created_at) VALUES(?,?,?,?)',
+          req.userId, h, nm, now()); } catch (_) {}
+      }
+    }
+    res.json({ ok: true, found, found_count: found.length, total: list.length });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+
+// ---------- graphe social : invitations personnalisées ----------
+// v2.32 : lien d'invitation personnalisé (code unique, attribution +50/+50 à l'inscription)
+app.post('/api/invites', auth, async (req, res) => {
+  try {
+    const label = String((req.body || {}).label || '').slice(0, 60);
+    let code = null;
+    for (let i = 0; i < 20 && !code; i++) {
+      const c = genRefCode();
+      if (!(await get1('SELECT 1 FROM invites WHERE code=?', c)) && !(await get1('SELECT 1 FROM users WHERE ref_code=?', c))) code = c;
+    }
+    if (!code) return res.status(500).json({ error: 'réessaie' });
+    const id = await insertId('INSERT INTO invites(user_id,code,label,status,created_at) VALUES(?,?,?,?,?)',
+      req.userId, code, label, 'pending', now());
+    const me = await get1('SELECT username FROM users WHERE id=?', req.userId);
+    const base = (req.protocol + '://' + req.get('host')).replace(/\/$/, '');
+    res.json({ ok: true, id: Number(id), code, label, link: base + '/invite/' + code,
+      inviter: me ? me.username : '' });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+
+app.get('/api/invites/mine', auth, async (req, res) => {
+  try {
+    const rows = await allRows(
+      `SELECT i.id, i.code, i.label, i.status, i.invited_user_id, i.created_at, u.username AS invited_username
+       FROM invites i LEFT JOIN users u ON u.id=i.invited_user_id
+       WHERE i.user_id=? ORDER BY i.created_at DESC LIMIT 100`, req.userId);
+    res.json({ ok: true, invites: rows.map(r => ({
+      id: Number(r.id), code: r.code, label: r.label || '',
+      status: r.status === 'inscrit' ? 'inscrit' : 'en attente',
+      invited_username: r.invited_username || null, created_at: Number(r.created_at) })) });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+
+// page d'accueil du lien d'invitation
+app.get('/invite/:code', async (req, res) => {
+  try {
+    const inv = await get1('SELECT i.*, u.username AS inviter FROM invites i JOIN users u ON u.id=i.user_id WHERE UPPER(i.code)=?',
+      String(req.params.code).toUpperCase());
+    if (!inv) return res.status(404).send("<h1>Lien d'invitation invalide</h1>");
+    const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    res.send('<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>VidiGagne — invitation</title></head>'
+      + '<body style="font-family:sans-serif;text-align:center;padding:40px;background:#0b0b0b;color:#fff"><h1>🎬 VidiGagne</h1>'
+      + '<p><b>@' + esc(inv.inviter) + "</b> t'invite à rejoindre VidiGagne !</p>"
+      + '<p>Télécharge l\u2019app, inscris-toi et entre le code :</p>'
+      + '<p style="font-size:32px;letter-spacing:4px;color:#f5c518"><b>' + esc(inv.code) + '</b></p>'
+      + '<p style="color:#888">Vous gagnez chacun +50 pièces 🪙</p></body></html>');
+  } catch (e) { res.status(500).send('erreur'); }
 });
 
 app.get('/api/users/:username', async (req, res) => {
@@ -5538,6 +6931,17 @@ app.get('/api/users/:username', async (req, res) => {
         return res.json({ user: pubUser(u), followers, following: 0, total_likes: 0, videos: [], private: true });
       }
     }
+    // v2.37 : enregistre la vue de profil (viewer authentifié, pas soi-même, max 1x/heure par couple).
+    // Placé APRÈS le contrôle compte privé : un profil privé visité par un non-abonné n'est pas enregistré.
+    if (meId && Number(meId) !== Number(u.id)) {
+      try {
+        const pv = await get1('SELECT viewed_at FROM profile_views WHERE viewer_id=? AND viewed_id=?', meId, u.id);
+        if (!pv || (now() - Number(pv.viewed_at)) >= 3600000) {
+          await runSql(`INSERT INTO profile_views(viewer_id,viewed_id,viewed_at) VALUES(?,?,?)
+            ON CONFLICT(viewer_id,viewed_id) DO UPDATE SET viewed_at=EXCLUDED.viewed_at`, meId, u.id, now());
+        }
+      } catch (e) {}
+    }
     const vids = await allRows(
       'SELECT * FROM videos WHERE user_id=? AND hidden=0 AND (scheduled_at IS NULL OR scheduled_at <= ?) ORDER BY created_at DESC', u.id, now());
     const followers = Number((await get1('SELECT COUNT(*) AS c FROM follows WHERE followed_id=?', u.id)).c);
@@ -5549,6 +6953,26 @@ app.get('/api/users/:username', async (req, res) => {
       if (await canSeeVideo(v, meId)) { const j = await videoJSON(v, null); if (j) videos.push(j); }
     }
     res.json({ user: pubUser(u), followers, following, total_likes: likes, videos });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+
+// ---------- v2.37 : historique des vues de profil ----------
+// Qui a vu mon profil : viewers récents (ordre décroissant, limite 50)
+app.get('/api/me/profile-views', auth, async (req, res) => {
+  try {
+    const rows = await allRows(
+      `SELECT u.id, u.username, u.avatar, pv.viewed_at FROM profile_views pv
+       JOIN users u ON u.id=pv.viewer_id
+       WHERE pv.viewed_id=? ORDER BY pv.viewed_at DESC LIMIT 50`, req.userId);
+    res.json({ ok: true, views: rows.map(r => ({
+      id: r.id, username: r.username, avatar: r.avatar, viewed_at: Number(r.viewed_at) })) });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// Effacer l'historique des vues de mon profil
+app.delete('/api/me/profile-views', auth, async (req, res) => {
+  try {
+    await runSql('DELETE FROM profile_views WHERE viewed_id=?', req.userId);
+    res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 
@@ -5723,8 +7147,17 @@ app.get('/api/search', async (req, res) => {
     const users = await allRows(
       'SELECT id,username,name,avatar FROM users WHERE username LIKE ? OR name LIKE ? LIMIT 20', q, q);
     const vf = visFilter('videos', meId);
+    // v2.37 : filtres de recherche (sort=recent|popular, min_duration, max_duration en secondes)
+    const sort = String(req.query.sort || 'recent');
+    const orderBy = sort === 'popular' ? 'ORDER BY views DESC' : 'ORDER BY created_at DESC';
+    const minD = Math.max(0, Number(req.query.min_duration) || 0);
+    const maxD = Number(req.query.max_duration) || 0;
+    let durClause = '';
+    const durParams = [];
+    if (minD > 0) { durClause += ' AND duration>=?'; durParams.push(minD); }
+    if (maxD > 0) { durClause += ' AND duration<=?'; durParams.push(maxD); }
     const vids = await allRows(
-      'SELECT * FROM videos WHERE (LOWER(description) LIKE ? OR LOWER(tags) LIKE ?) AND (scheduled_at IS NULL OR scheduled_at <= ?) AND hidden=0' + vf.clause + ' ORDER BY created_at DESC LIMIT 20', q, q, now(), ...vf.params);
+      'SELECT * FROM videos WHERE (LOWER(description) LIKE ? OR LOWER(tags) LIKE ?) AND (scheduled_at IS NULL OR scheduled_at <= ?) AND hidden=0' + durClause + vf.clause + ' ' + orderBy + ' LIMIT 20', q, q, now(), ...durParams, ...vf.params);
     const videos = [];
     for (const v of vids) { const j = await videoJSON(v, null); if (j) videos.push(j); }
     res.json({ users, videos });
@@ -5959,6 +7392,13 @@ app.get('/api/stories/feed', async (req, res) => {
 
 // ---------- live : chat, viewers, signalisation WebRTC, cadeaux, stats ----------
 async function liveById(id) { return get1('SELECT * FROM lives WHERE id=?', id); }
+// v2.33 : l'hôte ou un modérateur du live
+async function isLiveModerator(l, userId) {
+  if (!l || !userId) return false;
+  if (Number(l.user_id) === Number(userId)) return true;
+  const m = await get1('SELECT 1 FROM live_moderators WHERE live_id=? AND user_id=?', l.id, userId);
+  return !!m;
+}
 async function liveViewersCount(liveId) {
   const r = await get1('SELECT COUNT(*) AS c FROM live_viewers WHERE live_id=? AND updated_at>?', liveId, now() - 35000);
   return Number(r.c);
@@ -6102,6 +7542,211 @@ app.get('/api/live', async (req, res) => {
   for (const r of rows) lives.push(liveJSON(r, r, await liveViewersCount(r.id)));
   res.json({ lives });
 });
+// ==================== v2.38 : LIVES PROGRAMMÉS ====================
+app.post('/api/live/schedule', auth, async (req, res) => {
+  try {
+    const b = req.body || {};
+    const title = String(b.title || '').slice(0, 100);
+    const scheduledAt = Math.floor(Number(b.scheduled_at));
+    if (!title) return res.status(400).json({ error: 'titre requis' });
+    if (!scheduledAt || scheduledAt <= now()) return res.status(400).json({ error: 'date future requise' });
+    if (scheduledAt > now() + 30 * 86400000) return res.status(400).json({ error: 'max 30 jours' });
+    const id = await insertId('INSERT INTO live_scheduled(user_id,title,scheduled_at,created_at) VALUES(?,?,?,?)',
+      req.userId, title, scheduledAt, now());
+    // notifier les abonnés
+    const followers = await allRows('SELECT follower_id FROM follows WHERE followed_id=?', req.userId);
+    const me = await get1('SELECT username FROM users WHERE id=?', req.userId);
+    for (const f of (followers || [])) {
+      await insertId('INSERT INTO notifications(user_id,type,actor_id,text,title,is_read,created_at) VALUES(?,?,?,?,?,0,?)',
+        f.follower_id, 'live_scheduled', req.userId, '@' + (me ? me.username : '?') + ' prévoit un live : ' + title, '📅 Live programmé', now());
+    }
+    res.json({ ok: true, id, notified: (followers || []).length });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.get('/api/live/scheduled', auth, async (req, res) => {
+  try {
+    const rows = await allRows(`SELECT s.*, u.username FROM live_scheduled s JOIN users u ON u.id=s.user_id
+      WHERE s.cancelled=0 AND s.scheduled_at > ? AND (s.user_id=? OR s.user_id IN (SELECT followed_id FROM follows WHERE follower_id=?))
+      ORDER BY s.scheduled_at ASC LIMIT 50`, now(), req.userId, req.userId);
+    res.json({ ok: true, scheduled: rows || [] });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.delete('/api/live/scheduled/:id', auth, async (req, res) => {
+  try {
+    const s = await get1('SELECT * FROM live_scheduled WHERE id=?', req.params.id);
+    if (!s) return res.status(404).json({ error: 'introuvable' });
+    if (Number(s.user_id) !== Number(req.userId)) return res.status(403).json({ error: 'non autorisé' });
+    await runSql('UPDATE live_scheduled SET cancelled=1 WHERE id=?', req.params.id);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// ==================== v2.38 : TOURNOIS PK ====================
+app.post('/api/pk/tournament', auth, async (req, res) => {
+  try {
+    const b = req.body || {};
+    const title = String(b.title || '').slice(0, 100) || 'Tournoi PK';
+    const reward = Math.floor(Number(b.reward_coins)) || 0;
+    if (reward > 0) {
+      const debited = await runSqlChanges('UPDATE users SET coins=coins-? WHERE id=? AND coins>=?', reward, req.userId, reward);
+      if (!debited) return res.status(400).json({ error: 'pas assez de pièces pour la récompense' });
+      await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)', req.userId, -reward, 'cagnotte tournoi PK', now());
+    }
+    const id = await insertId('INSERT INTO pk_tournaments(creator_id,title,reward_coins,created_at) VALUES(?,?,?,?)',
+      req.userId, title, reward, now());
+    // le créateur est le premier participant (demi-finale 1, joueur 1)
+    await runSql('INSERT INTO pk_matches(tournament_id,round,player1_id,status,created_at) VALUES(?,?,?,?,?)',
+      id, 'semi1', req.userId, 'waiting', now());
+    res.json({ ok: true, id });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.post('/api/pk/tournament/:id/join', auth, async (req, res) => {
+  try {
+    const t = await get1('SELECT * FROM pk_tournaments WHERE id=?', req.params.id);
+    if (!t) return res.status(404).json({ error: 'tournoi introuvable' });
+    if (t.status !== 'open') return res.status(403).json({ error: 'tournoi fermé' });
+    const existing = await get1('SELECT id FROM pk_matches WHERE tournament_id=? AND (player1_id=? OR player2_id=?)',
+      req.params.id, req.userId, req.userId);
+    if (existing) return res.status(400).json({ error: 'déjà inscrit' });
+    // remplir les places : semi1.p2, semi2.p1, semi2.p2
+    const m1 = await get1("SELECT * FROM pk_matches WHERE tournament_id=? AND round='semi1'", req.params.id);
+    const m2 = await get1("SELECT * FROM pk_matches WHERE tournament_id=? AND round='semi2'", req.params.id);
+    if (m1 && !m1.player2_id) {
+      await runSql('UPDATE pk_matches SET player2_id=?, status=? WHERE id=?', req.userId, 'ready', m1.id);
+    } else if (!m2) {
+      await runSql("INSERT INTO pk_matches(tournament_id,round,player1_id,status,created_at) VALUES(?,'semi2',?,'waiting',?)",
+        req.params.id, req.userId, now());
+    } else if (!m2.player2_id) {
+      await runSql('UPDATE pk_matches SET player2_id=?, status=? WHERE id=?', req.userId, 'ready', m2.id);
+      await runSql('UPDATE pk_tournaments SET status=? WHERE id=?', 'running', req.params.id);
+    } else {
+      return res.status(400).json({ error: 'tournoi complet (4 joueurs)' });
+    }
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.get('/api/pk/tournament/:id', auth, async (req, res) => {
+  try {
+    const t = await get1('SELECT * FROM pk_tournaments WHERE id=?', req.params.id);
+    if (!t) return res.status(404).json({ error: 'tournoi introuvable' });
+    const matches = await allRows('SELECT m.*, u1.username AS p1_name, u2.username AS p2_name FROM pk_matches m LEFT JOIN users u1 ON u1.id=m.player1_id LEFT JOIN users u2 ON u2.id=m.player2_id WHERE m.tournament_id=? ORDER BY m.id', req.params.id);
+    res.json({ ok: true, tournament: t, matches: matches || [] });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.post('/api/pk/tournament/:id/match', auth, async (req, res) => {
+  try {
+    const t = await get1('SELECT * FROM pk_tournaments WHERE id=?', req.params.id);
+    if (!t) return res.status(404).json({ error: 'tournoi introuvable' });
+    if (Number(t.creator_id) !== Number(req.userId)) return res.status(403).json({ error: 'seul le créateur' });
+    const b = req.body || {};
+    const m = await get1('SELECT * FROM pk_matches WHERE id=? AND tournament_id=?', b.match_id, req.params.id);
+    if (!m) return res.status(404).json({ error: 'match introuvable' });
+    const winner = Number(b.winner_id);
+    if (winner !== Number(m.player1_id) && winner !== Number(m.player2_id))
+      return res.status(400).json({ error: 'gagnant invalide' });
+    await runSql('UPDATE pk_matches SET winner_id=?, player1_score=?, player2_score=?, status=? WHERE id=?',
+      winner, Math.floor(Number(b.score1)) || 0, Math.floor(Number(b.score2)) || 0, 'done', m.id);
+    // si demi-finale terminée → alimenter la finale
+    if (m.round === 'semi1' || m.round === 'semi2') {
+      const s1 = await get1("SELECT * FROM pk_matches WHERE tournament_id=? AND round='semi1' AND status='done'", req.params.id);
+      const s2 = await get1("SELECT * FROM pk_matches WHERE tournament_id=? AND round='semi2' AND status='done'", req.params.id);
+      if (s1 && s2) {
+        const fin = await get1("SELECT id FROM pk_matches WHERE tournament_id=? AND round='final'", req.params.id);
+        if (!fin) {
+          await runSql("INSERT INTO pk_matches(tournament_id,round,player1_id,player2_id,status,created_at) VALUES(?,'final',?,?,?,?)",
+            req.params.id, s1.winner_id, s2.winner_id, 'ready', now());
+        }
+      }
+    }
+    // si finale terminée → clôturer le tournoi + récompense
+    if (m.round === 'final') {
+      await runSql('UPDATE pk_tournaments SET status=?, winner_id=?, finished_at=? WHERE id=?', 'done', winner, now(), req.params.id);
+      if (Number(t.reward_coins) > 0) {
+        await runSql('UPDATE users SET coins=coins+? WHERE id=?', t.reward_coins, winner);
+        await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
+          winner, t.reward_coins, '🏆 victoire tournoi PK #' + t.id, now());
+        await insertId('INSERT INTO notifications(user_id,type,actor_id,text,title,is_read,created_at) VALUES(?,?,?,?,?,0,?)',
+          winner, 'pk_win', t.creator_id, 'Tu as remporté le tournoi "' + t.title + '" ! +' + t.reward_coins + ' pièces', '🏆 Victoire !', now());
+      }
+    }
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// ==================== v2.38 : REVANCHE PK ====================
+app.post('/api/live/:id/pk/rematch', auth, async (req, res) => {
+  try {
+    const l = await liveById(req.params.id);
+    if (!l) return res.status(404).json({ error: 'live introuvable' });
+    if (l.ended_at) return res.status(403).json({ error: 'live terminé' });
+    if (Number(l.user_id) !== Number(req.userId)) return res.status(403).json({ error: 'seul l\'hôte' });
+    const b = req.body || {};
+    const opponentId = Number(b.opponent_id);
+    if (!opponentId) return res.status(400).json({ error: 'adversaire requis' });
+    // vérifier qu'il y a eu un PK précédent entre ces deux joueurs (dans les 24h)
+    const prevPk = await get1(`SELECT * FROM live_signals WHERE kind='pk_result' AND live_id IN
+      (SELECT id FROM lives WHERE user_id IN (?,?)) AND created_at > ? ORDER BY id DESC LIMIT 1`,
+      req.userId, opponentId, now() - 86400000);
+    const rematchId = await insertId(`INSERT INTO live_signals(live_id,to_user_id,from_user_id,kind,payload,created_at)
+      VALUES(?,?,?,?,?,?)`, l.id, opponentId, req.userId, 'pk_rematch',
+      JSON.stringify({ prev_pk: prevPk ? prevPk.id : null, at: now() }), now());
+    res.json({ ok: true, rematch_id: rematchId, had_previous: !!prevPk });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// ==================== v2.38 : Q&R LIVE ====================
+app.post('/api/live/:id/qa', auth, async (req, res) => {
+  try {
+    const l = await liveById(req.params.id);
+    if (!l) return res.status(404).json({ error: 'live introuvable' });
+    if (Number(l.user_id) !== Number(req.userId)) return res.status(403).json({ error: 'seul l\'hôte' });
+    const mode = (req.body || {}).enabled ? 1 : 0;
+    await runSql('UPDATE lives SET qa_mode=? WHERE id=?', mode, l.id);
+    res.json({ ok: true, qa_mode: mode });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.post('/api/live/:id/questions', auth, async (req, res) => {
+  try {
+    const l = await liveById(req.params.id);
+    if (!l) return res.status(404).json({ error: 'live introuvable' });
+    if (l.ended_at) return res.status(403).json({ error: 'live terminé' });
+    const q = String((req.body || {}).question || '').slice(0, 300);
+    if (!q) return res.status(400).json({ error: 'question requise' });
+    const me = await get1('SELECT username FROM users WHERE id=?', req.userId);
+    const id = await insertId('INSERT INTO live_questions(live_id,user_id,username,question,created_at) VALUES(?,?,?,?,?)',
+      l.id, req.userId, me ? me.username : '?', q, now());
+    res.json({ ok: true, id });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.get('/api/live/:id/questions', auth, async (req, res) => {
+  try {
+    const l = await liveById(req.params.id);
+    if (!l) return res.status(404).json({ error: 'live introuvable' });
+    const qs = await allRows('SELECT * FROM live_questions WHERE live_id=? ORDER BY likes DESC, created_at ASC LIMIT 100', l.id);
+    res.json({ ok: true, qa_mode: Number(l.qa_mode) || 0, questions: qs || [] });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.post('/api/live/:id/questions/:qid/answer', auth, async (req, res) => {
+  try {
+    const l = await liveById(req.params.id);
+    if (!l) return res.status(404).json({ error: 'live introuvable' });
+    if (Number(l.user_id) !== Number(req.userId)) return res.status(403).json({ error: 'seul l\'hôte' });
+    const a = String((req.body || {}).answer || '').slice(0, 500);
+    await runSql('UPDATE live_questions SET answer=?, answered_at=? WHERE id=? AND live_id=?', a, now(), req.params.qid, l.id);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// ==================== v2.38 : EFFET EN DIRECT ====================
+app.post('/api/live/:id/effect', auth, async (req, res) => {
+  try {
+    const l = await liveById(req.params.id);
+    if (!l) return res.status(404).json({ error: 'live introuvable' });
+    if (Number(l.user_id) !== Number(req.userId)) return res.status(403).json({ error: 'seul l\'hôte' });
+    const effect = String((req.body || {}).effect || '').slice(0, 50);
+    await runSql('UPDATE lives SET current_effect=? WHERE id=?', effect, l.id);
+    // signaler aux viewers via live_signals
+    await insertId(`INSERT INTO live_signals(live_id,from_user_id,kind,payload,created_at) VALUES(?,?,?, ?,?)`,
+      l.id, req.userId, 'effect', JSON.stringify({ effect }), now());
+    res.json({ ok: true, effect });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
 app.get('/api/live/:id', async (req, res) => {
   const l = await liveById(req.params.id);
   if (!l) return res.status(404).json({ error: 'live introuvable' });
@@ -6211,6 +7856,9 @@ app.post('/api/live/:id/chat', auth, async (req, res) => {
     const raw = String((req.body || {}).text || '').trim();
     if (!raw) return res.status(400).json({ error: 'message vide' });
     if (raw.length > 280) return res.status(400).json({ error: 'message trop long (280 caractères max)' });
+    // v2.33 : un utilisateur banni ou en sourdine ne peut plus écrire dans le chat du live
+    const bk = await get1('SELECT kind FROM live_bans WHERE live_id=? AND user_id=?', l.id, req.userId);
+    if (bk) return res.status(403).json({ error: bk.kind === 'mute' ? 'tu es en sourdine sur ce live' : 'tu es banni de ce live' });
     const text = raw;
     const id = await insertId('INSERT INTO live_chat(live_id,user_id,text,created_at) VALUES(?,?,?,?)',
       l.id, req.userId, text, now());
@@ -6223,9 +7871,10 @@ app.get('/api/live/:id/chat', async (req, res) => {
   if (!l) return res.status(404).json({ error: 'live introuvable' });
   const since = Number(req.query.since) || 0;
   const rows = await allRows(
-    'SELECT c.id, c.text, c.created_at, u.id AS uid, u.username, u.name, u.avatar, u.verified FROM live_chat c JOIN users u ON u.id=c.user_id WHERE c.live_id=? AND c.id>? ORDER BY c.id ASC LIMIT 50',
+    // v2.33 : les messages épinglés remontent en premier (pinned=1), puis ordre chronologique
+    'SELECT c.id, c.text, c.created_at, COALESCE(c.pinned,0) AS pinned, u.id AS uid, u.username, u.name, u.avatar, u.verified FROM live_chat c JOIN users u ON u.id=c.user_id WHERE c.live_id=? AND c.id>? ORDER BY c.pinned DESC, c.id ASC LIMIT 50',
     l.id, since);
-  res.json({ messages: rows.map(r => ({ id: r.id, text: r.text, created_at: Number(r.created_at),
+  res.json({ messages: rows.map(r => ({ id: r.id, text: r.text, created_at: Number(r.created_at), pinned: Number(r.pinned) || 0,
     user: pubUser({ id: r.uid, username: r.username, name: r.name, avatar: r.avatar, verified: r.verified }) })) });
 });
 app.post('/api/live/:id/heartbeat', auth, async (req, res) => {
@@ -6317,6 +7966,7 @@ app.post('/api/live/:id/gift', auth, async (req, res) => {
       req.userId, toUserId, null, l.id, g.id, g.cost, now());
     await runSql('UPDATE lives SET gifts_total=COALESCE(gifts_total,0)+? WHERE id=?', split.creatorShare, l.id).catch(() => {});
     await notify(toUserId, 'gift', req.userId, null, g.emoji + ' ' + g.name + ' (+' + g.cost + ')'); // v2.31 : montant inclus
+    await maybeGiftEmail(toUserId, me.username, g); // v2.33 : e-mail si gros cadeau (≥100 🪙)
     res.json({ ok: true, coins: me.coins - g.cost, to_user_id: toUserId });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
@@ -6693,7 +8343,24 @@ app.get('/api/users/:username/subscription', auth, async (req, res) => {
   if (!u) return res.status(404).json({ error: 'utilisateur introuvable' });
   const s = await get1('SELECT * FROM creator_subs WHERE creator_id=? AND subscriber_id=? AND active=1 AND expires_at>? ORDER BY expires_at DESC',
     u.id, req.userId, now());
-  res.json({ subscription: s ? { active: true, expires_at: Number(s.expires_at), price_coins: Number(s.price_coins) } : { active: false } });
+  // FIX 2026-10-04 (bot chain-subscription) : l'UI (paintCrSub/openSubSettings) attend
+  // enabled/price/subscribed — avant, seul {subscription} était renvoyé et le bouton « S'abonner »
+  // ne s'affichait jamais. On garde {subscription} pour compatibilité.
+  const price = Math.max(10, Math.min(100000, Math.floor(Number(u.sub_price) || 0)));
+  const enabled = Number(u.sub_enabled) === 1 && price > 0;
+  res.json({ enabled, price, subscribed: !!s,
+    subscription: s ? { active: true, expires_at: Number(s.expires_at), price_coins: Number(s.price_coins) } : { active: false } });
+});
+// v2.36 : désabonnement d'un créateur (fin de période, sans remboursement — standard des abonnements)
+app.delete('/api/users/:username/subscribe', auth, async (req, res) => {
+  try {
+    const u = await get1('SELECT * FROM users WHERE username=?', String(req.params.username).toLowerCase());
+    if (!u) return res.status(404).json({ error: 'utilisateur introuvable' });
+    const s = await get1('SELECT * FROM creator_subs WHERE creator_id=? AND subscriber_id=? AND active=1', u.id, req.userId);
+    if (!s) return res.status(404).json({ error: 'aucun abonnement actif' });
+    await runSql('UPDATE creator_subs SET active=0 WHERE id=?', s.id);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 // désactive les abonnements expirés (toutes les 24 h)
 async function expireSubs() {
@@ -6727,6 +8394,13 @@ async function flagForReview(itemType, itemId, reason) {
   try {
     await runSql(`INSERT INTO review_queue(item_type,item_id,reason,status,created_at) VALUES(?,?,?,'pending',?)`,
       itemType, itemId, String(reason || '').slice(0, 200), now());
+  } catch (e) {}
+}
+// v2.39 : file de modération auto (mod_queue) — parallèle à review_queue, avec actions admin dédiées
+async function modFlag(targetType, targetId, reason) {
+  try {
+    await runSql(`INSERT INTO mod_queue(target_type,target_id,reason,status,created_at) VALUES(?,?,?,'pending',?)`,
+      targetType, targetId, String(reason || '').slice(0, 200), now());
   } catch (e) {}
 }
 
@@ -6849,7 +8523,6 @@ async function shopSearch(req, res) {
   const rows = await allRows(sql, ...params);
   res.json({ products: rows.map(productJSON) });
 }
-app.get('/api/shop/search', shopSearch);
 // alias utilisé par l'app (mêmes paramètres)
 app.get('/api/shop/products', shopSearch);
 
@@ -7004,6 +8677,100 @@ app.get('/api/shop/sales', auth, async (req, res) => {
      LEFT JOIN users u ON u.id=o.buyer_id
      WHERE oi.seller_id=? ORDER BY o.created_at DESC LIMIT 100`, req.userId);
   res.json({ sales: items });
+});
+
+// ---------- boutique : avis produits ----------
+// Table créée par migration (voir initDb) : shop_reviews(id, product_id, user_id, rating, comment, created_at)
+app.get('/api/shop/products/:id/reviews', async (req, res) => {
+  try {
+    const rows = await allRows(
+      `SELECT r.*, u.username FROM shop_reviews r LEFT JOIN users u ON u.id=r.user_id WHERE r.product_id=? ORDER BY r.created_at DESC LIMIT 50`,
+      Number(req.params.id));
+    const avg = await get1('SELECT COALESCE(AVG(rating),0) AS a, COUNT(*) AS c FROM shop_reviews WHERE product_id=?', Number(req.params.id));
+    res.json({ reviews: rows, average: Math.round(Number(avg.a) * 10) / 10, count: Number(avg.c) });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.post('/api/shop/products/:id/reviews', auth, async (req, res) => {
+  try {
+    const pid = Number(req.params.id);
+    const rating = Math.max(1, Math.min(5, Math.floor(Number((req.body || {}).rating))));
+    const comment = String((req.body || {}).comment || '').slice(0, 500);
+    if (!rating) return res.status(400).json({ error: 'note requise (1 à 5)' });
+    const prod = await get1('SELECT id FROM products WHERE id=?', pid);
+    if (!prod) return res.status(404).json({ error: 'produit introuvable' });
+    // l'acheteur doit avoir acheté le produit
+    const bought = await get1(
+      `SELECT 1 FROM order_items oi JOIN orders o ON o.id=oi.order_id WHERE oi.product_id=? AND o.buyer_id=? LIMIT 1`,
+      pid, req.userId);
+    if (!bought) return res.status(403).json({ error: 'achetez le produit pour le noter' });
+    const ex = await get1('SELECT id FROM shop_reviews WHERE product_id=? AND user_id=?', pid, req.userId);
+    if (ex) {
+      await runSql('UPDATE shop_reviews SET rating=?, comment=?, created_at=? WHERE id=?', rating, comment, now(), ex.id);
+      res.json({ ok: true, updated: true, id: ex.id });
+    } else {
+      const id = await insertId('INSERT INTO shop_reviews(product_id,user_id,rating,comment,created_at) VALUES(?,?,?,?,?)',
+        pid, req.userId, rating, comment, now());
+      res.json({ ok: true, id });
+    }
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+
+// ---------- boutique : remboursements ----------
+// Table : shop_refunds(id, order_id, buyer_id, seller_id, reason, status, created_at, decided_at)
+app.post('/api/shop/orders/:id/refund', auth, async (req, res) => {
+  try {
+    const order = await get1('SELECT * FROM orders WHERE id=? AND buyer_id=?', Number(req.params.id), req.userId);
+    if (!order) return res.status(404).json({ error: 'commande introuvable' });
+    if (order.status === 'refunded') return res.status(400).json({ error: 'déjà remboursée' });
+    const ex = await get1("SELECT id FROM shop_refunds WHERE order_id=? AND status='pending'", order.id);
+    if (ex) return res.status(409).json({ error: 'demande déjà en cours' });
+    const item = await get1('SELECT seller_id FROM order_items WHERE order_id=? LIMIT 1', order.id);
+    const id = await insertId(
+      'INSERT INTO shop_refunds(order_id,buyer_id,seller_id,reason,status,created_at) VALUES(?,?,?,?,?,?)',
+      order.id, req.userId, item ? item.seller_id : null,
+      String((req.body || {}).reason || '').slice(0, 500), 'pending', now());
+    res.json({ ok: true, id });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.get('/api/shop/refunds', auth, async (req, res) => {
+  try {
+    const rows = await allRows(
+      `SELECT r.*, o.total_coins FROM shop_refunds r JOIN orders o ON o.id=r.order_id WHERE r.buyer_id=? ORDER BY r.created_at DESC LIMIT 50`,
+      req.userId);
+    res.json({ refunds: rows });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.post('/api/shop/refunds/:id/decide', auth, async (req, res) => {
+  try {
+    const approve = !!((req.body || {}).approve);
+    const rf = await get1('SELECT * FROM shop_refunds WHERE id=?', Number(req.params.id));
+    if (!rf) return res.status(404).json({ error: 'demande introuvable' });
+    if (rf.status !== 'pending') return res.status(400).json({ error: 'déjà traitée' });
+    // seul le vendeur concerné ou un admin peut décider
+    const u = await get1('SELECT id FROM users WHERE id=?', req.userId);
+    const isAdmin = req.admin === true;
+    if (Number(rf.seller_id) !== Number(req.userId) && !isAdmin)
+      return res.status(403).json({ error: 'non autorisé' });
+    if (approve) {
+      const order = await get1('SELECT * FROM orders WHERE id=?', rf.order_id);
+      const total = Number(order.total_coins);
+      await runSql('UPDATE users SET coins=coins+? WHERE id=?', total, rf.buyer_id);
+      await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
+        rf.buyer_id, total, 'remboursement commande #' + rf.order_id, now());
+      await runSql("UPDATE orders SET status='refunded' WHERE id=?", rf.order_id);
+      // débite le vendeur du net perçu (ne peut pas passer sous zéro)
+      const items = await allRows('SELECT * FROM order_items WHERE order_id=?', rf.order_id);
+      for (const it of items) {
+        const net = Number(it.price_coins) * Number(it.qty) - Number(it.fee_coins);
+        await runSql('UPDATE users SET coins=CASE WHEN coins>=? THEN coins-? ELSE 0 END WHERE id=?', net, net, it.seller_id);
+        await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
+          it.seller_id, -net, 'remboursement vente #' + rf.order_id, now());
+      }
+    }
+    await runSql("UPDATE shop_refunds SET status=?, decided_at=? WHERE id=?",
+      approve ? 'approved' : 'rejected', now(), rf.id);
+    res.json({ ok: true, status: approve ? 'approved' : 'rejected' });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 
 // ---------- boutique : produits attachés aux vidéos ----------
@@ -7162,6 +8929,75 @@ app.get('/api/ads/feed', async (req, res) => {
     if (p) product = productJSON(p);
   }
   res.json({ ads: [{ id: c.id, title: c.title, target: c.target || '', product }] });
+});
+
+// ==================== v2.39 : MODÉRATION AUTO (file mod_queue) ====================
+// Liste des mots interdits : BANNED_WORDS (insultes graves, discriminations, menaces, spam)
+// définie plus haut (modération auto V3) et réutilisée ici via scanBanned().
+app.get('/api/admin/mod-queue', adminAuth, async (req, res) => {
+  try {
+    const status = String(req.query.status || 'pending');
+    if (!['pending', 'resolved'].includes(status))
+      return res.status(400).json({ error: 'statut invalide' });
+    const rows = await allRows('SELECT * FROM mod_queue WHERE status=? ORDER BY created_at ASC LIMIT 100', status);
+    const out = [];
+    for (const r of rows) {
+      let item = null;
+      if (r.target_type === 'video') {
+        const v = await get1('SELECT v.*, u.username FROM videos v LEFT JOIN users u ON u.id=v.user_id WHERE v.id=?', r.target_id);
+        if (v) item = { id: v.id, desc: v.description, user_id: v.user_id, username: v.username, hidden: v.hidden };
+      } else if (r.target_type === 'comment') {
+        const c = await get1('SELECT c.*, u.username FROM comments c LEFT JOIN users u ON u.id=c.user_id WHERE c.id=?', r.target_id);
+        if (c) item = c;
+      }
+      out.push({ id: r.id, target_type: r.target_type, target_id: r.target_id, reason: r.reason,
+        status: r.status, created_at: Number(r.created_at), item });
+    }
+    res.json({ queue: out });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.post('/api/admin/mod-queue/:id/review', adminAuth, async (req, res) => {
+  try {
+    const q = await get1('SELECT * FROM mod_queue WHERE id=?', req.params.id);
+    if (!q) return res.status(404).json({ error: 'élément introuvable' });
+    if (q.status !== 'pending') return res.status(409).json({ error: 'déjà traité' });
+    const action = String((req.body || {}).action || '');
+    if (!['approve', 'remove'].includes(action))
+      return res.status(400).json({ error: 'action invalide' });
+    if (action === 'approve') {
+      if (q.target_type === 'video')
+        await runSql("UPDATE videos SET hidden=0, review_status='ok' WHERE id=?", q.target_id);
+      else if (q.target_type === 'comment')
+        await runSql("UPDATE comments SET review_status='ok' WHERE id=?", q.target_id);
+    } else {
+      // remove : suppression définitive + notif à l'auteur
+      let authorId = null, label = '';
+      if (q.target_type === 'video') {
+        const v = await get1('SELECT user_id, description FROM videos WHERE id=?', q.target_id);
+        if (v) { authorId = v.user_id; label = 'ta vidéo'; }
+        await runSql('DELETE FROM videos WHERE id=?', q.target_id);
+      } else if (q.target_type === 'comment') {
+        const c = await get1('SELECT user_id, text FROM comments WHERE id=?', q.target_id);
+        if (c) { authorId = c.user_id; label = 'ton commentaire'; }
+        await runSql('DELETE FROM comments WHERE id=?', q.target_id);
+      }
+      if (authorId) {
+        try {
+          await notify(authorId, 'system', null, null,
+            '🛡️ ' + (label ? label[0].toUpperCase() + label.slice(1) : 'Ton contenu')
+            + ' a été supprimé par la modération : ' + String(q.reason || '').slice(0, 100) + '.');
+          const ue = await get1('SELECT email FROM users WHERE id=?', authorId);
+          if (ue && ue.email) sendVidiEmail(ue.email, '🛡️ Contenu supprimé — VidiGagne',
+            '<p style="font-size:18px">🛡️ Contenu supprimé</p>'
+            + '<p style="color:#ccc;font-size:14px">Ton contenu a été supprimé par notre équipe de modération (' + String(q.reason || '').replace(/</g, '&lt;') + ').</p>'
+            + '<p style="color:#999;font-size:12px">Merci de respecter les règles de la communauté. ✨</p>',
+            'Ton contenu VidiGagne a été supprimé par la modération.').catch(() => {});
+        } catch (_) {}
+      }
+    }
+    await runSql("UPDATE mod_queue SET status='resolved' WHERE id=?", q.id);
+    res.json({ ok: true, action });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 
 // ==================== V3 : MODÉRATION AUTO (file de revue admin) ====================
@@ -7447,6 +9283,141 @@ app.post('/api/series/:id/buy', auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 
+// ==================== V13 : TIKTOK STUDIO — PROMOUVOIR UNE VIDÉO ====================
+// Promotion payante d'une vidéo du créateur : débit du budget en pièces,
+// suivi des impressions/clics jusqu'à épuisement du budget.
+// POST /api/videos/:id/promote {budget_coins, target}
+app.post('/api/videos/:id/promote', auth, async (req, res) => {
+  try {
+    const v = await get1('SELECT id, user_id, hidden FROM videos WHERE id=?', req.params.id);
+    if (!v || v.hidden) return res.status(404).json({ error: 'vidéo introuvable' });
+    if (Number(v.user_id) !== Number(req.userId))
+      return res.status(403).json({ error: 'seul le créateur de la vidéo peut la promouvoir' });
+    const budget = Math.floor(Number((req.body || {}).budget_coins));
+    if (!budget || budget < 10)
+      return res.status(400).json({ error: 'budget minimum : 10 pièces' });
+    const target = String((req.body || {}).target || '').slice(0, 80);
+    const debited = await runSqlChanges('UPDATE users SET coins=coins-? WHERE id=? AND coins>=?', budget, req.userId, budget);
+    if (!debited) return res.status(400).json({ error: 'pas assez de pièces' });
+    await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
+      req.userId, -budget, 'promotion vidéo #' + v.id, now());
+    const id = await insertId(
+      `INSERT INTO video_promos(video_id,user_id,budget_coins,spent_coins,impressions,clicks,target,status,created_at)
+       VALUES(?,?,?,?,0,0,?,?,'active',?)`,
+      v.id, req.userId, budget, 0, target, now());
+    const bal = await get1('SELECT coins FROM users WHERE id=?', req.userId);
+    res.json({ ok: true, promo_id: id, coins: bal ? Number(bal.coins) : 0 });
+  } catch (e) { res.status(500).json({ error: 'échec de la promotion', _dbg: String(e && e.message || e).slice(0, 200) }); }
+});
+// Simule une impression ou un clic sur une vidéo promue (débite le budget).
+// POST /api/videos/:id/promo/event {type: 'impression'|'click'}
+app.post('/api/videos/:id/promo/event', async (req, res) => {
+  try {
+    const type = String((req.body || {}).type || '');
+    if (!['impression', 'click'].includes(type)) return res.status(400).json({ error: 'type invalide' });
+    const p = await get1(`SELECT * FROM video_promos WHERE video_id=? AND status='active' ORDER BY id DESC LIMIT 1`, req.params.id);
+    if (!p) return res.status(404).json({ error: 'aucune promotion active pour cette vidéo' });
+    const cost = type === 'click' ? AD_COST_CLICK : AD_COST_IMPRESSION;
+    if (Number(p.spent_coins) + cost > Number(p.budget_coins)) {
+      await runSql(`UPDATE video_promos SET status='paused' WHERE id=?`, p.id);
+      return res.status(400).json({ error: 'budget épuisé' });
+    }
+    await runSql('UPDATE video_promos SET spent_coins=spent_coins+?, impressions=impressions+?, clicks=clicks+? WHERE id=?',
+      cost, type === 'impression' ? 1 : 0, type === 'click' ? 1 : 0, p.id);
+    const upd = await get1('SELECT budget_coins,spent_coins,impressions,clicks,status FROM video_promos WHERE id=?', p.id);
+    res.json({ ok: true, remaining: Number(upd.budget_coins) - Number(upd.spent_coins),
+      impressions: Number(upd.impressions), clicks: Number(upd.clicks), status: upd.status });
+  } catch (e) { res.status(500).json({ error: 'échec de l\'événement promo' }); }
+});
+// Stats de promotion d'une vidéo (propriétaire uniquement).
+// GET /api/videos/:id/promo/stats
+app.get('/api/videos/:id/promo/stats', auth, async (req, res) => {
+  try {
+    const v = await get1('SELECT user_id FROM videos WHERE id=?', req.params.id);
+    if (!v) return res.status(404).json({ error: 'vidéo introuvable' });
+    if (Number(v.user_id) !== Number(req.userId))
+      return res.status(403).json({ error: 'réservé au créateur de la vidéo' });
+    const p = await get1(`SELECT * FROM video_promos WHERE video_id=? ORDER BY id DESC LIMIT 1`, req.params.id);
+    if (!p) return res.json({ promo: null });
+    res.json({ promo: { id: p.id, budget_coins: Number(p.budget_coins), spent_coins: Number(p.spent_coins),
+      remaining: Number(p.budget_coins) - Number(p.spent_coins),
+      impressions: Number(p.impressions), clicks: Number(p.clicks), target: p.target || '',
+      status: p.status, created_at: Number(p.created_at) } });
+  } catch (e) { res.status(500).json({ error: 'échec de lecture des stats' }); }
+});
+
+// ==================== V13 : TIKTOK STUDIO — COLLABORATIONS ====================
+// Le créateur invite un autre utilisateur à co-signer sa vidéo (partage des revenus).
+// POST /api/videos/:id/collab/invite {username, revenue_share_pct}
+app.post('/api/videos/:id/collab/invite', auth, async (req, res) => {
+  try {
+    const v = await get1('SELECT id, user_id, hidden, co_creator_id FROM videos WHERE id=?', req.params.id);
+    if (!v || v.hidden) return res.status(404).json({ error: 'vidéo introuvable' });
+    if (Number(v.user_id) !== Number(req.userId))
+      return res.status(403).json({ error: 'seul le créateur de la vidéo peut inviter' });
+    if (Number(v.co_creator_id)) return res.status(400).json({ error: 'cette vidéo a déjà un collaborateur' });
+    const targetName = String((req.body || {}).username || '').trim().replace(/^@/, '');
+    if (!targetName) return res.status(400).json({ error: 'pseudo requis' });
+    const tu = await get1('SELECT id, username FROM users WHERE LOWER(username)=LOWER(?)', targetName);
+    if (!tu) return res.status(404).json({ error: 'utilisateur introuvable' });
+    if (Number(tu.id) === Number(req.userId))
+      return res.status(400).json({ error: 'impossible de collaborer avec soi-même' });
+    let pct = Math.floor(Number((req.body || {}).revenue_share_pct));
+    if (!pct || pct < 1 || pct > 99) pct = 50;
+    const dup = await get1(`SELECT id FROM collab_invites WHERE video_id=? AND invitee_id=? AND status='pending'`, v.id, tu.id);
+    if (dup) return res.status(400).json({ error: 'invitation déjà envoyée' });
+    const me = await get1('SELECT username FROM users WHERE id=?', req.userId);
+    const inviterName = me ? me.username : ('user' + req.userId);
+    const id = await insertId(
+      `INSERT INTO collab_invites(video_id,inviter_id,invitee_id,status,revenue_share_pct,created_at)
+       VALUES(?,?,?,'pending',?,?)`, v.id, req.userId, tu.id, pct, now());
+    await notify(tu.id, 'collab_invite', req.userId, v.id, '🤝 @' + inviterName + ' t\'invite à collaborer sur une vidéo (' + pct + '% des revenus)');
+    res.json({ ok: true, invite_id: id, revenue_share_pct: pct });
+  } catch (e) { res.status(500).json({ error: 'échec de l\'invitation' }); }
+});
+// L'invité accepte : la vidéo devient co-signée (2 créateurs).
+// POST /api/collab/:id/accept
+app.post('/api/collab/:id/accept', auth, async (req, res) => {
+  try {
+    const inv = await get1('SELECT * FROM collab_invites WHERE id=?', req.params.id);
+    if (!inv || inv.status !== 'pending') return res.status(404).json({ error: 'invitation introuvable' });
+    if (Number(inv.invitee_id) !== Number(req.userId))
+      return res.status(403).json({ error: 'cette invitation ne t\'est pas adressée' });
+    await runSql(`UPDATE collab_invites SET status='accepted' WHERE id=?`, inv.id);
+    await runSql('UPDATE videos SET co_creator_id=? WHERE id=?', inv.invitee_id, inv.video_id);
+    await notify(inv.inviter_id, 'collab_accepted', req.userId, inv.video_id, '🤝 Collaboration acceptée !');
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'échec de l\'acceptation' }); }
+});
+// L'invité refuse.
+// POST /api/collab/:id/decline
+app.post('/api/collab/:id/decline', auth, async (req, res) => {
+  try {
+    const inv = await get1('SELECT * FROM collab_invites WHERE id=?', req.params.id);
+    if (!inv || inv.status !== 'pending') return res.status(404).json({ error: 'invitation introuvable' });
+    if (Number(inv.invitee_id) !== Number(req.userId))
+      return res.status(403).json({ error: 'cette invitation ne t\'est pas adressée' });
+    await runSql(`UPDATE collab_invites SET status='rejected' WHERE id=?`, inv.id);
+    await notify(inv.inviter_id, 'collab_declined', req.userId, inv.video_id, '😕 Collaboration refusée.');
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'échec du refus' }); }
+});
+// Mes invitations de collaboration en attente.
+// GET /api/collab/invites
+app.get('/api/collab/invites', auth, async (req, res) => {
+  try {
+    const rows = await allRows(
+      `SELECT ci.*, u.username AS inviter_name, v.description AS video_desc
+       FROM collab_invites ci
+       JOIN users u ON u.id=ci.inviter_id
+       JOIN videos v ON v.id=ci.video_id
+       WHERE ci.invitee_id=? AND ci.status='pending' ORDER BY ci.created_at DESC`, req.userId);
+    res.json({ invites: rows.map(r => ({ id: r.id, video_id: r.video_id, inviter_id: r.inviter_id,
+      inviter_name: r.inviter_name, video_desc: r.video_desc,
+      revenue_share_pct: Number(r.revenue_share_pct), created_at: Number(r.created_at) })) });
+  } catch (e) { res.status(500).json({ error: 'échec de lecture des invitations' }); }
+});
+
 // ---------- algo « Pour toi » : événements de visionnage ----------
 app.post('/api/watch', auth, async (req, res) => {
   try {
@@ -7599,21 +9570,28 @@ app.post('/api/ads/reward', auth, async (req, res) => {
   try{
     const ip = clientIp(req);
     const t = now();
-    const ipHit = await get1('SELECT id FROM ad_reward_claims WHERE ip=? AND created_at>?', ip, t-5*60*1000);
-    if(ipHit) return res.status(429).json({ error: 'trop de demandes (anti-fraude)' });
-    const uHit = await get1('SELECT id FROM ad_reward_claims WHERE user_id=? AND created_at>?', req.userId, t-2*60*1000);
-    if(uHit) return res.status(429).json({ error: 'patiente 2 minutes' });
-    // plafond journalier serveur : 100 pièces/jour max (le localStorage ne suffit pas)
-    const dayStart = new Date().setHours(0,0,0,0);
-    const earned = Number((await get1(`SELECT COALESCE(SUM(amount),0) AS s FROM ledger WHERE user_id=? AND amount>0 AND created_at>=?`, req.userId, dayStart)).s);
-    if (earned >= 100) return res.status(429).json({ error: 'plafond journalier atteint (100 pièces)' });
-    const grant = Math.min(30, 100 - earned);
-    await runSql('INSERT INTO ad_reward_claims(user_id,ip,created_at) VALUES(?,?,?)', req.userId, ip, t);
-    await runSql('UPDATE users SET coins=coins+? WHERE id=?', grant, req.userId);
-    await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)', req.userId, grant, 'pub récompensée', t);
-    await bumpDailyPoints(grant);
+    // anti-concurrence (2026-10-04) : les garde-fous anti-fraude (1/IP/5min, 1/user/2min)
+    // et le plafond journalier sont LUS puis ÉCRITS — sans sérialisation, 2 requêtes
+    // simultanées passent les contrôles ensemble et créditent 2× (TOCTOU).
+    const out = await withUserLock(req.userId, async () => {
+      const ipHit = await get1('SELECT id FROM ad_reward_claims WHERE ip=? AND created_at>?', ip, t-5*60*1000);
+      if(ipHit) return { error: 'trop de demandes (anti-fraude)' };
+      const uHit = await get1('SELECT id FROM ad_reward_claims WHERE user_id=? AND created_at>?', req.userId, t-2*60*1000);
+      if(uHit) return { error: 'patiente 2 minutes' };
+      // plafond journalier serveur : 100 pièces/jour max (le localStorage ne suffit pas)
+      const dayStart = new Date().setHours(0,0,0,0);
+      const earned = Number((await get1(`SELECT COALESCE(SUM(amount),0) AS s FROM ledger WHERE user_id=? AND amount>0 AND created_at>=?`, req.userId, dayStart)).s);
+      if (earned >= 100) return { error: 'plafond journalier atteint (100 pièces)' };
+      const grant = Math.min(30, 100 - earned);
+      await runSql('INSERT INTO ad_reward_claims(user_id,ip,created_at) VALUES(?,?,?)', req.userId, ip, t);
+      await runSql('UPDATE users SET coins=coins+? WHERE id=?', grant, req.userId);
+      await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)', req.userId, grant, 'pub récompensée', t);
+      await bumpDailyPoints(grant);
+      return { granted: grant };
+    });
+    if (out.error) return res.status(429).json({ error: out.error });
     const balR = await get1('SELECT coins FROM users WHERE id=?', req.userId);
-    res.json({ ok:true, granted: grant, coins: balR ? balR.coins : 0 });
+    res.json({ ok:true, granted: out.granted, coins: balR ? balR.coins : 0 });
   }catch(e){ res.status(500).json({ error:'erreur serveur' }); }
 });
 // Calcul 50-50 du jour : 50% propriétaire, 50%/points = valeur du point
@@ -7646,6 +9624,14 @@ app.post('/api/admin/ads/revenue', adminAuth, async (req, res) => {
     else await runSql('INSERT INTO ad_daily(day,points_distributed,ad_revenue_usd) VALUES(?,0,?)', day, rev);
     res.json({ ok:true, ...(await computeDaily5050(day)) });
   }catch(e){ res.status(500).json({ error:'erreur serveur' }); }
+});
+// V13 : déclenchement manuel de la distribution des revenus pubs aux créateurs
+// (même calcul que le cron 23h59, partage collab inclus) — utile pour les tests.
+app.post('/api/admin/ads/distribute', adminAuth, async (req, res) => {
+  try {
+    const day = String((req.body || {}).day || new Date().toISOString().slice(0, 10)).slice(0, 10);
+    res.json({ ok: true, ...(await distributeAdRevenue(day)) });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 // Déclenchement quotidien à 23h59 (heure serveur, UTC sur Render)
 setInterval(async () => {
@@ -7738,8 +9724,9 @@ async function checkReusePolicy(meId, ownerId, kind) {
 const VALID_POLICIES = ['everyone', 'friends', 'none'];
 app.get('/api/me/privacy', auth, async (req, res) => {
   try {
-    const u = await get1('SELECT duet_policy, stitch_policy, comment_privacy FROM users WHERE id=?', req.userId);
-    res.json({ ok: true, duet_policy: (u && u.duet_policy) || 'everyone', stitch_policy: (u && u.stitch_policy) || 'everyone', comment_privacy: (u && u.comment_privacy) || 'everyone' });
+    const u = await get1('SELECT duet_policy, stitch_policy, comment_privacy, discoverable, activity_status FROM users WHERE id=?', req.userId);
+    res.json({ ok: true, duet_policy: (u && u.duet_policy) || 'everyone', stitch_policy: (u && u.stitch_policy) || 'everyone', comment_privacy: (u && u.comment_privacy) || 'everyone',
+      discoverable: !u || Number(u.discoverable) !== 0, activity_status: (u && u.activity_status) || 'public' });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 app.post('/api/me/privacy', auth, async (req, res) => {
@@ -7764,6 +9751,8 @@ app.post('/api/me/privacy', auth, async (req, res) => {
     for (const k of Object.keys(allowed)) {
       if (b[k] !== undefined && allowed[k].includes(b[k])) { sets.push(k + '=?'); vals.push(b[k]); }
     }
+    // "Ne pas suggérer mon compte" : booléen → 0/1, traité à part (pas une liste de politiques)
+    if (b.discoverable !== undefined) { sets.push('discoverable=?'); vals.push(b.discoverable ? 1 : 0); }
     if (sets.length) { vals.push(req.userId); await runSql(`UPDATE users SET ${sets.join(',')} WHERE id=?`, ...vals); }
     const u = await get1('SELECT duet_policy, stitch_policy FROM users WHERE id=?', req.userId);
     res.json({ ok: true, duet_policy: u.duet_policy, stitch_policy: u.stitch_policy });
@@ -7887,6 +9876,70 @@ app.get('/api/lives/:id/moderators', async (req, res) => {
     res.json({ ok: true, moderators: rows });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
+// ---------- v2.33 : modération du live (hôte ou modérateurs) ----------
+// Sourdine : l'utilisateur ne peut plus écrire dans le chat de ce live
+app.post('/api/lives/:id/mute', auth, async (req, res) => {
+  try {
+    const l = await get1('SELECT * FROM lives WHERE id=?', req.params.id);
+    if (!l) return res.status(404).json({ error: 'live introuvable' });
+    if (!(await isLiveModerator(l, req.userId))) return res.status(403).json({ error: 'non autorisé' });
+    const uid = Number((req.body || {}).user_id);
+    if (!uid) return res.status(400).json({ error: 'user_id requis' });
+    if (Number(l.user_id) === uid) return res.status(400).json({ error: 'on ne mute pas l\'hôte' });
+    if (await isLiveModerator(l, uid)) return res.status(400).json({ error: 'on ne mute pas un modérateur' });
+    await insertIgnore('INSERT OR IGNORE INTO live_bans(live_id,user_id,kind,created_at) VALUES(?,?,?,?)', l.id, uid, 'mute', now());
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.delete('/api/lives/:id/mute/:uid', auth, async (req, res) => {
+  try {
+    const l = await get1('SELECT * FROM lives WHERE id=?', req.params.id);
+    if (!l) return res.status(404).json({ error: 'live introuvable' });
+    if (!(await isLiveModerator(l, req.userId))) return res.status(403).json({ error: 'non autorisé' });
+    await runSql("DELETE FROM live_bans WHERE live_id=? AND user_id=? AND kind='mute'", l.id, req.params.uid);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// Bannissement : banni du live, ne peut plus commenter
+app.post('/api/lives/:id/ban', auth, async (req, res) => {
+  try {
+    const l = await get1('SELECT * FROM lives WHERE id=?', req.params.id);
+    if (!l) return res.status(404).json({ error: 'live introuvable' });
+    if (!(await isLiveModerator(l, req.userId))) return res.status(403).json({ error: 'non autorisé' });
+    const uid = Number((req.body || {}).user_id);
+    if (!uid) return res.status(400).json({ error: 'user_id requis' });
+    if (Number(l.user_id) === uid) return res.status(400).json({ error: 'on ne bannit pas l\'hôte' });
+    if (await isLiveModerator(l, uid)) return res.status(400).json({ error: 'on ne bannit pas un modérateur' });
+    await insertIgnore('INSERT OR IGNORE INTO live_bans(live_id,user_id,kind,created_at) VALUES(?,?,?,?)', l.id, uid, 'ban', now());
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.delete('/api/lives/:id/ban/:uid', auth, async (req, res) => {
+  try {
+    const l = await get1('SELECT * FROM lives WHERE id=?', req.params.id);
+    if (!l) return res.status(404).json({ error: 'live introuvable' });
+    if (!(await isLiveModerator(l, req.userId))) return res.status(403).json({ error: 'non autorisé' });
+    await runSql("DELETE FROM live_bans WHERE live_id=? AND user_id=? AND kind='ban'", l.id, req.params.uid);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// ---------- v2.33 : épinglage d'un message du chat live (hôte ou modérateurs) ----------
+// Un seul message épinglé à la fois ; comment_id=0 (ou absent) → désépingle tout
+app.post('/api/lives/:id/pin', auth, async (req, res) => {
+  try {
+    const l = await get1('SELECT * FROM lives WHERE id=?', req.params.id);
+    if (!l) return res.status(404).json({ error: 'live introuvable' });
+    if (!(await isLiveModerator(l, req.userId))) return res.status(403).json({ error: 'non autorisé' });
+    const cid = Number((req.body || {}).comment_id) || 0;
+    await runSql('UPDATE live_chat SET pinned=0 WHERE live_id=?', l.id);
+    if (cid) {
+      const c = await get1('SELECT id FROM live_chat WHERE id=? AND live_id=?', cid, l.id);
+      if (!c) return res.status(404).json({ error: 'message introuvable' });
+      await runSql('UPDATE live_chat SET pinned=1 WHERE id=?', cid);
+    }
+    res.json({ ok: true, pinned: cid });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
 
 // ---------- statut d'activité (en ligne) ----------
 app.post('/api/me/heartbeat', auth, async (req, res) => {
@@ -7895,9 +9948,20 @@ app.post('/api/me/heartbeat', auth, async (req, res) => {
 });
 app.get('/api/users/:username/online', async (req, res) => {
   try {
-    const u = await get1('SELECT last_seen, activity_status FROM users WHERE username=?', req.params.username);
+    const u = await get1('SELECT id, last_seen, activity_status FROM users WHERE username=?', req.params.username);
     if (!u) return res.status(404).json({ error: 'introuvable' });
-    const online = u.activity_status !== 'nobody' && (now() - Number(u.last_seen || 0)) < 120000;
+    // v2.37 : 'friends' → seuls les amis (abonnements mutuels) voient le statut ;
+    // 'nobody' → jamais visible ; last_seen > 120s → hors ligne
+    const recent = (now() - Number(u.last_seen || 0)) < 120000;
+    let online = false;
+    if (recent) {
+      const st = u.activity_status || 'public';
+      if (st === 'nobody') online = false;
+      else if (st === 'friends') {
+        const meId = await optUserId(req);
+        online = meId ? await areFriends(meId, u.id) : false;
+      } else online = true; // 'public' (ou valeur inconnue → visible)
+    }
     res.json({ ok: true, online });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
@@ -7941,14 +10005,14 @@ app.post('/api/me/restricted', auth, async (req, res) => {
 // ---------- préférences de notifications ----------
 app.get('/api/me/notif-prefs', auth, async (req, res) => {
   try {
-    const u = await get1('SELECT notif_likes,notif_comments,notif_follows,notif_mentions,notif_lives FROM users WHERE id=?', req.userId);
+    const u = await get1('SELECT notif_likes,notif_comments,notif_follows,notif_mentions,notif_lives,notif_loginalert FROM users WHERE id=?', req.userId);
     res.json({ ok: true, prefs: u || {} });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 app.post('/api/me/notif-prefs', auth, async (req, res) => {
   try {
     const b = req.body || {}, sets = [], vals = [];
-    for (const k of ['notif_likes', 'notif_comments', 'notif_follows', 'notif_mentions', 'notif_lives']) {
+    for (const k of ['notif_likes', 'notif_comments', 'notif_follows', 'notif_mentions', 'notif_lives', 'notif_loginalert']) {
       if (b[k] !== undefined) { sets.push(k + '=?'); vals.push(b[k] ? 1 : 0); }
     }
     if (sets.length) { vals.push(req.userId); await runSql(`UPDATE users SET ${sets.join(',')} WHERE id=?`, ...vals); }
@@ -8050,7 +10114,18 @@ const BOT_KB = [
  {k:['bonjour','salut','hello','bonsoir','coucou'], r:"Salut ! 👋 Je suis Vigi, l'assistant VidiGagne. Dis-moi ton problème et je vais t'aider. Tu peux aussi m'envoyer jusqu'à 3 captures d'écran avec 📷.", action:null},
  {k:['merci','thanks','genial','super'], r:"De rien, avec plaisir ! 😊 Autre chose ?", action:null},
  {k:['bug','erreur','probleme','casse','plante','bloque','marche pas'], r:"Désolé pour ce problème ! 😟 Décris-moi ce qui se passe exactement, et envoie-moi une capture d'écran avec 📷 — ça m'aidera beaucoup.", action:null, askShot:true},
+ {k:['recommande','recommandation','conseil video','suggere','quoi regarder','suggestion video'], r:"Voici des vidéos tendance que je te recommande ! 🎬 Tape sur une carte pour la regarder.", action:'recommendVideos'},
+ {k:['signaler','signalement','signale','denoncer'], r:"Je peux t'aider à signaler un contenu inapproprié. 🛡️ Choisis la vidéo à signaler ci-dessous :", action:'reportFlow'},
 ];
+const VIGI_LANGS = {creole:'ht',haitien:'ht',ht:'ht',francais:'fr',french:'fr',fr:'fr',anglais:'en',english:'en',en:'en',espagnol:'es',spanish:'es',es:'es',portugais:'pt',pt:'pt',arabe:'ar',ar:'ar'};
+function botBrainLangChange(t){
+  // "mets en créole", "passe en français", "change la langue en anglais", "met l'app en espagnol"
+  for (const kw of Object.keys(VIGI_LANGS)){
+    if ((t.includes(' met ') || t.includes(' mets ') || t.includes(' passe ') || t.includes(' passer ') || t.includes(' change ')) && t.includes(' en ' + kw + ' ')) return VIGI_LANGS[kw];
+    if (t.includes('langue ' + kw) || t.includes('en ' + kw + ' stp') || t.includes('en ' + kw + ' svp')) return VIGI_LANGS[kw];
+  }
+  return null;
+}
 function botBrain(text){
   const t = ' ' + text.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'') + ' ';
   // v2.25 : réponses oui/non à une action proposée
@@ -8060,6 +10135,9 @@ function botBrain(text){
   if (/^\s*(non|no|pas|annule|stop)\s*[.!]?\s*$/.test(t.trim())) {
     return {r:"Pas de souci ! 👍 Dis-moi comment je peux t'aider autrement.", action:'confirmNo', offer:false};
   }
+  // v2.37 : changement de langue via Vigi ("mets en créole", "passe en français")
+  const langCode = botBrainLangChange(t);
+  if (langCode) return {r:"C'est fait ! ✅ L'application est maintenant en " + langCode.toUpperCase() + ".", action:'setLang:' + langCode, offer:false};
   let best = null, bestScore = 0;
   for (const e of BOT_KB){
     let score = 0;
@@ -8242,8 +10320,13 @@ async function notifyMentions(text, actorId, videoId, commentId) {
     for (const m of mentions.slice(0, 5)) {
       const uname = m.slice(1).toLowerCase();
       if (seen.has(uname)) continue; seen.add(uname);
-      const u = await get1('SELECT id FROM users WHERE LOWER(username)=?', uname);
+      const u = await get1('SELECT id, mention_privacy FROM users WHERE LOWER(username)=?', uname);
       if (u && Number(u.id) !== Number(actorId)) {
+        // v2.39 : application du réglage mention_privacy du mentionné (everyone/friends/nobody) —
+        // on bloque SEULEMENT la notification, le commentaire reste publié.
+        const mpol = (u.mention_privacy || 'everyone');
+        if (mpol === 'nobody') continue;
+        if (mpol === 'friends' && !(await areFriends(actorId, u.id))) continue;
         // v2.31 : texte = le commentaire lui-même (l'app compose "@acteur vous a mentionné"), + comment_id
         await notify(u.id, 'mention', actorId, videoId, String(text || '').slice(0, 100), commentId || null);
       }
@@ -8262,13 +10345,6 @@ app.get('/api/videos/:id/download-url', auth, async (req, res) => {
 });
 
 // ---------- vidéos privées (onglet cadenas) ----------
-app.get('/api/videos/mine/private', auth, async (req, res) => {
-  try {
-    const rows = await allRows(`SELECT * FROM videos WHERE user_id=? AND (is_private=1 OR visibility='private') ORDER BY created_at DESC`, req.userId);
-    res.json({ ok: true, videos: rows });
-  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
-});
-
 // FIX 2026-10-04 (chantier edge) : les erreurs multer (mauvais type de fichier, fichier
 // trop gros) tombaient sur le gestionnaire d'erreurs Express par défaut → page HTML 500
 // avec stack trace. → erreur JSON propre (400/413) avec message clair.
