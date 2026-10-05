@@ -4271,17 +4271,33 @@ app.post('/api/withdraw/:id/cancel', auth, async (req, res) => {
 // Série de connexion quotidienne : bonus progressif (jour N → min(N*5, 50) pièces)
 function streakBonus(n) { return Math.min(Math.max(1, n) * 5, 50); }
 function utcDay(ms) { return new Date(ms).toISOString().slice(0, 10); }
+// FIX temps 2026-10-05 (T2) : les séries comptaient les jours en UTC. Pour Haïti (UTC-4),
+// un checkin mardi 21h (= mercredi 01h UTC) « sautait » le mardi → série cassée à tort.
+// Jour local du joueur quand son tz_offset est connu (envoyé par l'app, cf. T7), UTC sinon.
+// (tz_offset=0 → identique à utcDay, aucun changement pour les autres.)
+function userDay(ms, tzMin) {
+  const off = Number(tzMin) || 0;
+  return off ? new Date(ms + off * 60000).toISOString().slice(0, 10) : utcDay(ms);
+}
+async function userTz(userId) {
+  try { const u = await get1('SELECT tz_offset FROM users WHERE id=?', userId); return Number(u && u.tz_offset) || 0; }
+  catch (_) { return 0; }
+}
 app.post('/api/streak/checkin', auth, async (req, res) => {
   try {
     // FIX race 2026-10-05 (Équipe 8/10) : double checkin — lecture+crédit sérialisés
     // par utilisateur. Avant : 2 requêtes simultanées créditaient le bonus 2 fois
     // (prouvé : +10 au lieu de +5).
     const out = await withUserLock(req.userId, async () => {
-      const t = now(), today = utcDay(t), yest = utcDay(t - 86400000);
+      // T2 : jour LOCAL du joueur (pas UTC) — avec tolérance de transition : last_day peut
+      // encore être au format UTC (écrit avant que l'app n'envoie tz_offset) ; on accepte
+      // hier en local OU hier en UTC pour ne pas casser une série existante à la bascule.
+      const tz = await userTz(req.userId);
+      const t = now(), today = userDay(t, tz), yest = userDay(t - 86400000, tz), yestU = utcDay(t - 86400000);
       const row = await get1('SELECT * FROM login_streaks WHERE user_id=?', req.userId);
       if (row && row.last_day === today)
         return { ok: true, streak: row.streak, bonus: 0, already: true, day: today };
-      const streak = (row && row.last_day === yest) ? row.streak + 1 : 1;
+      const streak = (row && (row.last_day === yest || row.last_day === yestU)) ? row.streak + 1 : 1;
       const bonus = streakBonus(streak);
       await raceGap(req); // crochet test concurrence (Équipe 8/10) : simule l'intercalage Postgres
       await runSql('UPDATE users SET coins=coins+? WHERE id=?', bonus, req.userId);
@@ -4297,7 +4313,7 @@ app.post('/api/streak/checkin', auth, async (req, res) => {
 app.get('/api/streak', auth, async (req, res) => {
   try {
     const row = await get1('SELECT * FROM login_streaks WHERE user_id=?', req.userId);
-    const today = utcDay(now());
+    const today = userDay(now(), await userTz(req.userId)); // T2 : jour local, pas UTC
     res.json({ streak: row ? row.streak : 0, last_day: row ? row.last_day : null,
       checked_in_today: !!(row && row.last_day === today), next_bonus: streakBonus((row ? row.streak : 0) + 1) });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
@@ -6971,7 +6987,10 @@ app.post('/api/videos/:id/watch-reward', auth, async (req, res) => {
       return res.json({ ok: true, granted: 0, reason: 'fraud-review', coins: _b ? _b.coins : 0 });
     }
     const day = new Date().toISOString().slice(0, 10);
-    const dayStart = new Date().setHours(0, 0, 0, 0);
+    // FIX temps 2026-10-05 (T3) : dayStart était minuit HEURE LOCALE serveur alors que
+    // `day` (clé anti-doublon) est en UTC → à cheval sur minuit, la règle
+    // « 1 récompense/vidéo/jour » était contournable. Unifié en UTC partout (comme les quêtes).
+    const dayStart = new Date(day + 'T00:00:00Z').getTime();
     // anti-concurrence (2026-10-04) : la section "anti-doublon → lecture du compteur
     // journalier → crédit" doit être atomique par utilisateur. Sans sérialisation,
     // N requêtes simultanées lisent le même compteur et dépassent le plafond 100/jour
@@ -8660,12 +8679,35 @@ async function updatePremieres() {
     }
     const dueLive = await allRows(`SELECT video_id, creator_id FROM premieres WHERE status='scheduled' AND scheduled_at<=?`, t);
     for (const p of dueLive) {
-      await runSql(`UPDATE premieres SET status='live' WHERE video_id=? AND status='scheduled'`, p.video_id);
+      // FIX temps 2026-10-05 (T1) : l'UPDATE est conditionnel mais on notifiait SANS vérifier
+      // qu'il a vraiment changé une ligne → 2 exécutions concurrentes (Postgres, restart)
+      // notifiaient 2×. Maintenant : on ne notifie que si la transition a eu lieu.
+      const changed = await runSqlChanges(`UPDATE premieres SET status='live' WHERE video_id=? AND status='scheduled'`, p.video_id);
+      if (!changed) continue;
       await runSql('UPDATE videos SET scheduled_at=NULL WHERE id=?', p.video_id);
       const rems = await allRows('SELECT user_id FROM premiere_reminders WHERE video_id=?', p.video_id);
       for (const r of rems) await notify(r.user_id, 'premiere_live', p.creator_id, p.video_id, 'La premiere commence maintenant 🔴', null);
     }
   } catch (e) { console.error('updatePremieres:', e.message); }
+}
+// FIX temps 2026-10-05 (T6) : les lives programmés expiraient silencieusement —
+// le schéma prévoyait `notified` mais aucun traitement ne tournait à l'heure prévue.
+// Maintenant : à l'heure prévue, les abonnés reçoivent « le live commence 🔴 ».
+async function updateScheduledLives() {
+  try {
+    const t = now();
+    const due = await allRows(`SELECT id, user_id, title FROM live_scheduled WHERE cancelled=0 AND notified=0 AND scheduled_at<=?`, t);
+    for (const s of due) {
+      const changed = await runSqlChanges(`UPDATE live_scheduled SET notified=1 WHERE id=? AND notified=0`, s.id);
+      if (!changed) continue; // déjà traité par une exécution concurrente
+      const followers = await allRows('SELECT follower_id FROM follows WHERE followed_id=?', s.user_id);
+      const me = await get1('SELECT username FROM users WHERE id=?', s.user_id);
+      for (const f of (followers || [])) {
+        await notify(f.follower_id, 'live_started', s.user_id, null,
+          '@' + (me ? me.username : '?') + ' est en live : ' + s.title + ' 🔴', null);
+      }
+    }
+  } catch (e) { console.error('updateScheduledLives:', e.message); }
 }
 async function scheduleNudges() {
   try {
@@ -9074,7 +9116,9 @@ async function friendshipStreakTouch(a, b) {
   // Recalcule/valide la série de la paire depuis les messages (échange bidirectionnel).
   const [x, y] = streakPair(a, b);
   if (!x || !y || x === y) return null;
-  const t = now(), today = utcDay(t), yest = utcDay(t - 86400000);
+  // T2 : jour local de l'utilisateur qui déclenche (a), pas UTC — même tolérance de transition que les séries de connexion
+  const tz = await userTz(a);
+  const t = now(), today = userDay(t, tz), yest = userDay(t - 86400000, tz), yestU = utcDay(t - 86400000);
   const [ds, de] = dayBoundsMs(today);
   const conv = await get1('SELECT id FROM conversations WHERE (user1_id=? AND user2_id=?) OR (user1_id=? AND user2_id=?)', x, y, y, x);
   let bidir = false;
@@ -9084,7 +9128,7 @@ async function friendshipStreakTouch(a, b) {
   }
   const row = await get1('SELECT * FROM friendship_streaks WHERE user_a=? AND user_b=?', x, y);
   if (!bidir || (row && row.last_day === today)) return row;
-  const streak = (row && row.last_day === yest) ? row.streak + 1 : 1;
+  const streak = (row && (row.last_day === yest || row.last_day === yestU)) ? row.streak + 1 : 1;
   if (row) await runSql('UPDATE friendship_streaks SET streak=?, last_day=?, updated_at=? WHERE user_a=? AND user_b=?', streak, today, t, x, y);
   else await runSql('INSERT INTO friendship_streaks(user_a,user_b,streak,last_day,updated_at) VALUES(?,?,?,?,?)', x, y, streak, today, t);
   return { user_a: x, user_b: y, streak, last_day: today, updated_at: t };
@@ -9122,7 +9166,9 @@ app.post('/api/friends/streaks/exchange', auth, async (req, res) => {
     if (!friendId || friendId === Number(req.userId)) return res.status(400).json({ error: 'ami invalide' });
     if (via !== 'comment' && via !== 'code') return res.status(400).json({ error: 'via invalide (comment|code)' });
     const [x, y] = streakPair(req.userId, friendId);
-    const t = now(), today = utcDay(t), yest = utcDay(t - 86400000);
+    // T2 : jour local du demandeur, pas UTC (tolérance de transition comme ailleurs)
+    const _stz = await userTz(req.userId);
+    const t = now(), today = userDay(t, _stz), yest = userDay(t - 86400000, _stz), yestU = utcDay(t - 86400000);
     const row = await get1('SELECT * FROM friendship_streaks WHERE user_a=? AND user_b=?', x, y);
     if (row && row.last_day === today) return res.json({ ok: true, streak: row.streak, already: true, via });
     if (via === 'code') {
@@ -9131,7 +9177,7 @@ app.post('/api/friends/streaks/exchange', auth, async (req, res) => {
       if (String(b.code || '').trim().toUpperCase() !== expect)
         return res.status(400).json({ error: 'code invalide' });
     }
-    const streak = (row && row.last_day === yest) ? row.streak + 1 : 1;
+    const streak = (row && (row.last_day === yest || row.last_day === yestU)) ? row.streak + 1 : 1;
     if (row) await runSql('UPDATE friendship_streaks SET streak=?, last_day=?, updated_at=? WHERE user_a=? AND user_b=?', streak, today, t, x, y);
     else await runSql('INSERT INTO friendship_streaks(user_a,user_b,streak,last_day,updated_at) VALUES(?,?,?,?,?)', x, y, streak, today, t);
     res.json({ ok: true, streak, last_day: today, via, flame: '🔥' });
@@ -12164,20 +12210,9 @@ app.delete('/api/family/children/:teen_id', auth, async (req, res) => {
 // ---------- publication programmée : publie les vidéos dont l'heure est passée ----------
 async function publishDue() {
   try {
-    // v2.48 SPEC-10 : les premieres qui sortent → notif premiere_live aux inscrits + chat ouvert
-    try {
-      const going = await allRows(`SELECT p.video_id FROM premieres p WHERE p.status='scheduled' AND p.scheduled_at<=?`, now());
-      for (const g of going) {
-        await runSql("UPDATE premieres SET status='live' WHERE video_id=?", g.video_id);
-        const subs = await allRows('SELECT user_id FROM premiere_reminders WHERE video_id=?', g.video_id);
-        const vv = await get1('SELECT description FROM videos WHERE id=?', g.video_id);
-        for (const s of subs) {
-          try { await insertId('INSERT INTO notifications(user_id,type,video_id,title,text,is_read,created_at) VALUES(?,?,?,?,?,0,?)',
-            s.user_id, 'premiere_live', g.video_id, 'La premiere commence !', String((vv && vv.description) || '').slice(0, 120), now()); } catch (_) {}
-        }
-        // le chat 'premiere:<video_id>' est servi par GET/POST /api/videos/:id/premiere/chat
-      }
-    } catch (_) {}
+    // FIX temps 2026-10-05 (T1) : la transition scheduled→live des premieres + les notifs
+    // premiere_live étaient faites ICI et dans updatePremieres() (toutes les 60 s chacune)
+    // → doubles notifications. La transition vit désormais UNIQUEMENT dans updatePremieres().
     await runSql('UPDATE videos SET scheduled_at=NULL WHERE scheduled_at IS NOT NULL AND scheduled_at <= ?', now());
   } catch (e) {}
 }
@@ -13554,6 +13589,8 @@ initDb().then(() => {
   // v2.48 (bots chaîne vague 3) : premieres (H-15 + bascule live) + rappels rétention
   updatePremieres().catch(()=>{});
   setInterval(()=>{updatePremieres().catch(()=>{})}, 60000);
+  updateScheduledLives().catch(()=>{}); // FIX T6 2026-10-05 : notifie les lives programmés à l'heure
+  setInterval(()=>{updateScheduledLives().catch(()=>{})}, 60000);
   scheduleNudges().catch(()=>{});
   setInterval(()=>{scheduleNudges().catch(()=>{})}, 3600000);
   setInterval(()=>{checkPremieres().catch(()=>{})}, 600000); // v2.48 SPEC-10 : rappels H-15 premieres
