@@ -63,7 +63,7 @@ CREATE TABLE IF NOT EXISTS devices(
   last_seen BIGINT NOT NULL,
   flagged INTEGER NOT NULL DEFAULT 0
 );
-// v2.41 : alertes anti-fraude (vues suspectes, vélocité de likes, vélocité IP, multi-comptes)
+-- v2.41 : alertes anti-fraude (vues suspectes, vélocité de likes, vélocité IP, multi-comptes)
 CREATE TABLE IF NOT EXISTS fraud_alerts(
   id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
   type TEXT NOT NULL,
@@ -72,7 +72,7 @@ CREATE TABLE IF NOT EXISTS fraud_alerts(
   detail TEXT NOT NULL DEFAULT '',
   created_at BIGINT NOT NULL
 );
-// v2.41 : réputation IP à l'inscription (fenêtre glissante de 24 h)
+-- v2.41 : réputation IP à l'inscription (fenêtre glissante de 24 h)
 CREATE TABLE IF NOT EXISTS ip_reputation(
   ip TEXT PRIMARY KEY,
   accounts_count INTEGER NOT NULL DEFAULT 0,
@@ -186,6 +186,14 @@ CREATE TABLE IF NOT EXISTS fund_earnings(
   amount_usd REAL NOT NULL,
   coins INTEGER NOT NULL,
   created_at BIGINT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS fund_applications(
+  id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+  user_id INTEGER UNIQUE NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  created_at BIGINT NOT NULL,
+  decided_at BIGINT,
+  note TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS id_verifications(
   id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
@@ -856,6 +864,27 @@ CREATE TABLE IF NOT EXISTS family_settings(
   screen_time_min INTEGER NOT NULL DEFAULT 60,
   restricted_mode INTEGER NOT NULL DEFAULT 0,
   dm_policy TEXT NOT NULL DEFAULT 'all'
+);
+-- v2.43 : journal d'audit des actions sensibles (admin + sécurité compte)
+CREATE TABLE IF NOT EXISTS audit_logs(
+  id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+  actor_id INTEGER,
+  action TEXT NOT NULL,
+  target_type TEXT,
+  target_id TEXT,
+  ip TEXT,
+  created_at BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS audit_logs_action_idx ON audit_logs(action, created_at);
+-- v2.43 : challenge anti-abus progressif (IP ayant déclenché ≥3 rate-limits en 1h)
+CREATE TABLE IF NOT EXISTS abuse_flags(
+  ip TEXT PRIMARY KEY,
+  user_id INTEGER,
+  score INTEGER NOT NULL DEFAULT 0,
+  challenged INTEGER NOT NULL DEFAULT 0,
+  challenged_at BIGINT,
+  created_at BIGINT NOT NULL,
+  last_event_at BIGINT NOT NULL DEFAULT 0
 );`;
   if (USE_PG) { await pool.query(schema);
     for (const col of ["ALTER TABLE withdrawals ADD COLUMN IF NOT EXISTS decided_at BIGINT",
@@ -1211,6 +1240,61 @@ app.get('/api/earnings/export', auth, async (req, res) => {
       csv += d + ';' + r.amount + ';"' + String(r.reason || '').replace(/"/g, '""') + '"\n';
     }
     res.type('text/csv').set('Content-Disposition', 'attachment; filename="gains-vidigagne.csv"').send(csv);
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// v2.40 : historique des retraits du user connecté (avec n° de reçu joint)
+app.get('/api/me/withdrawals', auth, async (req, res) => {
+  try {
+    const rows = await allRows(
+      `SELECT w.id, w.coins, w.usd, w.method, w.account, w.status, w.created_at, w.decided_at,
+              r.receipt_no FROM withdrawals w
+       LEFT JOIN receipts r ON r.withdrawal_id=w.id
+       WHERE w.user_id=? ORDER BY w.created_at DESC, w.id DESC LIMIT 200`, req.userId);
+    res.json({ withdrawals: rows });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// v2.40 : documents fiscaux annuels — gains (ledger) + retraits payés, mensuel sur 12 mois
+app.get('/api/me/tax-docs', auth, async (req, res) => {
+  try {
+    const year = Math.floor(+req.query.year) || new Date().getFullYear();
+    const y0 = new Date(year, 0, 1).getTime(), y1 = new Date(year + 1, 0, 1).getTime();
+    const coinsToUsd = c => Math.floor(Number(c) / 500 * 100) / 100;
+    const gains = await allRows(
+      'SELECT amount, created_at FROM ledger WHERE user_id=? AND amount>0 AND created_at>=? AND created_at<?',
+      req.userId, y0, y1);
+    const paid = await allRows(
+      "SELECT usd, created_at FROM withdrawals WHERE user_id=? AND status='paid' AND created_at>=? AND created_at<?",
+      req.userId, y0, y1);
+    const byMonth = Array.from({ length: 12 }, (_, i) => ({ month: i + 1, earned_coins: 0, withdrawn_usd: 0 }));
+    let totalEarned = 0, totalWithdrawn = 0;
+    for (const g of gains) {
+      const m = new Date(Number(g.created_at)).getMonth();
+      if (m >= 0 && m < 12) { totalEarned += Number(g.amount); byMonth[m].earned_coins += Number(g.amount); }
+    }
+    for (const w of paid) {
+      const m = new Date(Number(w.created_at)).getMonth();
+      if (m >= 0 && m < 12) { totalWithdrawn += Number(w.usd); byMonth[m].withdrawn_usd += Number(w.usd); }
+    }
+    for (const b of byMonth) b.withdrawn_usd = Math.round(b.withdrawn_usd * 100) / 100;
+    const totalEarnedUsd = coinsToUsd(totalEarned), totalWithdrawnUsd = Math.round(totalWithdrawn * 100) / 100;
+    if (req.query.format === 'csv') {
+      let csv = 'mois;gains_pieces;gains_usd;retraits_payes_usd\n';
+      for (const b of byMonth)
+        csv += String(b.month).padStart(2, '0') + '/' + year + ';' + b.earned_coins + ';'
+          + coinsToUsd(b.earned_coins).toFixed(2) + ';' + b.withdrawn_usd.toFixed(2) + '\n';
+      csv += 'TOTAL;' + totalEarned + ';' + totalEarnedUsd.toFixed(2) + ';' + totalWithdrawnUsd.toFixed(2) + '\n';
+      return res.type('text/csv').set('Content-Disposition',
+        'attachment; filename="documents-fiscaux-' + year + '.csv"').send(csv);
+    }
+    res.json({
+      year,
+      total_earned_coins: totalEarned,
+      total_earned_usd: totalEarnedUsd,
+      total_withdrawn_usd: totalWithdrawnUsd,
+      by_month: byMonth.map(b => ({ month: b.month, earned_usd: coinsToUsd(b.earned_coins), withdrawn_usd: b.withdrawn_usd })),
+      documents: [{ type: 'annual_summary', label: 'Résumé annuel des gains ' + year,
+        url: '/api/me/tax-docs?year=' + year + '&format=csv' }],
+    });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 // v1.67 : le créateur active/coupe la monétisation d'une de ses vidéos
@@ -2066,6 +2150,14 @@ app.get('/api/search/insights', async (req, res) => {
   await mig('users', 'seller_name', `TEXT NOT NULL DEFAULT ''`);
   await mig('users', 'seller_bio', `TEXT NOT NULL DEFAULT ''`);
   await mig('users', 'seller_verified', `INTEGER NOT NULL DEFAULT 0`);
+  // v2.42 (bots ads/business) : comptes professionnels
+  await mig('users', 'account_type', `TEXT NOT NULL DEFAULT 'personal'`);
+  await mig('users', 'company_name', `TEXT NOT NULL DEFAULT ''`);
+  await mig('users', 'contact_email', `TEXT NOT NULL DEFAULT ''`);
+  try {
+    const _pct = `CREATE TABLE IF NOT EXISTS promo_credits(id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'}, user_id INTEGER NOT NULL, coins INTEGER NOT NULL, reason TEXT NOT NULL DEFAULT '', expires_at BIGINT NOT NULL, used_coins INTEGER NOT NULL DEFAULT 0, created_at BIGINT NOT NULL)`;
+    if (USE_PG) await pool.query(_pct); else lite.exec(_pct);
+  } catch (e) {}
   await mig('videos', 'review_status', `TEXT NOT NULL DEFAULT 'ok'`);
   await mig('comments', 'review_status', `TEXT NOT NULL DEFAULT 'ok'`);
   // serveur v12 : photos, filtres commentaires, séries payantes, algo, famille
@@ -2263,7 +2355,11 @@ async function botReviewBadge(r) {
   const fails = [];
   if (!r.full_name || r.full_name.trim().length < 3) fails.push('nom complet manquant');
   if (!VERIF_CATEGORIES.includes(String(r.category || '').toLowerCase())) fails.push('catégorie invalide');
-  if (!r.id_doc_url || !/^https?:\/\//.test(r.id_doc_url)) fails.push('pièce d\u2019identité manquante ou illisible');
+  if (!r.id_doc_url || !/^https?:\/\//.test(r.id_doc_url)) {
+    // FIX v2.42 : sans Cloudinary, storeImage renvoie un nom de fichier local (pas une URL https) —
+    // c'est bien une photo stockée (même classe de correctif que le KYC du 2026-10-04)
+    if (!/^[A-Za-z0-9_\-./]+\.(png|jpe?g|webp|gif)$/i.test(String(r.id_doc_url || ''))) fails.push('pièce d\u2019identité manquante ou illisible');
+  }
   if (!r.website && !r.proof_links) fails.push('aucun site web ni lien de preuve');
   if (!r.activity || r.activity.trim().length < 20) fails.push('description d\u2019activité trop courte');
   // critères d'authenticité façon TikTok
@@ -2581,7 +2677,9 @@ async function notify(userId, type, actorId, videoId, text, commentId) {
       if (!inQuiet) {
         const ws = pushSockets.get(Number(userId));
         if (ws && ws.readyState === 1) {
-          ws.send(JSON.stringify({ t: 'push', id, type, text: String(text || '').slice(0, 200), actor: actorName }));
+          // v2.42 : video_id/comment_id inclus pour ouverture directe depuis le push temps réel
+          ws.send(JSON.stringify({ t: 'push', id, type, text: String(text || '').slice(0, 200), actor: actorName,
+            video_id: videoId || null, comment_id: commentId || null }));
         }
       }
     } catch (_) {}
@@ -2598,9 +2696,12 @@ async function notify(userId, type, actorId, videoId, text, commentId) {
     } catch (_) {}
   } catch (e) {}
 }
+// v2.42 : registre unique des WS (voir routeur 'upgrade' après les setups — FIX du 400 sur /api/push/ws)
+const wsRoute = {};
 function setupPushWs(server) {
   const { WebSocketServer } = require('ws');
-  const wss = new WebSocketServer({ server, path: '/api/push/ws' });
+  const wss = new WebSocketServer({ noServer: true });
+  wsRoute['/api/push/ws'] = wss;
   wss.on('connection', (ws) => {
     let uid = null;
     const hb = setInterval(() => { try { if (ws.readyState === 1) ws.ping(); } catch (_) {} }, 240000);
@@ -2679,6 +2780,7 @@ function pubUser(u) {
   // v1.54 : JAMAIS de données personnelles ici (prénom/nom/naissance = privées, voir privUser)
   return { id: u.id, username: u.username, name: u.name, avatar: u.avatar, bio: u.bio, verified: !!u.verified,
     is_private: !!u.is_private,
+    account_type: u.account_type || 'personal', company_name: u.company_name || '',
     sub_enabled: Number(u.sub_enabled) || 0, sub_price: Number(u.sub_price) || 0, ref_code: u.ref_code || '' };
 }
 // Données personnelles : uniquement pour le propriétaire du compte (/api/auth/me)
@@ -2868,6 +2970,13 @@ async function maybeLoginAlert(userId, ip) {
 // ---------- auth ----------
 app.post('/api/auth/register', async (req, res) => {
   try {
+    // v2.43 : challenge anti-abus d'abord, puis rate-limit inscription (5/heure/IP)
+    if (await abuseCheck(clientIp(req)))
+      return res.status(429).json({ error: 'activité suspecte détectée : résous le petit calcul pour continuer', challenge_required: true, retry_after: 300 });
+    if (registerRateLimited(clientIp(req))) {
+      await abuseEvent(clientIp(req), null);
+      return res.status(429).json({ error: 'trop d\u2019inscriptions depuis cette adresse — réessaie dans une heure', retry_after: 3600 });
+    }
     let { username, name, password, email, first_name, last_name, birthdate, gender } = req.body || {};
     gender = ['male', 'female', 'other'].includes(String(gender || '')) ? String(gender) : '';
     username = (username || '').toLowerCase().trim();
@@ -2941,6 +3050,69 @@ function loginRateLimited(ip, ident) {
   if (_loginAttempts.size > 5000) _loginAttempts.clear();
   return false;
 }
+// ---------- v2.43 : journal d'audit des actions sensibles ----------
+// Jamais bloquant : un échec d'écriture ne doit jamais casser l'action métier.
+async function logAudit(actorId, action, targetType, targetId, req) {
+  try {
+    await runSql('INSERT INTO audit_logs(actor_id,action,target_type,target_id,ip,created_at) VALUES(?,?,?,?,?,?)',
+      actorId == null ? null : Number(actorId), String(action).slice(0, 40),
+      targetType ? String(targetType).slice(0, 40) : null,
+      targetId == null ? null : String(targetId).slice(0, 80),
+      req ? clientIp(req) : null, now());
+  } catch (_) {}
+}
+// v2.43 : rate-limit inscription (5 / heure / IP) — anti création massive de comptes
+const _registerAttempts = new Map();
+function registerRateLimited(ip) {
+  const k = 'rg|' + ip, t = Date.now();
+  let a = _registerAttempts.get(k) || [];
+  a = a.filter(x => t - x < 60 * 60 * 1000);
+  if (a.length >= 5) return true;
+  a.push(t); _registerAttempts.set(k, a);
+  if (_registerAttempts.size > 5000) _registerAttempts.clear();
+  return false;
+}
+// ---------- v2.43 : challenge anti-abus progressif ----------
+// Quand un IP déclenche ≥3 rate-limits en 1h (login, inscription, mot de passe oublié),
+// il est marqué "challenged" : les requêtes sensibles suivantes (login, register)
+// répondent 429 + challenge_required jusqu'à résolution d'un petit calcul.
+// Seuil haut, jamais de faux positif sur usage normal.
+async function abuseEvent(ip, userId) {
+  try {
+    if (!ip) return;
+    const t = now();
+    const r = await get1('SELECT score, last_event_at, challenged FROM abuse_flags WHERE ip=?', ip);
+    const inWindow = r && (t - Number(r.last_event_at || 0) < 3600 * 1000);
+    const score = inWindow ? Number(r.score || 0) + 1 : 1;
+    const challenged = score >= 3 ? 1 : (inWindow ? Number(r.challenged || 0) : 0);
+    if (!r) {
+      await runSql('INSERT INTO abuse_flags(ip,user_id,score,challenged,challenged_at,created_at,last_event_at) VALUES(?,?,?,?,?,?,?)',
+        ip, userId || null, score, challenged, challenged ? t : null, t, t);
+    } else {
+      await runSql('UPDATE abuse_flags SET score=?, user_id=COALESCE(?,user_id), challenged=?, challenged_at=CASE WHEN ? THEN ? ELSE challenged_at END, last_event_at=? WHERE ip=?',
+        score, userId || null, challenged, challenged, t, t, ip);
+    }
+  } catch (_) {}
+}
+async function abuseCheck(ip) {
+  try {
+    if (!ip) return false;
+    const r = await get1('SELECT challenged, challenged_at FROM abuse_flags WHERE ip=?', ip);
+    if (!r || Number(r.challenged) !== 1) return false;
+    if (now() - Number(r.challenged_at || 0) > 24 * 3600 * 1000) {
+      await runSql('UPDATE abuse_flags SET challenged=0, score=0 WHERE ip=?', ip);
+      return false;
+    }
+    return true;
+  } catch (_) { return false; }
+}
+function resetIpLimits(ip) {
+  // Challenge résolu = preuve d'humanité : on efface les compteurs mémoire de cet IP.
+  try {
+    for (const k of [..._loginAttempts.keys()]) if (k.startsWith(ip + '|')) _loginAttempts.delete(k);
+    for (const k of [..._registerAttempts.keys()]) if (k === 'rg|' + ip) _registerAttempts.delete(k);
+  } catch (_) {}
+}
 app.post('/api/auth/login', async (req, res) => {
   try {
     const _vt = await peekVerifiedToken((req.body || {}).verification_token);
@@ -2956,8 +3128,13 @@ app.post('/api/auth/login', async (req, res) => {
       return res.json({ token: _token, user: privUser(_u), coins: _u.coins });
     }
     const ident = ((req.body || {}).username || (req.body || {}).identifier || (req.body || {}).email || '').toLowerCase().trim();
-    if (loginRateLimited(clientIp(req), ident))
+    // v2.43 : challenge anti-abus — un IP "challenged" doit d'abord résoudre le petit calcul
+    if (await abuseCheck(clientIp(req)))
+      return res.status(429).json({ error: 'activité suspecte détectée : résous le petit calcul pour continuer', challenge_required: true, retry_after: 300 });
+    if (loginRateLimited(clientIp(req), ident)) {
+      await abuseEvent(clientIp(req), null); // v2.43 : comptabilise pour le challenge anti-abus
       return res.status(429).json({ error: 'trop de tentatives, réessaie dans 15 minutes' });
+    }
     const u = await get1('SELECT * FROM users WHERE username=? OR email=?', ident, ident);
     if (!u || hashPass(req.body.password || '', u.pass_salt) !== u.pass_hash)
       return res.status(401).json({ error: 'pseudo ou mot de passe incorrect' });
@@ -2969,6 +3146,36 @@ app.post('/api/auth/login', async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 
+// ---------- v2.43 : challenge anti-abus — petit calcul à résoudre ----------
+// Pas de captcha visuel dans l'app : le serveur génère un calcul simple lié à un
+// nonce (5 min). Une bonne réponse lève le flag "challenged" pour l'IP.
+const _challenges = new Map(); // nonce -> { ans, exp }
+app.get('/api/auth/challenge/nonce', async (req, res) => {
+  try {
+    const a = 1 + crypto.randomInt(48), b = 1 + crypto.randomInt(48);
+    const nonce = crypto.randomBytes(16).toString('hex');
+    _challenges.set(nonce, { ans: a + b, exp: Date.now() + 5 * 60 * 1000 });
+    if (_challenges.size > 1000) _challenges.delete(_challenges.keys().next().value);
+    res.json({ nonce, question: a + ' + ' + b + ' = ?' });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.post('/api/auth/challenge/solve', async (req, res) => {
+  try {
+    const nonce = String((req.body || {}).nonce || '');
+    const c = _challenges.get(nonce);
+    if (!c || Date.now() > c.exp) {
+      _challenges.delete(nonce);
+      return res.status(400).json({ error: 'challenge expiré — demande un nouveau calcul' });
+    }
+    if (Number((req.body || {}).answer) !== c.ans)
+      return res.status(400).json({ error: 'mauvaise réponse — réessaie' });
+    _challenges.delete(nonce);
+    const ip = clientIp(req);
+    await runSql('UPDATE abuse_flags SET challenged=0, score=0 WHERE ip=?', ip);
+    resetIpLimits(ip); // preuve d'humanité : les compteurs repartent de zéro
+    res.json({ ok: true, message: 'vérification réussie — tu peux te reconnecter' });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
 app.get('/api/auth/me', auth, async (req, res) => {
   const u = await get1('SELECT * FROM users WHERE id=?', req.userId);
   res.json({ user: privUser(u), coins: u.coins });
@@ -3027,8 +3234,10 @@ app.post('/api/auth/forgot-password', async (req, res) => {
     const email = String((req.body || {}).email || '').trim().toLowerCase();
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))
       return res.status(400).json({ error: 'e-mail invalide' });
-    if (forgotRateLimited(email))
+    if (forgotRateLimited(email)) {
+      await abuseEvent(clientIp(req), null); // v2.43 : comptabilise pour le challenge anti-abus
       return res.status(429).json({ error: 'trop de tentatives, réessaie dans 15 minutes' });
+    }
     const u = await get1('SELECT id FROM users WHERE email=?', email);
     if (u) {
       const code = String(Math.floor(100000 + Math.random() * 900000));
@@ -3063,6 +3272,7 @@ app.post('/api/auth/reset-password', async (req, res) => {
     const salt = crypto.randomBytes(16).toString('hex');
     await runSql('UPDATE users SET pass_hash=?, pass_salt=? WHERE id=?', hashPass(np, salt), salt, u.id);
     await runSql('DELETE FROM password_resets WHERE email=?', email);
+    await logAudit(u.id, 'password_reset', 'user', u.id, req); // v2.43 : audit action sensible
     // v2.33 : confirmation par e-mail (sécurité : l'utilisateur est prévenu du changement)
     sendVidiEmail(email,
       '🔐 Ton mot de passe VidiGagne a été changé',
@@ -3820,11 +4030,13 @@ app.post('/api/playlists', auth, async (req, res) => {
 app.get('/api/playlists/:id', async (req, res) => {
   const pl = await get1('SELECT * FROM playlists WHERE id=?', req.params.id);
   if (!pl) return res.status(404).json({ error: 'introuvable' });
+  // PAGINATION 2026-10-04 : ?page=N (50/page)
+  const plpage = Math.max(1, parseInt(req.query.page, 10) || 1);
   const items = await allRows(
-    'SELECT v.* FROM playlist_items pi JOIN videos v ON v.id=pi.video_id WHERE pi.playlist_id=? ORDER BY pi.pos', pl.id);
+    'SELECT v.* FROM playlist_items pi JOIN videos v ON v.id=pi.video_id WHERE pi.playlist_id=? ORDER BY pi.pos LIMIT 50 OFFSET ' + ((plpage - 1) * 50), pl.id);
   const out = [];
   for (const v of items) { const j = await videoJSON(v, 0); if (j) out.push(j); }
-  res.json({ playlist: pl, videos: out });
+  res.json({ playlist: pl, videos: out, page: plpage, has_more: items.length >= 50 });
 });
 app.post('/api/playlists/:id/items', auth, async (req, res) => {
   const pl = await get1('SELECT * FROM playlists WHERE id=? AND user_id=?', req.params.id, req.userId);
@@ -3900,13 +4112,15 @@ app.get('/api/trending/hashtags', async (req, res) => {
 app.get('/api/hashtag/:tag', async (req, res) => {
   const tag = String(req.params.tag || '').toLowerCase();
   const meId = await optUserId(req);
+  // PAGINATION 2026-10-04 : ?page=N (50/page sur les candidats)
+  const hpage = Math.max(1, parseInt(req.query.page, 10) || 1);
   const rows = await allRows('SELECT * FROM videos WHERE hidden=0 ORDER BY created_at DESC LIMIT 500');
   const out = [];
   for (const v of rows) {
     if (!(await canSeeVideo(v, meId))) continue;
     if (extractTags((v.description || '') + ' ' + (v.tags || '')).includes(tag)) { const j = await videoJSON(v, 0); if (j) out.push(j); }
   }
-  res.json({ tag, videos: out.slice(0, 50) });
+  res.json({ tag, videos: out.slice((hpage - 1) * 50, hpage * 50), page: hpage, has_more: out.length > hpage * 50 });
 });
 // ---------- commentaires : likes + épingler ----------
 app.post('/api/comments/:id/like', auth, async (req, res) => {
@@ -3999,6 +4213,8 @@ app.get('/api/creator/stats', auth, async (req, res) => {
   followers7 = bucket(nf);
   const tipsR = await get1('SELECT COALESCE(SUM(coins),0) AS s FROM tips WHERE to_user_id=?', req.userId);
   const giftsR = await get1('SELECT COALESCE(SUM(cost),0) AS s FROM gifts WHERE to_id=?', req.userId);
+  // v2.42 : gains publicitaires 50-50 (distribution quotidienne)
+  const adEarn = await get1(`SELECT COALESCE(SUM(amount),0) AS s FROM ledger WHERE user_id=? AND reason LIKE '%revenu pub%'`, req.userId);
   res.json({
     videos: vids.length, views, likes: Number(lr.c), followers: Number(fr.c), coins: me.coins,
     watch_time_total: watchTime, watch_time: watchTime,
@@ -4279,6 +4495,7 @@ app.post('/api/kyc/:id/review', adminAuth, async (req, res) => {
         : 'Ta demande de vérification d\'identité n\'a pas pu être validée. Assure-toi que ton document est en cours de validité et bien lisible, puis renvoie une demande depuis l\'application.') + '</p>',
       kmsg).catch(() => {});
   }
+  await logAudit(null, approve ? 'kyc_approve' : 'kyc_reject', 'kyc', req.params.id, req); // v2.43
   res.json({ ok: true, status: approve ? 'approved' : 'rejected' });
 });
 // ---------- page admin : revue des identités ----------
@@ -4760,7 +4977,11 @@ app.get('/api/receipts', auth, async (req, res) => {
   res.json({ receipts: rows });
 });
 app.get('/api/receipts/:id', auth, async (req, res) => {
-  const r = await get1('SELECT * FROM receipts WHERE id=? AND user_id=?', req.params.id, req.userId);
+  let r = await get1('SELECT * FROM receipts WHERE id=? AND user_id=?', req.params.id, req.userId);
+  // v2.40 : accepte aussi le n° de reçu (format VG-AAAA-XXXXXX)
+  if (!r && /VG-/i.test(String(req.params.id)))
+    r = await get1('SELECT * FROM receipts WHERE receipt_no=? AND user_id=?',
+      String(req.params.id).toUpperCase(), req.userId);
   if (!r) return res.status(404).json({ error: 'introuvable' });
   res.json({ receipt: r });
 });
@@ -4775,11 +4996,13 @@ async function fundEligibility(userId) {
   const vw = await get1('SELECT COALESCE(SUM(views),0) AS s FROM videos WHERE user_id=?', userId);
   const avw = await get1('SELECT COALESCE(SUM(ad_views),0) AS s FROM videos WHERE user_id=?', userId);
   const kyc = await get1('SELECT status FROM id_verifications WHERE user_id=?', userId);
+  const app = await get1('SELECT status FROM fund_applications WHERE user_id=?', userId);
   const followers = Number(fol.c), views = Number(vw.s);
   const kycStatus = kyc ? kyc.status : 'none';
+  const appStatus = app ? app.status : 'none'; // v2.42 : la candidature validée par l'admin est requise
   return {
-    eligible: followers >= 1000 && views >= 50000 && kycStatus === 'approved',
-    followers, views, ad_views: Number(avw.s), kyc: kycStatus,
+    eligible: followers >= 1000 && views >= 50000 && kycStatus === 'approved' && appStatus === 'approved',
+    followers, views, ad_views: Number(avw.s), kyc: kycStatus, application: appStatus,
   };
 }
 app.get('/api/fund/status', auth, async (req, res) => {
@@ -4791,9 +5014,61 @@ app.get('/api/fund/status', auth, async (req, res) => {
       followers: e.followers, followers_needed: 1000,
       views: e.views, views_needed: 50000,
       ad_views: e.ad_views, kyc: e.kyc,
+      application: e.application,
       total_earned_usd: Math.floor(Number(er.s) * 100) / 100,
       total_earned_coins: Number(er.c),
     });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// v2.42 : postuler au Fonds Créateurs (les critères doivent être remplis ; l'admin valide ensuite)
+app.post('/api/fund/apply', auth, async (req, res) => {
+  try {
+    const fol = await get1('SELECT COUNT(*) AS c FROM follows WHERE followed_id=?', req.userId);
+    const vw = await get1('SELECT COALESCE(SUM(views),0) AS s FROM videos WHERE user_id=?', req.userId);
+    const kyc = await get1('SELECT status FROM id_verifications WHERE user_id=?', req.userId);
+    const kycStatus = kyc ? kyc.status : 'none';
+    if (!(Number(fol.c) >= 1000 && Number(vw.s) >= 50000 && kycStatus === 'approved'))
+      return res.status(400).json({ error: 'critères non remplis (1000 abonnés, 50 000 vues, identité vérifiée)' });
+    const ex = await get1('SELECT status FROM fund_applications WHERE user_id=?', req.userId);
+    if (ex && ex.status === 'pending') return res.status(400).json({ error: 'candidature déjà en cours d\u2019examen' });
+    if (ex && ex.status === 'approved') return res.status(400).json({ error: 'tu es déjà dans le Fonds Créateurs' });
+    await runSql(`INSERT INTO fund_applications(user_id,status,created_at,decided_at,note) VALUES(?, 'pending', ?, NULL, '')
+      ON CONFLICT(user_id) DO UPDATE SET status='pending', created_at=excluded.created_at, decided_at=NULL, note=''`, req.userId, now());
+    await notify(req.userId, 'system', null, null, '💰 Candidature au Fonds Créateurs envoyée !');
+    res.json({ ok: true, status: 'pending' });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.get('/api/fund/application', auth, async (req, res) => {
+  try {
+    const a = await get1('SELECT status, created_at, decided_at, note FROM fund_applications WHERE user_id=?', req.userId);
+    res.json(a ? { status: a.status, created_at: a.created_at, decided_at: a.decided_at, note: a.note } : { status: 'none' });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.get('/api/admin/fund/applications', async (req, res) => {
+  const t = req.headers['x-admin-token'];
+  if (!process.env.ADMIN_TOKEN || t !== process.env.ADMIN_TOKEN) return res.status(403).json({ error: 'non autorisé' });
+  try {
+    const rows = await allRows(`SELECT fa.*, u.username, u.avatar,
+      (SELECT COUNT(*) FROM follows WHERE followed_id=u.id) AS followers,
+      (SELECT COALESCE(SUM(views),0) FROM videos WHERE user_id=u.id) AS views,
+      (SELECT status FROM id_verifications WHERE user_id=u.id) AS kyc
+      FROM fund_applications fa JOIN users u ON u.id=fa.user_id
+      WHERE fa.status='pending' ORDER BY fa.created_at ASC LIMIT 100`);
+    res.json({ applications: rows });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.post('/api/admin/fund/applications/:id', async (req, res) => {
+  const t = req.headers['x-admin-token'];
+  if (!process.env.ADMIN_TOKEN || t !== process.env.ADMIN_TOKEN) return res.status(403).json({ error: 'non autorisé' });
+  try {
+    const approve = String((req.body || {}).action) === 'approve';
+    const a = await get1('SELECT * FROM fund_applications WHERE id=?', req.params.id);
+    if (!a) return res.status(404).json({ error: 'introuvable' });
+    await runSql('UPDATE fund_applications SET status=?, decided_at=? WHERE id=?',
+      approve ? 'approved' : 'rejected', now(), a.id);
+    await notify(a.user_id, 'system', null, null,
+      approve ? '💰 Bienvenue dans le Fonds Créateurs !' : '💰 Ta candidature au Fonds Créateurs a été refusée.');
+    res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 // Dépôt des revenus publicitaires réels (admin uniquement).
@@ -4850,7 +5125,8 @@ function liveBroadcastViewers(liveId) {
 }
 function setupLiveWs(server) {
   const { WebSocketServer } = require('ws');
-  const wss = new WebSocketServer({ server, path: '/api/live/ws' });
+  const wss = new WebSocketServer({ noServer: true });
+  wsRoute['/api/live/ws'] = wss;
   wss.on('connection', (ws) => {
     let liveId = null, role = null, peerId = null;
     ws.on('message', async (buf) => {
@@ -5217,7 +5493,86 @@ app.get('/api/videos/:id/analytics', auth, async (req, res) => {
         GROUP BY c ORDER BY n DESC LIMIT 1`, vid);
       if (tc && tc.c) top_country = tc.c;
     } catch (e) {}
-    res.json({ views, likes, comments, shares, avg_watch, top_country });
+    // v2.39 : courbe des vues heure par heure (24 dernières heures) — index 23 = heure courante
+    const views_by_hour = new Array(24).fill(0);
+    try {
+      const nowMs = now();
+      const rows24 = await allRows('SELECT created_at FROM video_views WHERE video_id=? AND created_at>=?', vid, nowMs - 24 * 3600 * 1000);
+      for (const r of rows24) {
+        const diff = nowMs - Number(r.created_at);
+        if (diff < 0 || diff >= 24 * 3600 * 1000) continue;
+        const idx = 23 - Math.floor(diff / 3600000);
+        views_by_hour[idx]++;
+      }
+    } catch (e) {}
+    // v2.39 : répartition du trafic par source
+    const traffic = { feed: 0, following: 0, search: 0, profile: 0, deeplink: 0, other: 0 };
+    try {
+      const tr = await allRows('SELECT source, COUNT(*) AS n FROM video_views WHERE video_id=? GROUP BY source', vid);
+      for (const r of tr) {
+        const k = String(r.source || 'feed').toLowerCase();
+        if (k in traffic) traffic[k] += Number(r.n) || 0;
+      }
+    } catch (e) {}
+    res.json({ views, likes, comments, shares, avg_watch, top_country, views_by_hour, traffic });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// ---------- v2.39 : démographie des spectateurs (créateur uniquement) ----------
+// Âge calculé depuis users.birthdate (YYYY-MM-DD) ; spectateurs distincts de video_views.
+app.get('/api/videos/:id/demographics', auth, async (req, res) => {
+  try {
+    const vid = Number(req.params.id);
+    const v = await get1('SELECT * FROM videos WHERE id=?', vid);
+    if (!v) return res.status(404).json({ error: 'vidéo introuvable' });
+    if (Number(v.user_id) !== Number(req.userId))
+      return res.status(403).json({ error: 'réservé au créateur' });
+    const viewers = await allRows(
+      `SELECT vv.viewer_id AS uid, u.birthdate AS birthdate, u.gender AS gender, u.country AS country
+       FROM video_views vv JOIN users u ON u.id=vv.viewer_id
+       WHERE vv.video_id=? AND vv.viewer_id IS NOT NULL GROUP BY vv.viewer_id`, vid);
+    const age = { '13-17': 0, '18-24': 0, '25-34': 0, '35-44': 0, '45+': 0 };
+    const gender = {};
+    const countries = {};
+    const d = new Date(now());
+    const y = d.getUTCFullYear(), mo = d.getUTCMonth() + 1, dy = d.getUTCDate();
+    for (const vw of viewers) {
+      const m = String(vw.birthdate || '').match(/^(\d{4})-(\d{2})-(\d{2})/);
+      if (m) {
+        let a = y - Number(m[1]);
+        if (mo < Number(m[2]) || (mo === Number(m[2]) && dy < Number(m[3]))) a--;
+        if (a >= 13) {
+          const b = a <= 17 ? '13-17' : a <= 24 ? '18-24' : a <= 34 ? '25-34' : a <= 44 ? '35-44' : '45+';
+          age[b]++;
+        }
+      }
+      const g = String(vw.gender || '').trim().toLowerCase() || 'unknown';
+      gender[g] = (gender[g] || 0) + 1;
+      const c = String(vw.country || '').trim().toUpperCase() || 'unknown';
+      countries[c] = (countries[c] || 0) + 1;
+    }
+    res.json({ age, gender, countries });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// ---------- v2.39 : courbe de rétention (créateur uniquement) ----------
+// Pourcentage de spectateurs ayant regardé >= 25/50/75/100 % de la vidéo
+// (max watch_ms par spectateur vs videos.duration en secondes). duration=0 → null.
+app.get('/api/videos/:id/retention', auth, async (req, res) => {
+  try {
+    const vid = Number(req.params.id);
+    const v = await get1('SELECT * FROM videos WHERE id=?', vid);
+    if (!v) return res.status(404).json({ error: 'vidéo introuvable' });
+    if (Number(v.user_id) !== Number(req.userId))
+      return res.status(403).json({ error: 'réservé au créateur' });
+    const dur = Number(v.duration) || 0;
+    if (!dur) return res.json({ r25: null, r50: null, r75: null, r100: null });
+    const rows = await allRows('SELECT user_id, MAX(watch_ms) AS m FROM watch_events WHERE video_id=? GROUP BY user_id', vid);
+    const total = rows.length;
+    const pct = (t) => {
+      if (!total) return 0;
+      const n = rows.filter(r => Number(r.m) >= dur * 1000 * t).length;
+      return Math.round(n / total * 1000) / 10;
+    };
+    res.json({ r25: pct(0.25), r50: pct(0.5), r75: pct(0.75), r100: pct(1) });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 app.get('/api/videos/:id', async (req, res) => {
@@ -5354,6 +5709,11 @@ app.post('/api/videos/:id/watch-reward', auth, async (req, res) => {
     const v = await get1('SELECT * FROM videos WHERE id=?', req.params.id);
     if (!v) return res.status(404).json({ error: 'vidéo introuvable' });
     if (Number(v.user_id) === Number(req.userId)) return res.json({ ok: true, granted: 0, reason: 'self' });
+    // v2.41 : gains bloqués si l'utilisateur est sur un device flagged avec ≥5 comptes (fraud-review)
+    if (await deviceEarningsBlocked(req.userId)) {
+      const _b = await get1('SELECT coins FROM users WHERE id=?', req.userId);
+      return res.json({ ok: true, granted: 0, reason: 'fraud-review', coins: _b ? _b.coins : 0 });
+    }
     const day = new Date().toISOString().slice(0, 10);
     const dayStart = new Date().setHours(0, 0, 0, 0);
     // anti-concurrence (2026-10-04) : la section "anti-doublon → lecture du compteur
@@ -5521,7 +5881,7 @@ app.get('/api/videos/:id/comments', async (req, res) => {
   // PAGINATION 2026-10-04 : ?page=N (50/page, ordre chronologique)
   const page = Math.max(1, parseInt(req.query.page, 10) || 1);
   const rows = await allRows(
-    `SELECT c.*, u.username, u.name, u.avatar FROM comments c
+    `SELECT c.*, u.username, u.name, u.avatar, u.verified FROM comments c
      JOIN users u ON u.id=c.user_id
      WHERE c.video_id=? AND (c.review_status IS NULL OR c.review_status<>'pending')
      ORDER BY c.created_at ASC LIMIT 50 OFFSET ` + ((page - 1) * 50), req.params.id);
@@ -5954,6 +6314,7 @@ app.post('/api/admin/users/:id/suspend', adminAuth, async (req, res) => {
     await runSql('UPDATE users SET suspended=? WHERE id=?', suspend ? 1 : 0, u.id);
     await notify(u.id, 'system', null, null, suspend ? '⛔ Ton compte a été suspendu par un administrateur.' : '✅ Ton compte a été réactivé.');
     res.json({ ok: true, id: u.id, username: u.username, suspended: suspend });
+    await logAudit(null, suspend ? 'user_ban' : 'user_unban', 'user', u.id, req); // v2.43
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 
@@ -5964,6 +6325,22 @@ function checkAdmin(req, res) {
   if (!process.env.ADMIN_TOKEN || t !== process.env.ADMIN_TOKEN) { res.status(403).json({ error: 'non autorisé' }); return false; }
   return true;
 }
+// ---------- v2.43 : journal d'audit admin (actions sensibles) ----------
+// Protégé comme /api/admin/withdrawals : en-tête x-admin-token.
+app.get('/api/admin/audit-logs', adminAuth, async (req, res) => {
+  try {
+    const action = String(req.query.action || '').trim().slice(0, 40);
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 200);
+    const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+    const offset = (page - 1) * limit;
+    const where = action ? 'WHERE action=?' : '';
+    const params = action ? [action] : [];
+    const rows = await allRows(
+      'SELECT * FROM audit_logs ' + where + ' ORDER BY id DESC LIMIT ? OFFSET ?', ...params, limit, offset);
+    const cnt = await get1('SELECT COUNT(*) AS c FROM audit_logs ' + where, ...params);
+    res.json({ ok: true, logs: rows, total: Number((cnt && cnt.c) || 0), page, limit });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
 app.get('/api/admin/withdrawals', async (req, res) => {
   try {
     if (!checkAdmin(req, res)) return;
@@ -5998,6 +6375,7 @@ app.post('/api/admin/withdrawals/:id/approve', async (req, res) => {
         'Ton retrait VidiGagne de ' + w.coins + ' pièces (≈ $' + w.usd + ') via ' + w.method + ' a été payé.')
         .catch(() => {});
     }
+    await logAudit(null, 'withdraw_approve', 'withdrawal', w.id, req); // v2.43
     res.json({ ok: true, id: w.id, status: 'paid' });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
@@ -6029,6 +6407,7 @@ app.post('/api/admin/withdrawals/:id/reject', async (req, res) => {
         'Ton retrait VidiGagne de ' + w.coins + ' pièces a été rejeté. Tes pièces ont été recréditées sur ton compte.')
         .catch(() => {});
     }
+    await logAudit(null, 'withdraw_reject', 'withdrawal', w.id, req); // v2.43
     res.json({ ok: true, id: w.id, status: 'rejected', refunded: w.coins });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
@@ -6170,6 +6549,26 @@ app.get('/api/admin/devices/flagged', async (req, res) => {
         users, accounts: users.length });
     }
     res.json({ devices: out });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+
+// ---------- v2.41 : anti-fraude — révision admin des alertes et de la réputation IP ----------
+// Protégés comme /api/admin/withdrawals : en-tête x-admin-token.
+app.get('/api/admin/fraud/alerts', async (req, res) => {
+  try {
+    if (!checkAdmin(req, res)) return;
+    const rows = await allRows(
+      'SELECT a.*, u.username FROM fraud_alerts a LEFT JOIN users u ON u.id=a.user_id ORDER BY a.created_at DESC LIMIT 200');
+    res.json({ alerts: rows.map(a => ({ id: a.id, type: a.type, user_id: a.user_id, username: a.username || null,
+      ip: a.ip, detail: a.detail, created_at: Number(a.created_at) })) });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.get('/api/admin/fraud/ip', async (req, res) => {
+  try {
+    if (!checkAdmin(req, res)) return;
+    const rows = await allRows('SELECT * FROM ip_reputation ORDER BY flagged DESC, accounts_count DESC LIMIT 200');
+    res.json({ ips: rows.map(r => ({ ip: r.ip, accounts_count: Number(r.accounts_count), flagged: Number(r.flagged),
+      first_seen: Number(r.first_seen), last_seen: Number(r.last_seen) })) });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 
@@ -6882,13 +7281,15 @@ app.get('/api/users/:username/reposts', async (req, res) => {
     const u = await get1('SELECT * FROM users WHERE username=?', String(req.params.username).toLowerCase());
     if (!u) return res.status(404).json({ error: 'utilisateur introuvable' });
     const meId = await optUserId(req);
-    const rows = await allRows('SELECT video_id FROM reposts WHERE user_id=? ORDER BY created_at DESC LIMIT 50', u.id);
+    // PAGINATION 2026-10-04 : ?page=N (30/page)
+    const rpage = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const rows = await allRows('SELECT video_id FROM reposts WHERE user_id=? ORDER BY created_at DESC LIMIT 30 OFFSET ' + ((rpage - 1) * 30), u.id);
     const videos = [];
     for (const r of rows) {
       const v = await get1('SELECT * FROM videos WHERE id=? AND hidden=0', r.video_id);
       if (v && await canSeeVideo(v, meId)) { const j = await videoJSON(v, null); if (j) videos.push(j); }
     }
-    res.json({ videos });
+    res.json({ videos, page: rpage, has_more: rows.length >= 30 });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 
@@ -7000,15 +7401,23 @@ app.post('/api/follow/:username', auth, async (req, res) => {
   await insertIgnore('INSERT OR IGNORE INTO follows(follower_id,followed_id,created_at) VALUES(?,?,?)',
     req.userId, u.id, now());
   await notify(u.id, 'follow', req.userId, null, '');
-  // v2.40 : badge preuve sociale — 1000 abonnés
-  try {
-    const c = await get1('SELECT COUNT(*) AS n FROM follows WHERE followed_id=?', u.id);
-    if (c && Number(c.n) >= 1000) {
-      await insertIgnore('INSERT OR IGNORE INTO user_badges(user_id,badge,awarded_at) VALUES(?,?,?)', u.id, 'rising_star', now());
-    }
-  } catch (e) {}
+  syncRisingStar(u.id).catch(() => {});
   res.json({ following: true });
 });
+
+// v2.42 : badge preuve sociale — synchronisé avec le seuil 1000 abonnés
+// (attribué à >=1000, RETIRÉ si on redescend sous le seuil)
+async function syncRisingStar(userId) {
+  try {
+    const c = await get1('SELECT COUNT(*) AS n FROM follows WHERE followed_id=?', userId);
+    if (c && Number(c.n) >= 1000) {
+      await insertIgnore('INSERT OR IGNORE INTO user_badges(user_id,badge,awarded_at) VALUES(?,?,?)',
+        userId, 'rising_star', now());
+    } else {
+      await runSql('DELETE FROM user_badges WHERE user_id=? AND badge=?', userId, 'rising_star');
+    }
+  } catch (e) {}
+}
 
 // v2.40 : demandes de suivi (comptes privés)
 app.get('/api/follow-requests', auth, async (req, res) => {
@@ -7042,6 +7451,7 @@ app.post('/api/friends/suggestions/:userId/hide', auth, async (req, res) => {
 
 // v2.40 : badges gagnés par l'utilisateur
 app.get('/api/me/badges', auth, async (req, res) => {
+  await syncRisingStar(req.userId).catch(() => {}); // v2.42 : réconcilie le badge 1000 abonnés
   const rows = await allRows('SELECT badge, awarded_at FROM user_badges WHERE user_id=? ORDER BY awarded_at DESC', req.userId);
   const defs = {
     rising_star: { icon: '🌟', name: 'Étoile montante', desc: '1000 abonnés atteints' },
@@ -7065,7 +7475,10 @@ app.post('/api/links/click', auth, async (req, res) => {
 
 app.delete('/api/follow/:username', auth, async (req, res) => {
   const u = await get1('SELECT * FROM users WHERE username=?', String(req.params.username).toLowerCase());
-  if (u) await runSql('DELETE FROM follows WHERE follower_id=? AND followed_id=?', req.userId, u.id);
+  if (u) {
+    await runSql('DELETE FROM follows WHERE follower_id=? AND followed_id=?', req.userId, u.id);
+    syncRisingStar(u.id).catch(() => {}); // v2.42 : retire le badge si <1000
+  }
   res.json({ following: false });
 });
 
@@ -7825,8 +8238,10 @@ app.post('/api/live/exchange-coins', auth, async (req, res) => {
 });
 app.get('/api/live/feed', async (req, res) => {
   try {
+    // PAGINATION 2026-10-04 : ?page=N (20/page)
+    const lpage = Math.max(1, parseInt(req.query.page, 10) || 1);
     const rows = await allRows(
-      'SELECT l.*, u.username, u.name, u.avatar FROM lives l JOIN users u ON u.id=l.user_id WHERE l.ended_at IS NULL ORDER BY l.started_at DESC LIMIT 50');
+      'SELECT l.*, u.username, u.name, u.avatar FROM lives l JOIN users u ON u.id=l.user_id WHERE l.ended_at IS NULL ORDER BY l.started_at DESC LIMIT 20 OFFSET ' + ((lpage - 1) * 20));
     const lives = [];
     for (const r of rows) {
       const lj = liveJSON(r, r, await liveViewersCount(r.id));
@@ -7836,7 +8251,7 @@ app.get('/api/live/feed', async (req, res) => {
       lj.guest_slots = maxGf;
       lives.push(lj);
     }
-    res.json({ lives });
+    res.json({ lives, page: lpage, has_more: rows.length >= 20 });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 app.get('/api/live', async (req, res) => {
@@ -8162,6 +8577,8 @@ app.post('/api/live/:id/chat', auth, async (req, res) => {
     const raw = String((req.body || {}).text || '').trim();
     if (!raw) return res.status(400).json({ error: 'message vide' });
     if (raw.length > 280) return res.status(400).json({ error: 'message trop long (280 caractères max)' });
+    // v2.42 : filtre anti-gros mots sur le chat live → rejet 400 (réutilise ALL_BADWORDS)
+    if (containsBadword(raw)) return res.status(400).json({ error: 'message refusé : langage inapproprié' });
     // v2.33 : un utilisateur banni ou en sourdine ne peut plus écrire dans le chat du live
     const bk = await get1('SELECT kind FROM live_bans WHERE live_id=? AND user_id=?', l.id, req.userId);
     if (bk) return res.status(403).json({ error: bk.kind === 'mute' ? 'tu es en sourdine sur ce live' : 'tu es banni de ce live' });
@@ -8169,6 +8586,15 @@ app.post('/api/live/:id/chat', auth, async (req, res) => {
     const id = await insertId('INSERT INTO live_chat(live_id,user_id,text,created_at) VALUES(?,?,?,?)',
       l.id, req.userId, text, now());
     const u = await get1('SELECT username,name,avatar FROM users WHERE id=?', req.userId);
+    // v2.42 : diffusion temps réel aux clients WS du live (/api/live/ws)
+    try {
+      const room = liveRooms[l.id];
+      if (room) {
+        const cpayload = JSON.stringify({ t: 'chat', id, user: u ? u.username : '?', text, created_at: now() });
+        if (room.broadcaster && room.broadcaster.readyState === 1) room.broadcaster.send(cpayload);
+        room.viewers.forEach((w) => { if (w && w.readyState === 1) w.send(cpayload); });
+      }
+    } catch (_) {}
     res.json({ ok: true, id, msg: { id, user: pubUser({ ...u, id: req.userId }), text, created_at: now() } });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
@@ -8560,17 +8986,23 @@ app.post('/api/sounds', auth, uploadAudio.single('audio'), async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'échec du téléversement' }); }
 });
 app.get('/api/sounds/trending', async (req, res) => {
-  const rows = await allRows('SELECT * FROM sounds ORDER BY use_count DESC, created_at DESC LIMIT 20');
-  res.json({ sounds: rows.map(s => soundJSON(s)) });
+  // PAGINATION 2026-10-04 : ?page=N (20/page)
+  const spage = Math.max(1, parseInt(req.query.page, 10) || 1);
+  const rows = await allRows('SELECT * FROM sounds ORDER BY use_count DESC, created_at DESC LIMIT 20 OFFSET ' + ((spage - 1) * 20));
+  res.json({ sounds: rows.map(s => soundJSON(s)), page: spage, has_more: rows.length >= 20 });
 });
 app.get('/api/sounds/search', async (req, res) => {
   const q = '%' + String(req.query.q || '').toLowerCase() + '%';
-  const rows = await allRows('SELECT * FROM sounds WHERE LOWER(title) LIKE ? OR LOWER(artist) LIKE ? ORDER BY use_count DESC LIMIT 20', q, q);
-  res.json({ sounds: rows.map(s => soundJSON(s)) });
+  // PAGINATION 2026-10-04 : ?page=N (20/page)
+  const sq2page = Math.max(1, parseInt(req.query.page, 10) || 1);
+  const rows = await allRows('SELECT * FROM sounds WHERE LOWER(title) LIKE ? OR LOWER(artist) LIKE ? ORDER BY use_count DESC LIMIT 20 OFFSET ' + ((sq2page - 1) * 20), q, q);
+  res.json({ sounds: rows.map(s => soundJSON(s)), page: sq2page, has_more: rows.length >= 20 });
 });
 app.get('/api/sounds/favs/mine', auth, async (req, res) => {
-  const rows = await allRows('SELECT s.* FROM sound_favs f JOIN sounds s ON s.id=f.sound_id WHERE f.user_id=? ORDER BY f.created_at DESC LIMIT 50', req.userId);
-  res.json({ sounds: rows.map(s => soundJSON(s, req.userId, true)) });
+  // PAGINATION 2026-10-04 : ?page=N (30/page)
+  const sfpage = Math.max(1, parseInt(req.query.page, 10) || 1);
+  const rows = await allRows('SELECT s.* FROM sound_favs f JOIN sounds s ON s.id=f.sound_id WHERE f.user_id=? ORDER BY f.created_at DESC LIMIT 30 OFFSET ' + ((sfpage - 1) * 30), req.userId);
+  res.json({ sounds: rows.map(s => soundJSON(s, req.userId, true)), page: sfpage, has_more: rows.length >= 30 });
 });
 app.get('/api/sounds/:id', async (req, res) => {
   const s = await get1('SELECT * FROM sounds WHERE id=?', req.params.id);
@@ -8761,6 +9193,33 @@ app.get('/api/shop/sellers/:username', async (req, res) => {
       seller_name: u.seller_name, seller_bio: u.seller_bio || '', seller_verified: !!u.seller_verified },
     products: prods.map(productJSON),
   });
+});
+
+// ---------- v2.42 : comptes professionnels (business) ----------
+app.post('/api/me/business', auth, async (req, res) => {
+  try {
+    const b = req.body || {};
+    const company = String(b.company_name || '').trim().slice(0, 100);
+    const email = String(b.contact_email || '').trim().slice(0, 120);
+    if (!company) return res.status(400).json({ error: 'nom de l’entreprise requis' });
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ error: 'e-mail de contact invalide' });
+    await runSql(`UPDATE users SET account_type='business', company_name=?, contact_email=? WHERE id=?`,
+      company, email, req.userId);
+    res.json({ ok: true, account_type: 'business', company_name: company });
+  } catch (e) { res.status(500).json({ error: 'échec de la mise à niveau' }); }
+});
+app.delete('/api/me/business', auth, async (req, res) => {
+  try {
+    await runSql(`UPDATE users SET account_type='personal', company_name='', contact_email='' WHERE id=?`, req.userId);
+    res.json({ ok: true, account_type: 'personal' });
+  } catch (e) { res.status(500).json({ error: 'échec du retour au compte personnel' }); }
+});
+app.get('/api/me/business', auth, async (req, res) => {
+  try {
+    const u = await get1('SELECT account_type, company_name, contact_email FROM users WHERE id=?', req.userId);
+    res.json({ account_type: (u && u.account_type) || 'personal', company_name: (u && u.company_name) || '',
+      contact_email: (u && u.contact_email) || '' });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 
 // ---------- boutique : produits (CRUD vendeur) ----------
@@ -9080,6 +9539,7 @@ app.post('/api/shop/refunds/:id/decide', auth, async (req, res) => {
     }
     await runSql("UPDATE shop_refunds SET status=?, decided_at=? WHERE id=?",
       approve ? 'approved' : 'rejected', now(), rf.id);
+    await logAudit(null, approve ? 'refund_approve' : 'refund_reject', 'refund', rf.id, req); // v2.43
     res.json({ ok: true, status: approve ? 'approved' : 'rejected' });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
@@ -9183,7 +9643,17 @@ app.post('/api/ads/campaigns', auth, async (req, res) => {
     const b = req.body || {};
     const title = String(b.title || '').trim().slice(0, 80);
     const budget = Math.floor(Number(b.budget_coins));
-    const target = String(b.target || '').slice(0, 80);
+    // v2.42 : target accepte un objet {countries:[...], age_min, age_max} (JSON stringifié) ou une chaîne legacy
+    let target = '';
+    if (b.target && typeof b.target === 'object') {
+      const t = {};
+      if (Array.isArray(b.target.countries)) t.countries = b.target.countries.map(c => String(c).toUpperCase().slice(0, 4)).slice(0, 50);
+      if (Number.isFinite(Number(b.target.age_min))) t.age_min = Math.max(0, Math.floor(Number(b.target.age_min)));
+      if (Number.isFinite(Number(b.target.age_max))) t.age_max = Math.max(0, Math.floor(Number(b.target.age_max)));
+      target = JSON.stringify(t).slice(0, 500);
+    } else {
+      target = String(b.target || '').slice(0, 80);
+    }
     const product_id = b.product_id ? Number(b.product_id) : null;
     if (!title) return res.status(400).json({ error: 'titre requis' });
     if (!budget || budget < 10) return res.status(400).json({ error: 'budget minimum : 10 pièces' });
@@ -9233,7 +9703,26 @@ app.get('/api/ads/feed', async (req, res) => {
   const rows = await allRows(
     `SELECT * FROM ad_campaigns WHERE status='active' AND spent_coins < budget_coins ORDER BY created_at DESC LIMIT 20`);
   if (!rows.length) return res.json({ ads: [] });
-  const c = rows[Math.floor(Math.random() * rows.length)];
+  // v2.42 : ciblage pays — une campagne ciblant des pays n'est servie qu'aux viewers de ces pays
+  let viewerCountry = '';
+  try {
+    const meId = await optUserId(req);
+    if (meId) {
+      const mu = await get1('SELECT country FROM users WHERE id=?', meId);
+      viewerCountry = String((mu && mu.country) || '').toUpperCase();
+    }
+  } catch (_) {}
+  const eligible = rows.filter(c => {
+    const t = String(c.target || '');
+    if (!t) return true;
+    let tj = null;
+    try { tj = JSON.parse(t); } catch (_) { return true; } // cible legacy (chaîne libre) → servie à tous
+    if (!tj || !Array.isArray(tj.countries) || !tj.countries.length) return true;
+    const list = tj.countries.map(x => String(x).toUpperCase());
+    return !!viewerCountry && list.includes(viewerCountry);
+  });
+  if (!eligible.length) return res.json({ ads: [] });
+  const c = eligible[Math.floor(Math.random() * eligible.length)];
   let product = null;
   if (c.product_id) {
     const p = await get1('SELECT * FROM products WHERE id=? AND active=1', c.product_id);
@@ -9287,10 +9776,12 @@ app.post('/api/admin/mod-queue/:id/review', adminAuth, async (req, res) => {
         const v = await get1('SELECT user_id, description FROM videos WHERE id=?', q.target_id);
         if (v) { authorId = v.user_id; label = 'ta vidéo'; }
         await runSql('DELETE FROM videos WHERE id=?', q.target_id);
+        await logAudit(null, 'video_delete', 'video', q.target_id, req); // v2.43 : suppression admin
       } else if (q.target_type === 'comment') {
         const c = await get1('SELECT user_id, text FROM comments WHERE id=?', q.target_id);
         if (c) { authorId = c.user_id; label = 'ton commentaire'; }
         await runSql('DELETE FROM comments WHERE id=?', q.target_id);
+        await logAudit(null, 'comment_delete', 'comment', q.target_id, req); // v2.43 : suppression admin
       }
       if (authorId) {
         try {
@@ -9608,10 +10099,18 @@ app.post('/api/videos/:id/promote', auth, async (req, res) => {
     if (!budget || budget < 10)
       return res.status(400).json({ error: 'budget minimum : 10 pièces' });
     const target = String((req.body || {}).target || '').slice(0, 80);
-    const debited = await runSqlChanges('UPDATE users SET coins=coins-? WHERE id=? AND coins>=?', budget, req.userId, budget);
-    if (!debited) return res.status(400).json({ error: 'pas assez de pièces' });
-    await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
-      req.userId, -budget, 'promotion vidéo #' + v.id, now());
+    // v2.42 : le crédit promo est déduit EN PREMIER (avant les pièces de l'utilisateur)
+    const fromCredit = await consumePromoCredit(req.userId, budget);
+    const remainder = budget - fromCredit;
+    if (remainder > 0) {
+      const debited = await runSqlChanges('UPDATE users SET coins=coins-? WHERE id=? AND coins>=?', remainder, req.userId, remainder);
+      if (!debited) return res.status(400).json({ error: 'pas assez de pièces' });
+      await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
+        req.userId, -remainder, 'promotion vidéo #' + v.id, now());
+    }
+    if (fromCredit > 0)
+      await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
+        req.userId, 0, 'promotion vidéo #' + v.id + ' (crédit promo ' + fromCredit + ' pièces)', now());
     const id = await insertId(
       `INSERT INTO video_promos(video_id,user_id,budget_coins,spent_coins,impressions,clicks,target,status,created_at)
        VALUES(?,?,?,0,0,0,?,'active',?)`,
@@ -9944,6 +10443,50 @@ app.post('/api/admin/ads/distribute', adminAuth, async (req, res) => {
     res.json({ ok: true, ...(await distributeAdRevenue(day)) });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
+// v2.42 : crédit promo — pièces offertes utilisables UNIQUEMENT pour les promotions vidéo
+// (déduites en priorité quand l'utilisateur crée une promo).
+app.post('/api/admin/promo-credit', adminAuth, async (req, res) => {
+  try {
+    const b = req.body || {};
+    const uid = Number(b.user_id);
+    const coins = Math.floor(Number(b.coins));
+    const reason = String(b.reason || '').trim().slice(0, 120);
+    const days = Math.max(1, Math.floor(Number(b.expires_days || 30)));
+    if (!uid || !coins || coins <= 0) return res.status(400).json({ error: 'user_id et coins (>0) requis' });
+    const u = await get1('SELECT id FROM users WHERE id=?', uid);
+    if (!u) return res.status(404).json({ error: 'utilisateur introuvable' });
+    const t = now();
+    const id = await insertId(
+      `INSERT INTO promo_credits(user_id,coins,reason,expires_at,used_coins,created_at) VALUES(?,?,?,?,0,?)`,
+      uid, coins, reason, t + days * 86400000, t);
+    res.json({ ok: true, id, user_id: uid, coins, expires_at: t + days * 86400000 });
+  } catch (e) { res.status(500).json({ error: 'échec du crédit promo' }); }
+});
+app.get('/api/me/promo-credits', auth, async (req, res) => {
+  try {
+    const rows = await allRows(`SELECT * FROM promo_credits WHERE user_id=? AND expires_at>? AND used_coins<coins ORDER BY created_at ASC`,
+      req.userId, now());
+    const total = rows.reduce((a, r) => a + (Number(r.coins) - Number(r.used_coins)), 0);
+    res.json({ credits: rows.map(r => ({ id: r.id, coins: Number(r.coins), used_coins: Number(r.used_coins),
+      available: Number(r.coins) - Number(r.used_coins), reason: r.reason || '',
+      expires_at: Number(r.expires_at), created_at: Number(r.created_at) })), total_available: total });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// Débiter le crédit promo disponible (FIFO, plus ancien d'abord). Retourne les pièces prises sur crédit.
+async function consumePromoCredit(userId, amount) {
+  const t = now();
+  const rows = await allRows(`SELECT id, coins, used_coins FROM promo_credits
+    WHERE user_id=? AND expires_at>? AND used_coins<coins ORDER BY created_at ASC, id ASC`, userId, t);
+  let need = amount, taken = 0;
+  for (const r of rows) {
+    if (need <= 0) break;
+    const avail = Number(r.coins) - Number(r.used_coins);
+    const use = Math.min(avail, need);
+    await runSql('UPDATE promo_credits SET used_coins=used_coins+? WHERE id=?', use, r.id);
+    taken += use; need -= use;
+  }
+  return taken;
+}
 // Déclenchement quotidien à 23h59 (heure serveur, UTC sur Render)
 setInterval(async () => {
   try{
@@ -10695,4 +11238,15 @@ initDb().then(() => {
   const server = app.listen(PORT, () => console.log(
     `VidiGagne Server v2 sur http://localhost:${PORT} (db=${USE_PG ? 'postgres' : 'sqlite'}, storage=${USE_CLOUDINARY ? 'cloudinary' : 'local'})`));
   setupLiveWs(server); setupPushWs(server);
+  // v2.42 FIX : UN SEUL routeur 'upgrade' — avant, chaque WebSocketServer({server, path})
+  // attachait son propre listener et le 1er (live) répondait 400 aux upgrades du 2nd (push),
+  // ce qui cassait COMPLÈTEMENT /api/push/ws (le push temps réel n'était jamais livré).
+  server.on('upgrade', (req, socket, head) => {
+    try {
+      const pathname = String(req.url || '').split('?')[0];
+      const wss = wsRoute[pathname];
+      if (!wss) { socket.destroy(); return; }
+      wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
+    } catch (_) { try { socket.destroy(); } catch (_) {} }
+  });
 }).catch(e => { console.error('Échec init DB:', e.message); process.exit(1); });
