@@ -9852,13 +9852,14 @@ app.post('/api/pk/tournament/:id/join', auth, async (req, res) => {
     const t = await get1('SELECT * FROM pk_tournaments WHERE id=?', req.params.id);
     if (!t) return res.status(404).json({ error: 'tournoi introuvable' });
     // B8 (2026-10-05) : distinguer « tournoi complet » (4 joueurs) de « tournoi fermé ».
-    // Ordre : statut d'abord (un tournoi démarré/fermé refuse tout → 403), puis complétude (400).
-    if (t.status !== 'open') return res.status(403).json({ error: 'tournoi fermé' });
+    // Un tournoi PLEIN répond 400 « complet » (même si le statut est passé à 'running'
+    // dès le 4e joueur) ; un tournoi non plein mais non 'open' répond 403 « fermé ».
     const pc = await get1(
       `SELECT COUNT(*) AS c FROM (SELECT player1_id AS p FROM pk_matches WHERE tournament_id=?
         UNION SELECT player2_id FROM pk_matches WHERE tournament_id=? AND player2_id IS NOT NULL)`,
       req.params.id, req.params.id);
     if (pc && Number(pc.c) >= 4) return res.status(400).json({ error: 'tournoi complet' });
+    if (t.status !== 'open') return res.status(403).json({ error: 'tournoi fermé' });
     const existing = await get1('SELECT id FROM pk_matches WHERE tournament_id=? AND (player1_id=? OR player2_id=?)',
       req.params.id, req.userId, req.userId);
     if (existing) return res.status(400).json({ error: 'déjà inscrit' });
