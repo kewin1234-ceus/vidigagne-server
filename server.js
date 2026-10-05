@@ -3122,7 +3122,10 @@ async function videoJSON(v, meId) {
     location: v.location || '', effect: v.effect || '',
     views: Number(v.views), likes: Number(likes), comments: Number(cmts), liked,
     created_at: Number(v.created_at),
-    user: privUser(u),
+    // FIX sécu 2026-10-05 (équipe performance #4) : JAMAIS de données personnelles
+    // (prénom/nom/naissance/genre/pays) dans les objets vidéo publics — pubUser only.
+    // Les données privées restent sur /api/auth/me (privUser).
+    user: pubUser(u),
   };
 }
 // parse les mots-clés de filtre de commentaires (v12)
@@ -3301,7 +3304,12 @@ app.post('/api/auth/register', async (req, res) => {
       if (!_vb.ok) return res.status(400).json({ error: _vb.error });
     }
     const exists = await get1('SELECT 1 FROM users WHERE username=?', username);
-    if (exists) return res.status(409).json({ error: 'ce pseudo est déjà pris' }); // unicité serveur (les pseudos sont publics par design, comme TikTok)
+    if (exists) {
+      // FIX sécu 2026-10-05 (F4) : hash factice pour aligner le temps de réponse
+      // (409 immédiat vs 200 lent → énumération de pseudos par timing). Coût ~identique au hash réel.
+      try { hashPass('timing-dummy-' + username, crypto.randomBytes(16).toString('hex')); } catch (_) {}
+      return res.status(409).json({ error: 'ce pseudo est déjà pris' });
+    }
     if (email) {
       const eExists = await get1('SELECT 1 FROM users WHERE email=?', email);
       // v1.54 : message générique pour l'e-mail (anti-énumération de comptes)
