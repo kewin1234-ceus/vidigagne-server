@@ -40,7 +40,10 @@ async function initDb() {
     pool = new Pool({ connectionString: u.toString(), ssl: { rejectUnauthorized: false } });
   } else {
     const { DatabaseSync } = require('node:sqlite');
-    const DATA = path.join(__dirname, 'data');
+    // v2.47-race (Équipe 8/10) : VG_DATA_DIR permet aux bots de concurrence d'utiliser
+    // une base SQLite DÉDIÉE (aucun verrou partagé avec les autres instances/bots).
+    // Non défini en production → comportement inchangé (data/vidigagne.db).
+    const DATA = process.env.VG_DATA_DIR || path.join(__dirname, 'data');
     fs.mkdirSync(DATA, { recursive: true });
     lite = new DatabaseSync(path.join(DATA, 'vidigagne.db'));
     // v2.31 : WAL + busy_timeout — la base locale est ouverte par 2 serveurs (3000/3100)
@@ -1156,7 +1159,7 @@ app.post('/api/live/:id/goal', auth, async (req, res) => {
   try {
     const live = await get1('SELECT * FROM lives WHERE id=?', req.params.id);
     if (!live) return res.status(404).json({ error: 'live introuvable' });
-    if (Number(live.broadcaster_id) !== Number(req.userId)) return res.status(403).json({ error: 'non autorisé' });
+    if (Number(live.user_id) !== Number(req.userId)) return res.status(403).json({ error: 'non autorisé' });
     const title = String((req.body || {}).title || 'Objectif').slice(0, 80);
     const target = Math.max(10, Math.min(1000000, Math.floor(Number((req.body || {}).target_coins) || 100)));
     const gid = await insertId('INSERT INTO live_goals(live_id,title,target_coins,created_at) VALUES(?,?,?,?)',
@@ -1169,7 +1172,7 @@ app.get('/api/live/:id/goals', async (req, res) => {
     const goals = await allRows('SELECT * FROM live_goals WHERE live_id=? ORDER BY created_at DESC', req.params.id);
     const out = [];
     for (const g of goals) {
-      const r = await get1(`SELECT COALESCE(SUM(cost),0) AS s FROM gift_events WHERE live_id=? AND created_at>=?`,
+      const r = await get1(`SELECT COALESCE(SUM(cost),0) AS s FROM gifts WHERE live_id=? AND created_at>=?`,
         g.live_id, g.created_at);
       out.push({ ...g, current_coins: Number(r.s) || 0 });
     }
@@ -1870,6 +1873,11 @@ app.get('/api/search/insights', async (req, res) => {
       status TEXT NOT NULL DEFAULT 'pending', score_a INTEGER NOT NULL DEFAULT 0,
       score_b INTEGER NOT NULL DEFAULT 0, winner_id INTEGER,
       created_at BIGINT NOT NULL, starts_at BIGINT, ends_at BIGINT)`);
+    // FIX 2026-10-05 (audit DB) : live_goals n'existait que sur Postgres → 500 "no such table"
+    // sur SQLite local pour POST /api/live/:id/goal et GET /api/live/:id/goals
+    lite.exec(`CREATE TABLE IF NOT EXISTS live_goals(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, live_id INTEGER NOT NULL, title TEXT NOT NULL,
+      target_coins INTEGER NOT NULL, created_at BIGINT NOT NULL)`);
     lite.exec(`CREATE TABLE IF NOT EXISTS calls(
       id INTEGER PRIMARY KEY AUTOINCREMENT, caller_id INTEGER NOT NULL, callee_id INTEGER NOT NULL,
       ctype TEXT NOT NULL DEFAULT 'video', status TEXT NOT NULL DEFAULT 'ringing',
@@ -2195,7 +2203,7 @@ app.get('/api/search/insights', async (req, res) => {
   // serveur v10 : stories durcies, live, sons, pourboires, abonnements payants
   await mig('stories', 'privacy', `TEXT NOT NULL DEFAULT 'public'`);
   await mig('stories', 'text', `TEXT NOT NULL DEFAULT ''`);
-  await mig('videos', 'visibility', `TEXT NOT NULL DEFAULT 'public'`);
+  // FIX 2026-10-05 (audit DB) : videos.visibility déjà migré plus haut — doublon supprimé
   await mig('lives', 'peak_viewers', `INTEGER NOT NULL DEFAULT 0`);
   await mig('lives', 'duration_s', `INTEGER NOT NULL DEFAULT 0`);
   await mig('lives', 'gifts_total', `INTEGER NOT NULL DEFAULT 0`);
@@ -2235,12 +2243,28 @@ app.get('/api/search/insights', async (req, res) => {
     if (USE_PG) await pool.query('CREATE INDEX IF NOT EXISTS watch_events_user_video_idx ON watch_events(user_id,video_id)');
     else lite.exec('CREATE INDEX IF NOT EXISTS watch_events_user_video_idx ON watch_events(user_id,video_id)');
   } catch (e) {}
-  // serveur v13 : replays de lives, voix de synthèse TTS, "pourquoi cette vidéo"
-  await mig('videos', 'is_replay', `INTEGER NOT NULL DEFAULT 0`);
-  await mig('videos', 'live_id', `INTEGER`);
-  await mig('videos', 'tts_text', `TEXT NOT NULL DEFAULT ''`);
-  await mig('videos', 'tts_voice', `TEXT NOT NULL DEFAULT ''`);
-  await mig('videos', 'tts_rate', `REAL NOT NULL DEFAULT 1`);
+  // FIX 2026-10-05 (audit DB) : index manquants sur les requêtes les plus chaudes —
+  // sans eux, Postgres fait un seq scan sur des tables à millions de lignes
+  // (profils, compteurs d'abonnés/likes/commentaires, historique wallet, chat).
+  for (const idxSql of [
+    'CREATE INDEX IF NOT EXISTS idx_videos_user ON videos(user_id)',
+    'CREATE INDEX IF NOT EXISTS idx_videos_created ON videos(created_at DESC)',
+    'CREATE INDEX IF NOT EXISTS idx_follows_followed ON follows(followed_id)',
+    'CREATE INDEX IF NOT EXISTS idx_follows_follower ON follows(follower_id)',
+    'CREATE INDEX IF NOT EXISTS idx_likes_video ON likes(video_id)',
+    'CREATE INDEX IF NOT EXISTS idx_comments_video ON comments(video_id)',
+    'CREATE INDEX IF NOT EXISTS idx_video_views_video ON video_views(video_id)',
+    'CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id)',
+    'CREATE INDEX IF NOT EXISTS idx_ledger_user ON ledger(user_id)',
+    'CREATE INDEX IF NOT EXISTS idx_notifications_actor ON notifications(actor_id)',
+    'CREATE INDEX IF NOT EXISTS idx_gifts_live ON gifts(live_id)',
+    'CREATE INDEX IF NOT EXISTS idx_tips_to ON tips(to_user_id)',
+  ]) {
+    try { if (USE_PG) await pool.query(idxSql); else lite.exec(idxSql); } catch (e) {}
+  }
+  // FIX 2026-10-05 (audit DB) : bloc de migrations dupliqué supprimé — is_replay, live_id,
+  // tts_text, tts_voice, tts_rate étaient déjà migrés plus haut (avec des types TEXT) ;
+  // la 2e passe ne faisait rien (colonne déjà existante) et créait une ambiguïté de type.
   // catégories de boutique par défaut
   try {
     const n = await get1('SELECT COUNT(*) AS c FROM categories');
@@ -2384,27 +2408,46 @@ async function distributeAdRevenue(dayStr) {
 const COIN_EXPIRY_MS = 90 * 24 * 3600 * 1000; // 3 mois
 
 // pièces valides (non expirées) d'un utilisateur — comptabilité FIFO sur le ledger
+// FIX 2026-10-05 (Équipe 8/10) : les DÉBITS consomment d'abord les crédits encore
+// VALIDES au moment du débit (les plus anciens d'abord), puis les expirés à défaut.
+// Avant : un débit consommait les crédits les plus anciens même expirés — un retrait
+// « mangeait » des pièces expirées (sans valeur) tout en versant leur contre-valeur,
+// permettant de retirer au total plus que les pièces valides (ex. 3000 retirés pour
+// 2000 valides, même en séquentiel).
 async function validCoins(userId) {
   const rows = await allRows(
     'SELECT amount, created_at FROM ledger WHERE user_id=? ORDER BY created_at ASC, id ASC', userId);
   const tnow = now();
-  const queue = []; // crédits [montant, timestamp]
+  const credits = []; // crédits restants [montant, timestamp]
   for (const r of rows) {
     const amt = Number(r.amount) || 0;
+    const ts = Number(r.created_at) || 0;
     if (amt > 0) {
-      queue.push([amt, Number(r.created_at) || 0]);
+      credits.push([amt, ts]);
     } else if (amt < 0) {
       let need = -amt;
-      while (need > 0 && queue.length) {
-        const take = Math.min(queue[0][0], need);
-        queue[0][0] -= take; need -= take;
-        if (queue[0][0] <= 0) queue.shift();
+      // 1) crédits encore valides au moment du débit (plus anciens d'abord)
+      for (const c of credits) {
+        if (need <= 0) break;
+        if (c[0] > 0 && ts - c[1] < COIN_EXPIRY_MS) {
+          const take = Math.min(c[0], need);
+          c[0] -= take; need -= take;
+        }
       }
+      // 2) à défaut, les crédits déjà expirés
+      for (const c of credits) {
+        if (need <= 0) break;
+        if (c[0] > 0) {
+          const take = Math.min(c[0], need);
+          c[0] -= take; need -= take;
+        }
+      }
+      for (let i = credits.length - 1; i >= 0; i--) if (credits[i][0] <= 0) credits.splice(i, 1);
     }
   }
   // expire les crédits de 3 mois ou plus
   let valid = 0, expired = 0;
-  for (const [amt, ts] of queue) {
+  for (const [amt, ts] of credits) {
     if (tnow - ts >= COIN_EXPIRY_MS) expired += amt;
     else valid += amt;
   }
@@ -2576,6 +2619,20 @@ async function withUserLock(userId, fn) {
   finally { release(); if (_userLocks.get(key) === cur) _userLocks.delete(key); }
 }
 
+// ---------- crochet de test « race » (Équipe 8/10 — concurrence, 2026-10-05) ----------
+// Simule l'entrelacement Postgres en local : node:sqlite est synchrone et sérialise
+// totalement les requêtes, ce qui MASQUE les TOCTOU réels en production (pool async).
+// Quand l'en-tête X-Race-Test: 1 est présent (bots de concurrence uniquement), on insère
+// un vrai délai async entre la lecture et l'écriture des sections critiques, ce qui
+// reproduit l'intercalage des requêtes simultanées sur Postgres.
+// Sans l'en-tête : aucun effet (zéro impact en production — le délai ne ralentit que
+// la requête du testeur qui l'envoie).
+function raceGap(req) {
+  if (req && req.headers && req.headers['x-race-test'] === '1')
+    return new Promise(r => setTimeout(r, 40));
+  return null;
+}
+
 // ---------- stockage vidéos ----------
 const DATA = path.join(__dirname, 'data');
 const UP = path.join(DATA, 'uploads');
@@ -2654,7 +2711,11 @@ function fileUrl(f) {
 
 const app = express();
 app.disable('x-powered-by'); // ne pas annoncer la techno du serveur
-app.set('trust proxy', 1); // m10 : derrière Render, req.ip = vraie IP cliente (pas de x-forwarded-for falsifiable)
+app.set('trust proxy', (() => { const _tp = parseInt(process.env.TRUST_PROXY || '', 10); return Number.isFinite(_tp) ? _tp : 1; })());
+// v2.47-sec : Railway ajoute la vraie IP cliente comme DERNIER segment de X-Forwarded-For,
+// donc trust=1 lit exactement ce segment (segments forgés à gauche ignorés). En local/dev
+// (connexion directe, aucun proxy), X-Forwarded-For EST falsifiable et contourne les
+// rate-limits par IP → mettre TRUST_PROXY=0 en dev/test.
 // ---------- durcissement sécurité v1.54 : headers ----------
 app.use((req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
@@ -2684,6 +2745,21 @@ function hashPass(pw, salt) {
 }
 function validUsername(u) {
   return typeof u === 'string' && /^[a-z0-9._]{2,24}$/.test(u);
+}
+// FIX torture 2026-10-05 : âge minimum 13 ans VÉRIFIÉ CÔTÉ SERVEUR (l'app le fait déjà côté client,
+// mais un appel API direct pouvait créer un compte pour un enfant de 10 ans ou avec une date future)
+function validBirthdate(bd) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(bd || '')) return { ok: false, error: 'date de naissance invalide' };
+  const d = new Date(bd + 'T12:00:00Z');
+  if (isNaN(d.getTime())) return { ok: false, error: 'date de naissance invalide' };
+  const nowD = new Date();
+  if (d > nowD) return { ok: false, error: 'la date de naissance ne peut pas être dans le futur' };
+  let age = nowD.getUTCFullYear() - d.getUTCFullYear();
+  const m = nowD.getUTCMonth() - d.getUTCMonth();
+  if (m < 0 || (m === 0 && nowD.getUTCDate() < d.getUTCDate())) age--;
+  if (age < 13) return { ok: false, error: 'il faut avoir au moins 13 ans pour utiliser VidiGagne' };
+  if (age > 120) return { ok: false, error: 'date de naissance invalide' };
+  return { ok: true };
 }
 async function auth(req, res, next) {
   const h = req.headers.authorization || '';
@@ -3080,11 +3156,18 @@ async function maybeLoginAlert(userId, ip) {
 app.post('/api/auth/register', async (req, res) => {
   try {
     // v2.43 : challenge anti-abus d'abord, puis rate-limit inscription (5/heure/IP)
-    if (await abuseCheck(clientIp(req)))
-      return res.status(429).json({ error: 'activité suspecte détectée : résous le petit calcul pour continuer', challenge_required: true, retry_after: 300 });
-    if (registerRateLimited(clientIp(req))) {
-      await abuseEvent(clientIp(req), null);
-      return res.status(429).json({ error: 'trop d\u2019inscriptions depuis cette adresse — réessaie dans une heure', retry_after: 3600 });
+    // 2026-10-05 : VG_TEST_HOOKS=1 (instances locales des bots) → pas de garde-fous anti-abus.
+    // Les 310 bots d'enchaînement partagent l'IP localhost et déclencheraient le challenge en
+    // permanence (faux 429). Le comportement réel reste testé par chain-captcha-abuse et
+    // chain-rate-limit contre l'instance :3111 (sans hooks). Sans effet en production (Railway
+    // ne définit pas VG_TEST_HOOKS).
+    if (!VG_TEST_HOOKS) {
+      if (await abuseCheck(clientIp(req)))
+        return res.status(429).json({ error: 'activité suspecte détectée : résous le petit calcul pour continuer', challenge_required: true, retry_after: 300 });
+      if (registerRateLimited(clientIp(req))) {
+        await abuseEvent(clientIp(req), null);
+        return res.status(429).json({ error: 'trop d\u2019inscriptions depuis cette adresse — réessaie dans une heure', retry_after: 3600 });
+      }
     }
     let { username, name, password, email, first_name, last_name, birthdate, gender } = req.body || {};
     gender = ['male', 'female', 'other'].includes(String(gender || '')) ? String(gender) : '';
@@ -3104,6 +3187,11 @@ app.post('/api/auth/register', async (req, res) => {
     first_name = String(first_name || '').trim().slice(0, 40);
     last_name = String(last_name || '').trim().slice(0, 40);
     birthdate = /^\d{4}-\d{2}-\d{2}$/.test(birthdate || '') ? birthdate : '';
+    // FIX torture 2026-10-05 : 13 ans minimum vérifié côté serveur
+    if (birthdate) {
+      const _vb = validBirthdate(birthdate);
+      if (!_vb.ok) return res.status(400).json({ error: _vb.error });
+    }
     const exists = await get1('SELECT 1 FROM users WHERE username=?', username);
     if (exists) return res.status(409).json({ error: 'ce pseudo est déjà pris' }); // unicité serveur (les pseudos sont publics par design, comme TikTok)
     if (email) {
@@ -3112,9 +3200,19 @@ app.post('/api/auth/register', async (req, res) => {
       if (eExists) return res.status(409).json({ error: 'inscription impossible avec ces informations' });
     }
     const salt = crypto.randomBytes(16).toString('hex');
-    const id = await insertId(
-      'INSERT INTO users(username,name,first_name,last_name,birthdate,gender,email,pass_hash,pass_salt,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)',
-      username, (name || username).slice(0, 40), first_name, last_name, birthdate, gender, email, hashPass(password, salt), salt, now());
+    await raceGap(req); // crochet test concurrence (Équipe 8/10) : simule l'intercalage Postgres
+    // FIX race 2026-10-05 (Équipe 8/10) : 2 inscriptions simultanées avec le même
+    // pseudo → la 2e viole la contrainte UNIQUE : 409 propre au lieu de 500.
+    let id;
+    try {
+      id = await insertId(
+        'INSERT INTO users(username,name,first_name,last_name,birthdate,gender,email,pass_hash,pass_salt,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)',
+        username, (name || username).slice(0, 40), first_name, last_name, birthdate, gender, email, hashPass(password, salt), salt, now());
+    } catch (e) {
+      if (/UNIQUE/i.test(String((e && e.message) || '')))
+        return res.status(409).json({ error: 'ce pseudo est déjà pris' });
+      throw e;
+    }
     // code parrain unique
     let refCode = null;
     for (let i = 0; i < 20 && !refCode; i++) {
@@ -3129,12 +3227,18 @@ app.post('/api/auth/register', async (req, res) => {
         const inv = await get1('SELECT * FROM invites WHERE UPPER(code)=?', invCode);
         if (inv && !inv.invited_user_id && Number(inv.user_id) !== Number(id)) {
           await runSql('UPDATE users SET referred_by=? WHERE id=?', inv.user_id, id);
-          await runSql("UPDATE invites SET invited_user_id=?, status='inscrit' WHERE id=?", id, inv.id);
-          const _t = now();
-          await runSql('UPDATE users SET coins=coins+50 WHERE id=?', id);
-          await runSql('UPDATE users SET coins=coins+50 WHERE id=?', inv.user_id);
-          await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)', id, 50, 'invitation (lien)', _t);
-          await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)', inv.user_id, 50, 'invitation de @' + username, _t);
+          await raceGap(req); // crochet test concurrence (Équipe 8/10) : simule l'intercalage Postgres
+          // FIX race 2026-10-05 (Équipe 8/10) : double bonus — seul le premier inscrit
+          // qui réclame ce code reçoit le +50/+50 (UPDATE conditionnel). Avant : 2
+          // inscriptions simultanées avec le même code créditaient 2 fois (prouvé : 200 au lieu de 100).
+          const invClaimed = await runSqlChanges("UPDATE invites SET invited_user_id=?, status='inscrit' WHERE id=? AND invited_user_id IS NULL", id, inv.id);
+          if (invClaimed) {
+            const _t = now();
+            await runSql('UPDATE users SET coins=coins+50 WHERE id=?', id);
+            await runSql('UPDATE users SET coins=coins+50 WHERE id=?', inv.user_id);
+            await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)', id, 50, 'invitation (lien)', _t);
+            await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)', inv.user_id, 50, 'invitation de @' + username, _t);
+          }
         }
       } catch (_) {}
     }
@@ -3238,11 +3342,15 @@ app.post('/api/auth/login', async (req, res) => {
     }
     const ident = ((req.body || {}).username || (req.body || {}).identifier || (req.body || {}).email || '').toLowerCase().trim();
     // v2.43 : challenge anti-abus — un IP "challenged" doit d'abord résoudre le petit calcul
-    if (await abuseCheck(clientIp(req)))
-      return res.status(429).json({ error: 'activité suspecte détectée : résous le petit calcul pour continuer', challenge_required: true, retry_after: 300 });
-    if (loginRateLimited(clientIp(req), ident)) {
-      await abuseEvent(clientIp(req), null); // v2.43 : comptabilise pour le challenge anti-abus
-      return res.status(429).json({ error: 'trop de tentatives, réessaie dans 15 minutes' });
+    // 2026-10-05 : VG_TEST_HOOKS=1 (instances locales des bots) → pas de garde-fous anti-abus
+    // (même justification que sur /api/auth/register ; comportement réel testé sur :3111).
+    if (!VG_TEST_HOOKS) {
+      if (await abuseCheck(clientIp(req)))
+        return res.status(429).json({ error: 'activité suspecte détectée : résous le petit calcul pour continuer', challenge_required: true, retry_after: 300 });
+      if (loginRateLimited(clientIp(req), ident)) {
+        await abuseEvent(clientIp(req), null); // v2.43 : comptabilise pour le challenge anti-abus
+        return res.status(429).json({ error: 'trop de tentatives, réessaie dans 15 minutes' });
+      }
     }
     const u = await get1('SELECT * FROM users WHERE username=? OR email=?', ident, ident);
     if (!u || hashPass(req.body.password || '', u.pass_salt) !== u.pass_hash)
@@ -3575,6 +3683,12 @@ app.patch('/api/auth/me', auth, async (req, res) => {
       _links = JSON.stringify(arr.slice(0, 5).map(l => ({ t: String(l.t || l.title || '').slice(0, 40), u: String(l.u || l.url || '').slice(0, 200) })).filter(l => l.u));
     } catch (e) { _links = null; }
   }
+  // FIX torture 2026-10-05 : 13 ans minimum aussi sur modification du profil
+  let _bd = /^\d{4}-\d{2}-\d{2}$/.test(birthdate || '') ? birthdate : null;
+  if (_bd) {
+    const _vb = validBirthdate(_bd);
+    if (!_vb.ok) return res.status(400).json({ error: _vb.error });
+  }
   await runSql('UPDATE users SET name=COALESCE(?,name), avatar=COALESCE(?,avatar), bio=COALESCE(?,bio), first_name=COALESCE(?,first_name), last_name=COALESCE(?,last_name), birthdate=COALESCE(?,birthdate), gender=COALESCE(?,gender), country=COALESCE(?,country), cover=COALESCE(?,cover), pronouns=COALESCE(?,pronouns), links=COALESCE(?,links) WHERE id=?',
     name !== undefined && name !== null ? String(name).slice(0, 40) : null,
     _avatar,
@@ -3583,7 +3697,7 @@ app.patch('/api/auth/me', auth, async (req, res) => {
     bio !== undefined && bio !== null ? String(bio).slice(0, 150) : null,
     first_name !== undefined ? String(first_name).trim().slice(0, 40) : null,
     last_name !== undefined ? String(last_name).trim().slice(0, 40) : null,
-    /^\d{4}-\d{2}-\d{2}$/.test(birthdate || '') ? birthdate : null,
+    _bd,
     _gender,
     /^[A-Z]{2}$/.test(String(country || '')) ? String(country) : null,
     _cover, _pronouns, _links, req.userId);
@@ -3682,6 +3796,11 @@ const uploadVoice = multer({
   },
 });
 async function storeVoice(file) {
+  // FIX fuzz 2026-10-05 : valider le contenu réel (le mimetype multipart est falsifiable —
+  // un fichier texte déguisé en audio était accepté). WebM accepté : les vocaux de l'app
+  // sont enregistrés en WebM/Opus (detectMediaKind → 'video' pour EBML).
+  const kind = detectMediaKind(mediaBytes(file));
+  if (kind !== 'audio' && kind !== 'video') throw new Error('fichier audio invalide (contenu non reconnu)');
   const ext = '.webm';
   if (USE_CLOUDINARY) {
     const tmp = path.join(os.tmpdir(), 'vgvoice' + Date.now() + '_' + crypto.randomBytes(6).toString('hex') + ext);
@@ -3742,6 +3861,8 @@ function stripBannedTags(text) {
 app.post('/api/videos', auth, upload.single('video'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'aucune vidéo reçue' });
+    // FIX torture 2026-10-05 : fichier vide → 400 explicite
+    if (!req.file.size) return res.status(400).json({ error: 'fichier vide : envoie une vraie vidéo' });
     // v1.54 : quota de stockage (2 Go / utilisateur)
     if (!(await checkQuota(req.userId, req.file.size || 0)))
       return res.status(413).json({ error: 'quota de stockage atteint (2 Go)' });
@@ -3852,7 +3973,12 @@ app.post('/api/videos', auth, upload.single('video'), async (req, res) => {
       }
     } catch (e) {}
     res.json({ video: await videoJSON(v, req.userId), pending_review: !!badW });
-  } catch (e) { res.status(500).json({ error: "échec du téléversement" }); }
+  } catch (e) {
+    // FIX torture 2026-10-05 : fichier invalide (0 octet, corrompu, faux format) → 400, pas 500
+    if (e && /fichier (vidéo|audio|image) invalide|contenu non reconnu/i.test(e.message || ''))
+      return res.status(400).json({ error: 'fichier invalide : envoie une vraie vidéo' });
+    res.status(500).json({ error: "échec du téléversement" });
+  }
 });
 
 // ---------- v12 : publication photo (carrousel, max 10 images) ----------
@@ -3886,7 +4012,12 @@ app.post('/api/photos', auth, uploadPhotos.array('photos', 10), async (req, res)
     }
     const v = await get1('SELECT * FROM videos WHERE id=?', id);
     res.json({ video: await videoJSON(v, req.userId), pending_review: !!badW });
-  } catch (e) { res.status(500).json({ error: 'échec du téléversement' }); }
+  } catch (e) {
+    // FIX torture 2026-10-05 : fichier invalide → 400, pas 500
+    if (e && /fichier (vidéo|audio|image) invalide|contenu non reconnu/i.test(e.message || ''))
+      return res.status(400).json({ error: 'fichier invalide : envoie une vraie photo' });
+    res.status(500).json({ error: 'échec du téléversement' });
+  }
 });
 
 // ==================== PHASE 2 ====================
@@ -3974,10 +4105,16 @@ app.post('/api/withdraw/:id/cancel', auth, async (req, res) => {
     if (Number(w.user_id) !== Number(req.userId)) return res.status(403).json({ error: 'non autorisé' });
     if (w.status !== 'pending') return res.status(400).json({ error: 'déjà traité (' + w.status + ')' });
     const t = now();
+    await raceGap(req); // crochet test concurrence (Équipe 8/10) : simule l'intercalage Postgres
+    // FIX race 2026-10-05 (Équipe 8/10) : double annulation — la transition
+    // pending→cancelled est atomique (UPDATE conditionnel) ; seul le premier passage
+    // rembourse. Avant : 5 annulations simultanées remboursaient 5 fois
+    // (prouvé : 10000 au lieu de 2000).
+    const cancelled = await runSqlChanges("UPDATE withdrawals SET status='cancelled', decided_at=? WHERE id=? AND status='pending'", t, w.id);
+    if (!cancelled) return res.status(400).json({ error: 'déjà traité (' + w.status + ')' });
     await runSql('UPDATE users SET coins=coins+? WHERE id=?', w.coins, w.user_id);
     await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
       w.user_id, w.coins, 'annulation retrait #' + w.id + ' par l\'utilisateur', t);
-    await runSql('UPDATE withdrawals SET status=?, decided_at=? WHERE id=?', 'cancelled', t, w.id);
     await runSql('UPDATE receipts SET status=? WHERE withdrawal_id=?', 'cancelled', w.id);
     await notify(w.user_id, 'withdrawal', null, null,
       '↩️ Ton retrait de ' + w.coins + ' 🪙 a été annulé. Les pièces ont été recréditées.');
@@ -3990,18 +4127,25 @@ function streakBonus(n) { return Math.min(Math.max(1, n) * 5, 50); }
 function utcDay(ms) { return new Date(ms).toISOString().slice(0, 10); }
 app.post('/api/streak/checkin', auth, async (req, res) => {
   try {
-    const t = now(), today = utcDay(t), yest = utcDay(t - 86400000);
-    const row = await get1('SELECT * FROM login_streaks WHERE user_id=?', req.userId);
-    if (row && row.last_day === today)
-      return res.json({ ok: true, streak: row.streak, bonus: 0, already: true, day: today });
-    const streak = (row && row.last_day === yest) ? row.streak + 1 : 1;
-    const bonus = streakBonus(streak);
-    await runSql('UPDATE users SET coins=coins+? WHERE id=?', bonus, req.userId);
-    await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
-      req.userId, bonus, '🔥 bonus série jour ' + streak, t);
-    if (row) await runSql('UPDATE login_streaks SET streak=?, last_day=?, updated_at=? WHERE user_id=?', streak, today, t, req.userId);
-    else await runSql('INSERT INTO login_streaks(user_id,streak,last_day,updated_at) VALUES(?,?,?,?)', req.userId, streak, today, t);
-    res.json({ ok: true, streak, bonus, day: today });
+    // FIX race 2026-10-05 (Équipe 8/10) : double checkin — lecture+crédit sérialisés
+    // par utilisateur. Avant : 2 requêtes simultanées créditaient le bonus 2 fois
+    // (prouvé : +10 au lieu de +5).
+    const out = await withUserLock(req.userId, async () => {
+      const t = now(), today = utcDay(t), yest = utcDay(t - 86400000);
+      const row = await get1('SELECT * FROM login_streaks WHERE user_id=?', req.userId);
+      if (row && row.last_day === today)
+        return { ok: true, streak: row.streak, bonus: 0, already: true, day: today };
+      const streak = (row && row.last_day === yest) ? row.streak + 1 : 1;
+      const bonus = streakBonus(streak);
+      await raceGap(req); // crochet test concurrence (Équipe 8/10) : simule l'intercalage Postgres
+      await runSql('UPDATE users SET coins=coins+? WHERE id=?', bonus, req.userId);
+      await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
+        req.userId, bonus, '🔥 bonus série jour ' + streak, t);
+      if (row) await runSql('UPDATE login_streaks SET streak=?, last_day=?, updated_at=? WHERE user_id=?', streak, today, t, req.userId);
+      else await runSql('INSERT INTO login_streaks(user_id,streak,last_day,updated_at) VALUES(?,?,?,?)', req.userId, streak, today, t);
+      return { ok: true, streak, bonus, day: today };
+    });
+    res.json(out);
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 app.get('/api/streak', auth, async (req, res) => {
@@ -4056,6 +4200,12 @@ app.post('/api/quests/:key/claim', auth, async (req, res) => {
     await runSql(ins, req.userId, q.key, day, t);
     const again = await get1('SELECT created_at FROM quest_claims WHERE user_id=? AND quest_key=? AND day=?', req.userId, q.key, day);
     if (!again || Number(again.created_at) !== t) return res.status(400).json({ error: 'récompense déjà réclamée aujourd\'hui' });
+    // v2.46 : gains bloqués si l'utilisateur est sur un device flagged avec ≥5 comptes (fraud-review)
+    // — même protection que les watch-rewards (cohérence anti-fraude, audit économique 2026-10-05)
+    if (await deviceEarningsBlocked(req.userId)) {
+      const _b = await get1('SELECT coins FROM users WHERE id=?', req.userId);
+      return res.json({ ok: true, reward: 0, granted: 0, reason: 'fraud-review', coins: _b ? _b.coins : 0 });
+    }
     await runSql('UPDATE users SET coins=coins+? WHERE id=?', q.reward, req.userId);
     await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
       req.userId, q.reward, '🎯 quête "' + q.name + '"', t);
@@ -4120,7 +4270,11 @@ app.post('/api/gifts/:id/thank', auth, async (req, res) => {
     if (Number(g.to_id) !== Number(req.userId)) return res.status(403).json({ error: 'non autorisé' });
     if (g.thanked) return res.json({ ok: true, already: true });
     const me = await get1('SELECT username FROM users WHERE id=?', req.userId);
-    await runSql('UPDATE gifts SET thanked=1 WHERE id=?', g.id);
+    await raceGap(req); // crochet test concurrence (Équipe 8/10) : simule l'intercalage Postgres
+    // FIX race 2026-10-05 (Équipe 8/10) : 5 remerciements simultanés notifiaient 5 fois.
+    // Seul le premier (UPDATE conditionnel) envoie la notification.
+    const marked = await runSqlChanges('UPDATE gifts SET thanked=1 WHERE id=? AND (thanked=0 OR thanked IS NULL)', g.id);
+    if (!marked) return res.json({ ok: true, already: true });
     await notify(g.from_id, 'gift_thanks', req.userId, g.video_id,
       '🙏 @' + me.username + ' te remercie pour ton cadeau !');
     res.json({ ok: true });
@@ -4738,12 +4892,13 @@ app.get('/admin/kyc', (req, res) => {
 <div id="gate"><h1>🔐 Accès admin</h1><p style="color:#666">Colle ton token admin pour voir les vérifications d'identité.</p><input id="tk" type="password" placeholder="Token admin" autocomplete="off"><button onclick="go()">Accéder</button><p id="err" style="color:#c00"></p></div>
 <div id="main" style="display:none"><h1>🔍 Vérifications d'identité en attente</h1><div id="list"><p>Chargement…</p></div></div>
 <script>let T='';
+const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 async function go(){T=document.getElementById('tk').value.trim();const r=await fetch('/api/kyc/pending',{headers:{'x-admin-token':T}});if(!r.ok){document.getElementById('err').textContent='Token invalide';return}document.getElementById('gate').style.display='none';document.getElementById('main').style.display='';load()}
 async function load(){const r=await fetch('/api/kyc/pending',{headers:{'x-admin-token':T}});const d=await r.json();
 const box=document.getElementById('list');
 if(!d.pending.length){box.innerHTML='<p>Aucune demande en attente ✅</p>';return}
-box.innerHTML=d.pending.map(p=>'<div class="card" id="k'+p.id+'"><div><b>@'+p.username+'</b> <span class="meta">'+p.name+' • '+p.country+' • '+p.doc_type+' • expire : '+(p.expiry||'?')+'</span></div>'
-+'<div><img src="'+p.doc_front+'"></div>'+(p.doc_back?'<div><img src="'+p.doc_back+'"></div>':'')
+box.innerHTML=d.pending.map(p=>'<div class="card" id="k'+p.id+'"><div><b>@'+esc(p.username)+'</b> <span class="meta">'+esc(p.name)+' • '+esc(p.country)+' • '+esc(p.doc_type)+' • expire : '+esc(p.expiry||'?')+'</span></div>'
++'<div><img src="'+esc(p.doc_front)+'"></div>'+(p.doc_back?'<div><img src="'+esc(p.doc_back)+'"></div>':'')
 +'<div class="row"><button class="ok" onclick="rev('+p.id+',true)">✅ Approuver</button><button class="ko" onclick="rev('+p.id+',false)">❌ Rejeter</button></div></div>').join('')}
 async function rev(id,ok){await fetch('/api/kyc/'+id+'/review',{method:'POST',headers:{'Content-Type':'application/json','x-admin-token':T},body:JSON.stringify({approve:ok})});
 document.getElementById('k'+id).remove();const box=document.getElementById('list');if(!box.children.length)box.innerHTML='<p>Aucune demande en attente ✅</p>'}
@@ -5001,17 +5156,33 @@ app.post('/api/withdraw', auth, async (req, res) => {
     const me = await get1('SELECT * FROM users WHERE id=?', req.userId);
     if (!me) return res.status(400).json({ error: 'compte introuvable' });
     // 🤖 le bot rejette à l'immédiat les pièces expirées (3 mois ou plus)
-    const vc = await validCoins(req.userId);
-    if (vc.expired > 0 && n > vc.valid)
-      return res.status(400).json({ error: '🤖 ' + vc.expired + ' de tes pièces ont expiré (3 mois ou plus). Seules ' + vc.valid + ' pièces sont retirables.' });
-    if (n > vc.valid)
-      return res.status(400).json({ error: 'pas assez de pièces valides (' + vc.valid + ' disponibles)' });
+    // FIX race 2026-10-05 (Équipe 8/10) : TOCTOU pièces valides — le contrôle
+    // validCoins + le débit sont sérialisés par utilisateur. Avant : 2 retraits
+    // simultanés passaient chacun le contrôle (ex. 2000 valides) puis débitaient
+    // sur le total → retraits cumulés > pièces valides.
+    const wdOut = await withUserLock(req.userId, async () => {
+      const vc = await validCoins(req.userId);
+      if (vc.expired > 0 && n > vc.valid) {
+        const e = new Error('🤖 ' + vc.expired + ' de tes pièces ont expiré (3 mois ou plus). Seules ' + vc.valid + ' pièces sont retirables.');
+        e.httpStatus = 400; throw e;
+      }
+      if (n > vc.valid) {
+        const e = new Error('pas assez de pièces valides (' + vc.valid + ' disponibles)');
+        e.httpStatus = 400; throw e;
+      }
+      await raceGap(req); // crochet test concurrence (Équipe 8/10) : simule l'intercalage Postgres
+      // débit atomique anti double-retrait (race condition)
+      const debited = await runSqlChanges('UPDATE users SET coins=coins-? WHERE id=? AND coins>=?', n, req.userId, n);
+      if (!debited) { const e = new Error('pas assez de pièces'); e.httpStatus = 400; throw e; }
+      await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
+        req.userId, -n, 'retrait ' + pm.type, now());
+      return { ok: true };
+    }).catch(e => {
+      if (e.httpStatus) return { _err: e.message, _status: e.httpStatus };
+      throw e;
+    });
+    if (wdOut._err) return res.status(wdOut._status).json({ error: wdOut._err });
     const usd = Math.floor(n / 500 * 100) / 100;
-    // débit atomique anti double-retrait (race condition)
-    const debited = await runSqlChanges('UPDATE users SET coins=coins-? WHERE id=? AND coins>=?', n, req.userId, n);
-    if (!debited) return res.status(400).json({ error: 'pas assez de pièces' });
-    await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
-      req.userId, -n, 'retrait ' + pm.type, now());
     const wid = await insertId(
       'INSERT INTO withdrawals(user_id,coins,usd,method,account,status,created_at) VALUES(?,?,?,?,?,?,?)',
       req.userId, n, usd, pm.type, pm.account, 'pending', now());
@@ -5038,7 +5209,13 @@ app.post('/api/referral', auth, async (req, res) => {
     const parrain = await get1('SELECT * FROM users WHERE UPPER(ref_code)=?', code);
     if (!parrain) return res.status(404).json({ error: 'code invalide' });
     if (Number(parrain.id) === Number(req.userId)) return res.status(400).json({ error: 'impossible' });
-    await runSql('UPDATE users SET referred_by=? WHERE id=? AND referred_by IS NULL', parrain.id, req.userId);
+    await raceGap(req); // crochet test concurrence (Équipe 8/10) : simule l'intercalage Postgres
+    // FIX race 2026-10-05 (Équipe 8/10) : double-claim — le 2e passage concurrent
+    // trouve referred_by déjà renseigné (UPDATE conditionnel → 0 ligne) et est rejeté
+    // AVANT de créditer. Avant : les deux requêtes passaient le test `me.referred_by`
+    // puis créditaient +50/+50 chacune (prouvé : 250 au lieu de 50).
+    const claimed = await runSqlChanges('UPDATE users SET referred_by=? WHERE id=? AND referred_by IS NULL', parrain.id, req.userId);
+    if (!claimed) return res.status(400).json({ error: 'code déjà utilisé' });
     await runSql('UPDATE users SET coins=coins+50 WHERE id=?', req.userId);
     await runSql('UPDATE users SET coins=coins+50 WHERE id=?', parrain.id);
     const t = now();
@@ -6533,9 +6710,16 @@ app.post('/api/polls/:id/vote', auth, async (req, res) => {
       return res.json({ poll: await pollJSON(p.id, req.userId) }); // déjà voté ici
     if (old) {
       // changement d'avis : on retire l'ancien vote
-      await runSql('UPDATE poll_options SET votes=votes-1 WHERE id=?', old.option_id);
-      await runSql('UPDATE poll_votes SET option_id=? WHERE poll_id=? AND user_id=?', optId, p.id, req.userId);
-      await runSql('UPDATE poll_options SET votes=votes+1 WHERE id=?', optId);
+      await raceGap(req); // crochet test concurrence (Équipe 8/10) : simule l'intercalage Postgres
+      // FIX race 2026-10-05 (Équipe 8/10) : 5 changements simultanés A→B corrompaient
+      // les compteurs (prouvé : A=-4, B=5). Seule la requête qui déplace vraiment le
+      // vote (UPDATE conditionnel sur l'ancienne option) ajuste les compteurs.
+      const moved = await runSqlChanges('UPDATE poll_votes SET option_id=? WHERE poll_id=? AND user_id=? AND option_id=?',
+        optId, p.id, req.userId, old.option_id);
+      if (moved) {
+        await runSql('UPDATE poll_options SET votes=votes-1 WHERE id=?', old.option_id);
+        await runSql('UPDATE poll_options SET votes=votes+1 WHERE id=?', optId);
+      }
     } else {
       // n'incrémente que si le vote a vraiment été inséré (anti double-vote)
       const inserted = await insertIgnore('INSERT OR IGNORE INTO poll_votes(poll_id,user_id,option_id) VALUES(?,?,?)',
@@ -6691,6 +6875,24 @@ const ORPHAN_CHECKS = [
   { key: 'follows_follower',  table: 'follows',       column: 'follower_id', ref_table: 'users',  ref_column: 'id', label: 'follows → follower manquant' },
   { key: 'follows_followed',  table: 'follows',       column: 'followed_id', ref_table: 'users',  ref_column: 'id', label: 'follows → suivi manquant' },
   { key: 'withdrawals_user',  table: 'withdrawals',   column: 'user_id',     ref_table: 'users',  ref_column: 'id', label: 'retraits → utilisateur manquant' },
+  // FIX 2026-10-05 (audit DB) : couverture étendue — 60+ tables avec FK logiques n'étaient pas scannées
+  { key: 'messages_conv',     table: 'messages',      column: 'conversation_id', ref_table: 'conversations', ref_column: 'id', label: 'messages → conversation manquante' },
+  { key: 'messages_sender',   table: 'messages',      column: 'sender_id', ref_table: 'users',  ref_column: 'id', label: 'messages → expéditeur manquant' },
+  { key: 'tips_to',           table: 'tips',          column: 'to_user_id', ref_table: 'users', ref_column: 'id', label: 'pourboires → destinataire manquant' },
+  { key: 'tips_from',         table: 'tips',          column: 'from_user_id', ref_table: 'users', ref_column: 'id', label: 'pourboires → expéditeur manquant' },
+  { key: 'tips_video',        table: 'tips',          column: 'video_id',  ref_table: 'videos', ref_column: 'id', label: 'pourboires → vidéo manquante' },
+  { key: 'reposts_user',      table: 'reposts',       column: 'user_id',   ref_table: 'users',  ref_column: 'id', label: 'reposts → utilisateur manquant' },
+  { key: 'reposts_video',     table: 'reposts',       column: 'video_id',  ref_table: 'videos', ref_column: 'id', label: 'reposts → vidéo manquante' },
+  { key: 'comment_likes_comment', table: 'comment_likes', column: 'comment_id', ref_table: 'comments', ref_column: 'id', label: 'likes commentaire → commentaire manquant' },
+  { key: 'comment_likes_user', table: 'comment_likes', column: 'user_id',  ref_table: 'users',  ref_column: 'id', label: 'likes commentaire → utilisateur manquant' },
+  { key: 'poll_votes_poll',   table: 'poll_votes',    column: 'poll_id',   ref_table: 'polls',  ref_column: 'id', label: 'votes sondage → sondage manquant' },
+  { key: 'poll_votes_user',   table: 'poll_votes',    column: 'user_id',   ref_table: 'users',  ref_column: 'id', label: 'votes sondage → utilisateur manquant' },
+  { key: 'watch_events_user', table: 'watch_events',  column: 'user_id',  ref_table: 'users',  ref_column: 'id', label: 'événements vue → utilisateur manquant' },
+  { key: 'watch_events_video', table: 'watch_events', column: 'video_id', ref_table: 'videos', ref_column: 'id', label: 'événements vue → vidéo manquante' },
+  { key: 'video_views_viewer', table: 'video_views',  column: 'viewer_id', ref_table: 'users', ref_column: 'id', label: 'vues → spectateur manquant' },
+  { key: 'gifts_to',          table: 'gifts',         column: 'to_id',     ref_table: 'users',  ref_column: 'id', label: 'cadeaux → destinataire manquant' },
+  { key: 'gifts_from',        table: 'gifts',         column: 'from_id',   ref_table: 'users',  ref_column: 'id', label: 'cadeaux → expéditeur manquant' },
+  { key: 'ledger_user',       table: 'ledger',        column: 'user_id',   ref_table: 'users',  ref_column: 'id', label: 'ledger → utilisateur manquant' },
 ];
 function orphanWhere(c) {
   return `NOT EXISTS (SELECT 1 FROM ${c.ref_table} r WHERE r.${c.ref_column} = ${c.table}.${c.column})`;
@@ -8464,10 +8666,39 @@ app.post('/api/live/withdraw', auth, async (req, res) => {
     if (!pm) return res.status(400).json({ error: 'moyen de paiement introuvable — ajoute-le dans Retirer mes gains' });
     const vc = await validCoins(req.userId);
     if (coins > vc.valid) return res.status(400).json({ error: 'pas assez de pièces valides (' + vc.valid + ' disponibles)' });
-    // débit atomique des pièces + suivi du pool du live
-    const debited = await runSqlChanges('UPDATE users SET coins=coins-? WHERE id=? AND coins>=?', coins, req.userId, coins);
-    if (!debited) return res.status(400).json({ error: 'pas assez de pièces' });
-    await runSql('UPDATE live_summaries SET withdrawn_usd=withdrawn_usd+? WHERE live_id=?', amount, p.live.id);
+    // FIX race 2026-10-05 (Équipe 8/10) : 2 retraits live simultanés passaient chacun
+    // les contrôles (gains restants + pièces valides) puis débitaient 2 fois.
+    // Le pool du live est décrémenté atomiquement (UPDATE conditionnel) et le
+    // contrôle des pièces valides + débit est sérialisé par utilisateur.
+    const lwOut = await withUserLock(req.userId, async () => {
+      const p2 = await livePool(live_id, req.userId);
+      if (p2.err) { const e = new Error(p2.err); e.httpStatus = p2.code; throw e; }
+      if (amount > p2.remaining) {
+        const e = new Error('montant supérieur aux gains restants (' + p2.remaining.toFixed(2) + ' $)');
+        e.httpStatus = 400; throw e;
+      }
+      const vc2 = await validCoins(req.userId);
+      if (coins > vc2.valid) {
+        const e = new Error('pas assez de pièces valides (' + vc2.valid + ' disponibles)');
+        e.httpStatus = 400; throw e;
+      }
+      await raceGap(req); // crochet test concurrence (Équipe 8/10)
+      const poolOk = await runSqlChanges(
+        'UPDATE live_summaries SET withdrawn_usd=withdrawn_usd+? WHERE live_id=? AND (usd_earned - withdrawn_usd - exchanged_usd) >= ?',
+        amount, p.live.id, amount);
+      if (!poolOk) { const e = new Error('gains du live insuffisants'); e.httpStatus = 400; throw e; }
+      // débit atomique des pièces + suivi du pool du live
+      const debited = await runSqlChanges('UPDATE users SET coins=coins-? WHERE id=? AND coins>=?', coins, req.userId, coins);
+      if (!debited) {
+        await runSql('UPDATE live_summaries SET withdrawn_usd=withdrawn_usd-? WHERE live_id=?', amount, p.live.id);
+        const e = new Error('pas assez de pièces'); e.httpStatus = 400; throw e;
+      }
+      return { ok: true };
+    }).catch(e => {
+      if (e.httpStatus) return { _err: e.message, _status: e.httpStatus };
+      throw e;
+    });
+    if (lwOut._err) return res.status(lwOut._status).json({ error: lwOut._err });
     await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
       req.userId, -coins, 'retrait live #' + p.live.id + ' (' + pm.type + ')', now());
     const usd = Math.floor(coins / 500 * 100) / 100;
@@ -9355,24 +9586,40 @@ app.post('/api/users/:username/subscribe', auth, async (req, res) => {
     // le prix est fixé par le CRÉATEUR, jamais par le client (anti-fraude)
     const price = Math.max(10, Math.min(100000, Math.floor(Number(u.sub_price) || 0)));
     if (Number(u.sub_enabled) !== 1 || !price) return res.status(400).json({ error: 'abonnement non proposé par ce créateur' });
-    const debited = await runSqlChanges('UPDATE users SET coins=coins-? WHERE id=? AND coins>=?', price, req.userId, price);
-    if (!debited) return res.status(400).json({ error: 'pas assez de pièces' });
-    await runSql('UPDATE users SET coins=coins+? WHERE id=?', price, u.id);
-    await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
-      req.userId, -price, 'abonnement @' + u.username, now());
-    await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
-      u.id, price, 'abonnement reçu', now());
-    const t = now(), exp = t + 30 * 86400000;
-    const cur = await get1('SELECT * FROM creator_subs WHERE creator_id=? AND subscriber_id=? AND active=1 AND expires_at>?', u.id, req.userId, t);
-    if (cur) {
-      await runSql('UPDATE creator_subs SET expires_at=?, price_coins=? WHERE id=?', Number(cur.expires_at) + 30 * 86400000, price, cur.id);
-    } else {
-      await insertId('INSERT INTO creator_subs(creator_id,subscriber_id,price_coins,started_at,expires_at,active,created_at) VALUES(?,?,?,?,?,1,?)',
-        u.id, req.userId, price, t, exp, t);
-    }
-    const sub = await get1('SELECT * FROM creator_subs WHERE creator_id=? AND subscriber_id=? AND active=1 ORDER BY expires_at DESC', u.id, req.userId);
-    await notify(u.id, 'subscribe', req.userId, null, '');
-    res.json({ ok: true, expires_at: Number(sub.expires_at) });
+    // FIX race 2026-10-05 (Équipe 8/10) : double-clic « S'abonner » — section
+    // débit+insert sérialisée par abonné ; un 2e appel < 15 s après la création
+    // (double-clic réseau) est idempotent : pas de 2e débit. Avant : 2 requêtes
+    // simultanées débitaient 2 fois le prix (prouvé : 8000 au lieu de 9000).
+    const subOut = await withUserLock(req.userId, async () => {
+      const t0 = now();
+      const dup = await get1('SELECT * FROM creator_subs WHERE creator_id=? AND subscriber_id=? AND active=1 AND expires_at>?', u.id, req.userId, t0);
+      if (dup && t0 - Number(dup.created_at) < 15000)
+        return { ok: true, duplicate: true, expires_at: Number(dup.expires_at) };
+      await raceGap(req); // crochet test concurrence (Équipe 8/10) : simule l'intercalage Postgres
+      const debited = await runSqlChanges('UPDATE users SET coins=coins-? WHERE id=? AND coins>=?', price, req.userId, price);
+      if (!debited) { const e = new Error('pas assez de pièces'); e.httpStatus = 400; throw e; }
+      await runSql('UPDATE users SET coins=coins+? WHERE id=?', price, u.id);
+      await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
+        req.userId, -price, 'abonnement @' + u.username, now());
+      await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
+        u.id, price, 'abonnement reçu', now());
+      const t = now(), exp = t + 30 * 86400000;
+      const cur = await get1('SELECT * FROM creator_subs WHERE creator_id=? AND subscriber_id=? AND active=1 AND expires_at>?', u.id, req.userId, t);
+      if (cur) {
+        await runSql('UPDATE creator_subs SET expires_at=?, price_coins=? WHERE id=?', Number(cur.expires_at) + 30 * 86400000, price, cur.id);
+      } else {
+        await insertId('INSERT INTO creator_subs(creator_id,subscriber_id,price_coins,started_at,expires_at,active,created_at) VALUES(?,?,?,?,?,1,?)',
+          u.id, req.userId, price, t, exp, t);
+      }
+      const sub = await get1('SELECT * FROM creator_subs WHERE creator_id=? AND subscriber_id=? AND active=1 ORDER BY expires_at DESC', u.id, req.userId);
+      await notify(u.id, 'subscribe', req.userId, null, '');
+      return { ok: true, expires_at: Number(sub.expires_at) };
+    }).catch(e => {
+      if (e.httpStatus) return { _err: e.message, _status: e.httpStatus };
+      throw e;
+    });
+    if (subOut._err) return res.status(subOut._status).json({ error: subOut._err });
+    res.json(subOut);
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 app.get('/api/users/:username/subscription', auth, async (req, res) => {
@@ -9402,6 +9649,22 @@ app.delete('/api/users/:username/subscribe', auth, async (req, res) => {
 // désactive les abonnements expirés (toutes les 24 h)
 async function expireSubs() {
   try { await runSql('UPDATE creator_subs SET active=0 WHERE active=1 AND expires_at<=?', now()); } catch (e) {}
+}
+
+// FIX 2026-10-05 (audit DB) : purge des tables à croissance illimitée.
+// video_views/watch_events ne sont PAS purgées (les compteurs de vues et l'historique
+// sont calculés en live depuis ces tables). En revanche les journaux techniques
+// (audit, webhooks, alertes fraude, file de notifs, impressions pubs) n'ont aucune
+// valeur après 30-90 jours et feraient exploser la base à grande échelle.
+async function purgeOldLogs() {
+  const t = now(), D = 86400000;
+  try { await runSql('DELETE FROM audit_logs WHERE created_at<?', t - 90 * D); } catch (e) {}
+  try { await runSql('DELETE FROM webhook_deliveries WHERE created_at<?', t - 30 * D); } catch (e) {}
+  try { await runSql('DELETE FROM fraud_alerts WHERE created_at<?', t - 90 * D); } catch (e) {}
+  try { await runSql('DELETE FROM notif_queue WHERE sent_at IS NOT NULL AND sent_at<?', t - 30 * D); } catch (e) {}
+  try { await runSql('DELETE FROM ad_impressions WHERE created_at<?', t - 90 * D); } catch (e) {}
+  // notifications lues de plus de 180 jours (les non-lues sont conservées)
+  try { await runSql('DELETE FROM notifications WHERE is_read=1 AND created_at<?', t - 180 * D); } catch (e) {}
 }
 
 // ==================== SERVEUR v11 — V3 ====================
@@ -10760,7 +11023,9 @@ app.get('/.well-known/assetlinks.json', (req, res) => { res.type('application/js
 app.get('/.well-known/apple-app-site-association', (req, res) => { res.type('application/json').send(JSON.stringify(AAS_EQA)); });
 // ==================== fin v2.44-EQA-OG ====================
 function clientIp(req){
-  // m10 : req.ip avec trust proxy (le premier segment de x-forwarded-for est falsifiable par le client)
+  // v2.47-sec : req.ip = segment X-Forwarded-For à N hops de la droite (N = trust proxy).
+  // Fiable uniquement derrière un proxy de confiance (Railway en prod). En connexion
+  // directe, le client peut forger X-Forwarded-For → TRUST_PROXY=0 en dev.
   return (req.ip || req.socket.remoteAddress || '').trim().slice(0, 45);
 }
 async function bumpDailyPoints(n){
@@ -11870,6 +12135,8 @@ initDb().then(() => {
   setInterval(publishDue, 60000); // vérifie les publications dues toutes les 60 s
   expireSubs();
   setInterval(expireSubs, 86400000); // désactive les abonnements expirés toutes les 24 h
+  purgeOldLogs(); // FIX 2026-10-05 (audit DB) : purge des journaux techniques
+  setInterval(purgeOldLogs, 86400000); // toutes les 24 h
   setInterval(runVerificationBot, 3600000); // 🤖 bot de vérification toutes les heures
   scheduleDailyCampaigns().catch(()=>{}); // campagnes notif du jour
   setInterval(()=>{scheduleDailyCampaigns().catch(()=>{})}, 3600000); // vérifie chaque heure
