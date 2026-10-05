@@ -63,6 +63,24 @@ CREATE TABLE IF NOT EXISTS devices(
   last_seen BIGINT NOT NULL,
   flagged INTEGER NOT NULL DEFAULT 0
 );
+// v2.41 : alertes anti-fraude (vues suspectes, vélocité de likes, vélocité IP, multi-comptes)
+CREATE TABLE IF NOT EXISTS fraud_alerts(
+  id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+  type TEXT NOT NULL,
+  user_id INTEGER,
+  ip TEXT NOT NULL DEFAULT '',
+  detail TEXT NOT NULL DEFAULT '',
+  created_at BIGINT NOT NULL
+);
+// v2.41 : réputation IP à l'inscription (fenêtre glissante de 24 h)
+CREATE TABLE IF NOT EXISTS ip_reputation(
+  ip TEXT PRIMARY KEY,
+  accounts_count INTEGER NOT NULL DEFAULT 0,
+  window_start BIGINT NOT NULL DEFAULT 0,
+  first_seen BIGINT NOT NULL,
+  last_seen BIGINT NOT NULL,
+  flagged INTEGER NOT NULL DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS videos(
   id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
   user_id INTEGER NOT NULL,
@@ -1786,6 +1804,8 @@ app.get('/api/search/insights', async (req, res) => {
   await mig('videos', 'tts_text', `TEXT`);
   await mig('videos', 'tts_voice', `TEXT`);
   await mig('videos', 'tts_rate', `REAL NOT NULL DEFAULT 1`);
+  // analytics v2.39 : source du trafic des vues (feed|following|search|profile|deeplink|other)
+  await mig('video_views', 'source', `TEXT NOT NULL DEFAULT 'feed'`);
   // v2.39 : la sanction appliquée lors du traitement d'un signalement (pour les appels)
   await mig('reports', 'action', `TEXT NOT NULL DEFAULT ''`);
   await mig('comments', 'audio_url', `TEXT`);
@@ -1827,6 +1847,8 @@ app.get('/api/search/insights', async (req, res) => {
   await mig('users', 'quiet_end', `INTEGER`);
   await mig('users', 'notif_priority', `INTEGER NOT NULL DEFAULT 1`);
   await mig('users', 'last_login_ip', `TEXT NOT NULL DEFAULT ''`);
+  // v2.41 : notif "nouvelle vidéo" pour les abonnés quand un suivi publie
+  await mig('users', 'notif_newvideos', `INTEGER NOT NULL DEFAULT 1`);
   await mig('users', 'dm_privacy', `TEXT NOT NULL DEFAULT 'everyone'`);
   // PARITÉ TIKTOK 2026-10-04 : politiques duo/collage par compte + PIN mode restreint + flag sensible
   await mig('users', 'duet_policy', `TEXT NOT NULL DEFAULT 'everyone'`);
@@ -2529,9 +2551,9 @@ async function notify(userId, type, actorId, videoId, text, commentId) {
     // v1.84 : vérifie les préférences de notification du destinataire
     let prefs = null;
     try {
-      prefs = await get1('SELECT notif_likes,notif_comments,notif_follows,notif_mentions,notif_lives,notif_loginalert,quiet_start,quiet_end FROM users WHERE id=?', userId);
+      prefs = await get1('SELECT notif_likes,notif_comments,notif_follows,notif_mentions,notif_lives,notif_loginalert,quiet_start,quiet_end,notif_newvideos FROM users WHERE id=?', userId);
       if (prefs) {
-        const prefMap = { like: 'notif_likes', comment: 'notif_comments', follow: 'notif_follows', follow_request: 'notif_follows', follow_accepted: 'notif_follows', mention: 'notif_mentions', live: 'notif_lives', login_alert: 'notif_loginalert' };
+        const prefMap = { like: 'notif_likes', comment: 'notif_comments', follow: 'notif_follows', follow_request: 'notif_follows', follow_accepted: 'notif_follows', mention: 'notif_mentions', live: 'notif_lives', login_alert: 'notif_loginalert', new_video: 'notif_newvideos' };
         const col = prefMap[type];
         if (col && Number(prefs[col]) === 0) return; // désactivé par l'utilisateur
       }
@@ -2554,18 +2576,20 @@ async function notify(userId, type, actorId, videoId, text, commentId) {
       userId, type, actorId || null, videoId || null, commentId || null, String(text || '').slice(0, 200), now());
     let actorName = '';
     try { if (actorId) { const a = await get1('SELECT username FROM users WHERE id=?', actorId); if (a) actorName = a.username; } } catch (_) {}
-    // push instantané si le destinataire est connecté en WebSocket
+    // push instantané si le destinataire est connecté en WebSocket (supprimé en heures silencieuses v2.41)
     try {
-      const ws = pushSockets.get(Number(userId));
-      if (ws && ws.readyState === 1) {
-        ws.send(JSON.stringify({ t: 'push', id, type, text: String(text || '').slice(0, 200), actor: actorName }));
+      if (!inQuiet) {
+        const ws = pushSockets.get(Number(userId));
+        if (ws && ws.readyState === 1) {
+          ws.send(JSON.stringify({ t: 'push', id, type, text: String(text || '').slice(0, 200), actor: actorName }));
+        }
       }
     } catch (_) {}
-    // v1.84 : tentative de push FCM (fonctionne même app fermée)
-    try {
+    // v1.84 : tentative de push FCM (fonctionne même app fermée) — supprimée en heures silencieuses v2.41
+    if (!inQuiet) try {
       const titles = { like: 'Nouveau J\u2019aime', comment: 'Nouveau commentaire', follow: 'Nouvel abonné',
         follow_request: '👤 Demande de suivi', follow_accepted: '✅ Demande acceptée',
-        mention: 'Mention', live: 'En direct', repost: 'Repost', gift: '🎁 Cadeau reçu',
+        mention: 'Mention', live: 'En direct', new_video: '🎬 Nouvelle vidéo', repost: 'Repost', gift: '🎁 Cadeau reçu',
         withdrawal: '💸 Retrait', kyc: '🪪 Identité', badge: '✔️ Badge vérifié', report: '🛡️ Signalement',
         security: '🔐 Sécurité', login_alert: '🔐 Nouvelle connexion', default: 'VidiGagne' };
       const title = (actorName ? actorName + ' — ' : '') + (titles[type] || titles.default);
@@ -2758,6 +2782,71 @@ async function recordDevice(req, userId) {
   } catch (e) { /* jamais bloquant : l'auth ne doit pas échouer à cause du suivi device */ }
 }
 
+// ---------- v2.41 : anti-fraude — alertes, vélocité de vues/likes, réputation IP, blocage des gains ----------
+// Insère une alerte anti-fraude avec déduplication (max 1 alerte par type+user/IP/heure) pour
+// éviter le spam d'alertes quand un bot frappe un endpoint en boucle.
+async function fraudAlert(type, userId, ip, detail) {
+  try {
+    const t = now(), hourAgo = t - 3600000;
+    const ipS = String(ip || '');
+    const dup = await get1(
+      'SELECT 1 FROM fraud_alerts WHERE type=? AND created_at>? AND (ip=? OR (user_id IS NOT NULL AND user_id=?))',
+      String(type).slice(0, 40), hourAgo, ipS, userId || -1);
+    if (dup) return false;
+    await runSql('INSERT INTO fraud_alerts(type,user_id,ip,detail,created_at) VALUES(?,?,?,?,?)',
+      String(type).slice(0, 40), userId || null, ipS, String(detail || '').slice(0, 500), t);
+    return true;
+  } catch (e) { return false; }
+}
+// Vrai si l'utilisateur est sur un device flagged avec ≥5 comptes distincts → gains bloqués
+// (seuil 5 : en dessous, simple détection sans blocage — faux positifs possibles : famille, revente).
+async function deviceEarningsBlocked(userId) {
+  try {
+    const rows = await allRows('SELECT user_ids FROM devices WHERE flagged=1');
+    for (const r of rows) {
+      let ids = [];
+      try { ids = JSON.parse(r.user_ids || '[]'); } catch (e) { ids = []; }
+      if (Array.isArray(ids) && ids.includes(Number(userId)) && ids.length >= 5) return true;
+    }
+  } catch (e) {}
+  return false;
+}
+// Vélocité de vues en mémoire (fenêtre 1 h) : le compteur de hits du endpoint lui-même,
+// car les vues dédupliquées n'apparaissent pas en base. Limite : par processus (mono-instance ici).
+const _viewHits = new Map();
+function viewVelocityHit(viewerId, ip) {
+  const key = viewerId ? 'u:' + viewerId : 'ip:' + ip;
+  const t = Date.now(), win = t - 3600000;
+  let arr = _viewHits.get(key) || [];
+  arr = arr.filter(x => x > win);
+  arr.push(t);
+  if (_viewHits.size > 20000) _viewHits.clear();
+  _viewHits.set(key, arr);
+  return arr.length;
+}
+// Réputation IP à l'inscription : compteur sur fenêtre glissante de 24 h.
+// ≥5 comptes en 24 h → flagged=1 + alerte ip_velocity. Jamais bloquant pour l'inscription.
+async function recordIpSignup(req, userId) {
+  try {
+    const ip = clientIp(req);
+    if (!ip) return;
+    const t = now();
+    const row = await get1('SELECT * FROM ip_reputation WHERE ip=?', ip);
+    if (!row) {
+      await runSql('INSERT INTO ip_reputation(ip,accounts_count,window_start,first_seen,last_seen,flagged) VALUES(?,?,?,?,?,0)',
+        ip, 1, t, t, t);
+      return;
+    }
+    let count = Number(row.accounts_count) || 0;
+    let winStart = Number(row.window_start) || 0;
+    if (t - winStart > 86400000) { count = 1; winStart = t; } else { count += 1; }
+    const flagged = count >= 5 ? 1 : 0;
+    await runSql('UPDATE ip_reputation SET accounts_count=?, window_start=?, last_seen=?, flagged=? WHERE ip=?',
+      count, winStart, t, flagged, ip);
+    if (flagged) await fraudAlert('ip_velocity', userId, ip, count + ' inscriptions en 24h depuis cette IP');
+  } catch (e) { /* jamais bloquant : l'inscription ne doit pas échouer à cause du suivi IP */ }
+}
+
 // ---------- v2.34 : ALERTES DE CONNEXION ----------
 // Notifie l'utilisateur d'une connexion réussie, sauf si la dernière alerte
 // date de moins d'1 heure ET que l'IP est identique (anti-spam).
@@ -2834,6 +2923,7 @@ app.post('/api/auth/register', async (req, res) => {
     const token = crypto.randomBytes(32).toString('hex');
     await runSql('INSERT INTO tokens(token,user_id,created_at) VALUES(?,?,?)', token, id, now());
     await recordDevice(req, id); // v2.32 : 1 identité par installation (détection, jamais bloquant)
+    await recordIpSignup(req, id); // v2.41 : réputation IP (fenêtre 24 h, jamais bloquant)
     const u = await get1('SELECT * FROM users WHERE id=?', id);
     if (email) await consumeVerifiedToken((req.body || {}).verification_token);
     res.json({ token, user: privUser(u), coins: u.coins });
@@ -3397,6 +3487,19 @@ app.post('/api/videos', auth, upload.single('video'), async (req, res) => {
       try { await notify(req.userId, 'system', null, null,
         '🤖 Hashtags supprimés : ' + _bannedRemoved.join(' ') + ' (plateformes concurrentes interdites)'); } catch (_) {}
     }
+    // v2.41 : notifier les abonnés d'une nouvelle vidéo publique (respecte la pref notif_newvideos via notify())
+    (async () => {
+      try {
+        if (visibility === 'public' && !scheduledAt) {
+          const me = await get1('SELECT username FROM users WHERE id=?', req.userId);
+          const fols = await allRows('SELECT follower_id FROM follows WHERE followed_id=?', req.userId);
+          for (const f of (fols || [])) {
+            await notify(f.follower_id, 'new_video', req.userId, id,
+              '🎬 @' + (me ? me.username : 'créateur') + ' a publié une nouvelle vidéo');
+          }
+        }
+      } catch (_) {}
+    })();
     // pièces : +10 par publication
     await runSql('UPDATE users SET coins=coins+10 WHERE id=?', req.userId);
     await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
@@ -5210,6 +5313,10 @@ app.post('/api/videos/:id/view', async (req, res) => {
     }
     const ip = (req.ip || req.socket.remoteAddress || '').trim().slice(0, 45);
     const dayAgo = now() - 86400000;
+    // v2.41 : vélocité anti-fraude — >50 hits de vues/heure pour le même spectateur = comportement de bot.
+    // Compté sur les hits du endpoint (les vues dédupliquées n'atteignent jamais la base).
+    const _vh = viewVelocityHit(viewerId, ip);
+    if (_vh > 50) await fraudAlert('view_velocity', viewerId, ip, _vh + ' vues/heure — vélocité suspecte');
     const dup = viewerId
       ? await get1('SELECT 1 FROM video_views WHERE video_id=? AND viewer_id=? AND created_at>?', v.id, viewerId, dayAgo)
       : await get1('SELECT 1 FROM video_views WHERE video_id=? AND viewer_id IS NULL AND ip=? AND created_at>?', v.id, ip, dayAgo);
@@ -5226,8 +5333,15 @@ app.post('/api/videos/:id/view', async (req, res) => {
     }
     // le serveur décide seul si la vue est monétisée (1 vue sur 6) — le client ne peut pas gonfler ad_views
     const adShown = (Number(v.views) % 6 === 5) ? 1 : 0;
-    await runSql('INSERT INTO video_views(video_id,viewer_id,ip,ad_shown,created_at) VALUES(?,?,?,?,?)',
-      v.id, viewerId, ip, adShown, now());
+    // v2.39 : source du trafic (feed|following|search|profile|deeplink|other) — valeur inconnue → 'feed'
+    const VIEW_SOURCES = ['feed', 'following', 'search', 'profile', 'deeplink', 'other'];
+    let viewSrc = 'feed';
+    try {
+      const s = String((req.body && req.body.source) || '').trim().toLowerCase();
+      if (VIEW_SOURCES.includes(s)) viewSrc = s;
+    } catch (e) {}
+    await runSql('INSERT INTO video_views(video_id,viewer_id,ip,ad_shown,source,created_at) VALUES(?,?,?,?,?,?)',
+      v.id, viewerId, ip, adShown, viewSrc, now());
     await runSql('UPDATE videos SET views=views+1' + (adShown ? ', ad_views=ad_views+1' : '') + ' WHERE id=?', v.id);
     await touchHistory(viewerId, v.id);
     res.json({ ok: true, counted: true, ad_shown: !!adShown });
@@ -5276,6 +5390,13 @@ app.post('/api/videos/:id/like', auth, async (req, res) => {
     const alreadyLiked = await get1('SELECT 1 FROM likes WHERE user_id=? AND video_id=?', req.userId, v.id);
     await insertIgnore('INSERT OR IGNORE INTO likes(user_id,video_id,created_at) VALUES(?,?,?)',
       req.userId, v.id, now());
+    // v2.41 : vélocité anti-fraude — >15 likes en 5 min = comportement de bot (farme de likes).
+    if (!alreadyLiked) {
+      try {
+        const _lc = await get1('SELECT COUNT(*) AS c FROM likes WHERE user_id=? AND created_at>?', req.userId, now() - 300000);
+        if (Number(_lc.c) > 15) await fraudAlert('like_velocity', req.userId, clientIp(req), Number(_lc.c) + ' likes en 5 min — vélocité suspecte');
+      } catch (_e) {}
+    }
     if (!alreadyLiked) await notify(v.user_id, 'like', req.userId, v.id, '');
     // v2.38 : signal « Pour toi » — un like frais incrémente les scores des tags de la vidéo
     if (!alreadyLiked) {
@@ -5296,7 +5417,8 @@ app.post('/api/videos/:id/like', auth, async (req, res) => {
       req.userId, v.id, now());
     // anti-concurrence (2026-10-04) : +1 pièce au créateur, plafond 100/jour —
     // lecture+vérification+crédit sérialisés par créateur (TOCTOU sinon).
-    if (firstReward && Number(v.user_id) !== Number(req.userId)) {
+    // v2.41 : pas de gain si le créateur est sur un device flagged avec ≥5 comptes (fraud-review).
+    if (firstReward && Number(v.user_id) !== Number(req.userId) && !(await deviceEarningsBlocked(v.user_id))) {
       await withUserLock(v.user_id, async () => {
         const earned = Number((await get1(
           `SELECT COALESCE(SUM(amount),0) AS s FROM ledger
@@ -5911,6 +6033,122 @@ app.post('/api/admin/withdrawals/:id/reject', async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 
+// ---------- v2.34 : bots d'intégrité données (admin) ----------
+// Scan des lignes orphelines : FK logiques sans contrainte SQL (SQLite/PG).
+// Protégé comme /api/admin/withdrawals : en-tête x-admin-token.
+const ORPHAN_CHECKS = [
+  { key: 'comments_video',    table: 'comments',      column: 'video_id',    ref_table: 'videos', ref_column: 'id', label: 'commentaires → vidéo manquante' },
+  { key: 'comments_user',     table: 'comments',      column: 'user_id',     ref_table: 'users',  ref_column: 'id', label: 'commentaires → utilisateur manquant' },
+  { key: 'likes_user',        table: 'likes',         column: 'user_id',     ref_table: 'users',  ref_column: 'id', label: 'likes → utilisateur manquant' },
+  { key: 'likes_video',       table: 'likes',         column: 'video_id',    ref_table: 'videos', ref_column: 'id', label: 'likes → vidéo manquante' },
+  { key: 'notifications_user',table: 'notifications', column: 'user_id',     ref_table: 'users',  ref_column: 'id', label: 'notifications → utilisateur manquant' },
+  { key: 'video_views_video', table: 'video_views',   column: 'video_id',    ref_table: 'videos', ref_column: 'id', label: 'vues → vidéo manquante' },
+  { key: 'follows_follower',  table: 'follows',       column: 'follower_id', ref_table: 'users',  ref_column: 'id', label: 'follows → follower manquant' },
+  { key: 'follows_followed',  table: 'follows',       column: 'followed_id', ref_table: 'users',  ref_column: 'id', label: 'follows → suivi manquant' },
+  { key: 'withdrawals_user',  table: 'withdrawals',   column: 'user_id',     ref_table: 'users',  ref_column: 'id', label: 'retraits → utilisateur manquant' },
+];
+function orphanWhere(c) {
+  return `NOT EXISTS (SELECT 1 FROM ${c.ref_table} r WHERE r.${c.ref_column} = ${c.table}.${c.column})`;
+}
+app.get('/api/admin/integrity/orphans', async (req, res) => {
+  try {
+    if (!checkAdmin(req, res)) return;
+    const checks = [];
+    let total = 0;
+    for (const c of ORPHAN_CHECKS) {
+      let count = 0, sample = [];
+      try {
+        const r = await get1(`SELECT COUNT(*) AS c FROM ${c.table} WHERE ${orphanWhere(c)}`);
+        count = Number(r ? r.c : 0);
+        if (count > 0) sample = await allRows(`SELECT * FROM ${c.table} WHERE ${orphanWhere(c)} LIMIT 50`);
+      } catch (e) { count = -1; } // table/colonne absente → marqué non supporté
+      total += Math.max(0, count);
+      checks.push({ key: c.key, label: c.label, table: c.table, column: c.column,
+        ref_table: c.ref_table, ref_column: c.ref_column, count, sample });
+    }
+    res.json({ ok: true, total, checks });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.post('/api/admin/integrity/orphans/clean', async (req, res) => {
+  try {
+    if (!checkAdmin(req, res)) return;
+    const dry_run = req.body && req.body.dry_run !== false; // défaut = simulation
+    const cleaned = {};
+    let total = 0;
+    for (const c of ORPHAN_CHECKS) {
+      let n = 0;
+      try {
+        if (dry_run) {
+          const r = await get1(`SELECT COUNT(*) AS c FROM ${c.table} WHERE ${orphanWhere(c)}`);
+          n = Number(r ? r.c : 0);
+        } else {
+          n = await runSqlChanges(`DELETE FROM ${c.table} WHERE ${orphanWhere(c)}`);
+        }
+      } catch (e) { n = -1; }
+      cleaned[c.key] = n;
+      total += Math.max(0, n);
+    }
+    res.json({ ok: true, dry_run, cleaned, total });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+
+// ---------- v2.34 : compteurs dénormalisés vs réalité (admin) ----------
+// Constat schéma (2026-10-04) : videos N'A PAS de colonne likes_count ni comments_count ;
+// les seuls compteurs stockés avec table de détail sont videos.views (↔ video_views)
+// et comments.likes (↔ comment_likes). users N'A PAS de followers_count.
+// Les vérifications s'adaptent : toute colonne/table absente est marquée non supportée.
+const COUNTER_CHECKS = [
+  { key: 'videos_views',  table: 'videos',   pk: 'id', column: 'views', ref_table: 'video_views',  ref_column: 'video_id',   label: 'videos.views ↔ COUNT(video_views)' },
+  { key: 'comments_likes',table: 'comments', pk: 'id', column: 'likes', ref_table: 'comment_likes',ref_column: 'comment_id', label: 'comments.likes ↔ COUNT(comment_likes)' },
+];
+app.get('/api/admin/integrity/counters', async (req, res) => {
+  try {
+    if (!checkAdmin(req, res)) return;
+    const checks = [];
+    let total = 0;
+    for (const c of COUNTER_CHECKS) {
+      let mismatches = [], supported = true, checked = 0;
+      try {
+        const cnt = await get1(`SELECT COUNT(*) AS c FROM ${c.table}`);
+        checked = Number(cnt ? cnt.c : 0);
+        mismatches = await allRows(
+          `SELECT ${c.pk} AS id, COALESCE(${c.column},0) AS stored,` +
+          ` (SELECT COUNT(*) FROM ${c.ref_table} r WHERE r.${c.ref_column} = t.${c.pk}) AS real` +
+          ` FROM ${c.table} t WHERE COALESCE(t.${c.column},0) !=` +
+          ` (SELECT COUNT(*) FROM ${c.ref_table} r WHERE r.${c.ref_column} = t.${c.pk}) LIMIT 100`);
+      } catch (e) { supported = false; }
+      total += mismatches.length;
+      checks.push({ key: c.key, label: c.label, table: c.table, column: c.column,
+        ref_table: c.ref_table, supported, checked, mismatch_count: mismatches.length, mismatches });
+    }
+    res.json({ ok: true, total_mismatches: total, checks });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.post('/api/admin/integrity/counters/fix', async (req, res) => {
+  try {
+    if (!checkAdmin(req, res)) return;
+    const dry_run = req.body && req.body.dry_run !== false; // défaut = simulation
+    const fixed = {};
+    let total = 0;
+    for (const c of COUNTER_CHECKS) {
+      let n = 0;
+      try {
+        const realExpr = `(SELECT COUNT(*) FROM ${c.ref_table} r WHERE r.${c.ref_column} = ${c.table}.${c.pk})`;
+        if (dry_run) {
+          const r = await get1(`SELECT COUNT(*) AS c FROM ${c.table} WHERE COALESCE(${c.column},0) != ${realExpr}`);
+          n = Number(r ? r.c : 0);
+        } else {
+          n = await runSqlChanges(
+            `UPDATE ${c.table} SET ${c.column} = ${realExpr} WHERE COALESCE(${c.column},0) != ${realExpr}`);
+        }
+      } catch (e) { n = -1; }
+      fixed[c.key] = n;
+      total += Math.max(0, n);
+    }
+    res.json({ ok: true, dry_run, fixed, total });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+
 // ---------- v2.32 : 1 identité par installation — révision admin des doublons de device ----------
 // Un device flagged=1 = vu sur ≥2 comptes distincts. Détection anti-fraude UNIQUEMENT :
 // l'admin arbitre (faux positifs possibles : famille partageant un téléphone, réinstallation).
@@ -5941,7 +6179,14 @@ app.get('/api/notifications', auth, async (req, res) => {
   try {
     // PAGINATION 2026-10-04 : ?page=N (20/page)
     const page = Math.max(1, parseInt(req.query.page, 10) || 1);
-    const rows = await allRows('SELECT * FROM notifications WHERE user_id=? ORDER BY created_at DESC LIMIT 20 OFFSET ' + ((page - 1) * 20), req.userId);
+    // v2.41 : tri par priorité de type (mention > comment > like > follow > system, puis récent d'abord) ;
+    // désactivable par l'utilisateur via la préf notif_priority=0 (chronologique seul).
+    let prio = 1;
+    try { const _up = await get1('SELECT notif_priority FROM users WHERE id=?', req.userId); if (_up && _up.notif_priority !== null && _up.notif_priority !== undefined) prio = Number(_up.notif_priority); } catch (_) {}
+    const orderBy = prio
+      ? `ORDER BY CASE type WHEN 'mention' THEN 0 WHEN 'comment' THEN 1 WHEN 'like' THEN 2 WHEN 'follow' THEN 3 WHEN 'follow_request' THEN 3 WHEN 'follow_accepted' THEN 3 WHEN 'system' THEN 4 ELSE 5 END, created_at DESC, id DESC`
+      : `ORDER BY created_at DESC, id DESC`;
+    const rows = await allRows('SELECT * FROM notifications WHERE user_id=? ' + orderBy + ' LIMIT 20 OFFSET ' + ((page - 1) * 20), req.userId);
     const out = [];
     for (const n of rows) {
       const actor = n.actor_id ? await get1('SELECT * FROM users WHERE id=?', n.actor_id) : null;
@@ -7008,7 +7253,7 @@ app.get('/api/users/:username', async (req, res) => {
     for (const v of vids) {
       if (await canSeeVideo(v, meId)) { const j = await videoJSON(v, null); if (j) videos.push(j); }
     }
-    res.json({ user: pubUser(u), followers, following, total_likes: likes, videos });
+    res.json({ user: pubUser(u), followers, following, total_likes: likes, videos, page: upage, has_more: vids.length >= 30 });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 
@@ -10071,16 +10316,27 @@ app.post('/api/me/restricted', auth, async (req, res) => {
 // ---------- préférences de notifications ----------
 app.get('/api/me/notif-prefs', auth, async (req, res) => {
   try {
-    const u = await get1('SELECT notif_likes,notif_comments,notif_follows,notif_mentions,notif_lives,notif_loginalert FROM users WHERE id=?', req.userId);
+    // v2.41 : expose aussi quiet_start/quiet_end (heures silencieuses), notif_priority (tri par priorité) et notif_newvideos (nouvelles vidéos des suivis)
+    const u = await get1('SELECT notif_likes,notif_comments,notif_follows,notif_mentions,notif_lives,notif_loginalert,quiet_start,quiet_end,notif_priority,notif_newvideos FROM users WHERE id=?', req.userId);
     res.json({ ok: true, prefs: u || {} });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 app.post('/api/me/notif-prefs', auth, async (req, res) => {
   try {
     const b = req.body || {}, sets = [], vals = [];
-    for (const k of ['notif_likes', 'notif_comments', 'notif_follows', 'notif_mentions', 'notif_lives', 'notif_loginalert']) {
+    for (const k of ['notif_likes', 'notif_comments', 'notif_follows', 'notif_mentions', 'notif_lives', 'notif_loginalert', 'notif_newvideos']) {
       if (b[k] !== undefined) { sets.push(k + '=?'); vals.push(b[k] ? 1 : 0); }
     }
+    // v2.41 : heures silencieuses — entier 0-23 ou null (null = désactivé)
+    if (b.quiet_start !== undefined || b.quiet_end !== undefined) {
+      const qv = v => v === null || v === '' || (Number.isInteger(Number(v)) && Number(v) >= 0 && Number(v) <= 23);
+      if (!qv(b.quiet_start) || !qv(b.quiet_end)) return res.status(400).json({ error: 'quiet_start/quiet_end : 0-23 ou null' });
+      const qn = v => (v === null || v === '' ? null : Number(v));
+      sets.push('quiet_start=?'); vals.push(qn(b.quiet_start));
+      sets.push('quiet_end=?'); vals.push(qn(b.quiet_end));
+    }
+    // v2.41 : tri des notifications par priorité de type (1) ou chronologique seul (0)
+    if (b.notif_priority !== undefined) { sets.push('notif_priority=?'); vals.push(b.notif_priority ? 1 : 0); }
     if (sets.length) { vals.push(req.userId); await runSql(`UPDATE users SET ${sets.join(',')} WHERE id=?`, ...vals); }
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
@@ -10096,11 +10352,13 @@ app.get('/api/me/content-prefs', auth, async (req, res) => {
 // Endpoints manquants détectés par le bot de test (2026-10-03)
 app.get('/api/me/followers', auth, async (req, res) => {
   try {
+    // PAGINATION 2026-10-04 : ?page=N (30/page)
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
     const rows = await allRows(
-      'SELECT u.id, u.username, u.avatar FROM follows f JOIN users u ON u.id=f.follower_id WHERE f.followed_id=? ORDER BY f.created_at DESC LIMIT 100',
+      'SELECT u.id, u.username, u.avatar FROM follows f JOIN users u ON u.id=f.follower_id WHERE f.followed_id=? ORDER BY f.created_at DESC LIMIT 30 OFFSET ' + ((page - 1) * 30),
       req.userId
     );
-    res.json({ ok: true, followers: rows });
+    res.json({ ok: true, followers: rows, page, has_more: rows.length >= 30 });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 // Abonnés d'un autre utilisateur (public — les suivis restent privés)
@@ -10116,11 +10374,13 @@ app.get('/api/users/:username/followers', async (req, res) => {
       const _pf = await get1('SELECT 1 FROM follows WHERE follower_id=? AND followed_id=?', meId || -1, u.id);
       if (!_pf) return res.status(403).json({ error: 'compte privé' });
     }
+    // PAGINATION 2026-10-04 : ?page=N (30/page)
+    const fpage = Math.max(1, parseInt(req.query.page, 10) || 1);
     const rows = await allRows(
-      'SELECT u.id, u.username, u.avatar FROM follows f JOIN users u ON u.id=f.follower_id WHERE f.followed_id=? ORDER BY f.created_at DESC LIMIT 100',
+      'SELECT u.id, u.username, u.avatar FROM follows f JOIN users u ON u.id=f.follower_id WHERE f.followed_id=? ORDER BY f.created_at DESC LIMIT 30 OFFSET ' + ((fpage - 1) * 30),
       u.id
     );
-    res.json({ ok: true, followers: rows });
+    res.json({ ok: true, followers: rows, page: fpage, has_more: rows.length >= 30 });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 app.get('/api/me/stats', auth, async (req, res) => {
