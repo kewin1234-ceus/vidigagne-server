@@ -4829,10 +4829,42 @@ app.get('/api/account/export', auth, async (req, res) => {
       const filleuls = await allRows('SELECT id, username, created_at FROM users WHERE referred_by=?', req.userId);
       return { ref_code: (me && me.ref_code) || null, parrain: parrain || null, filleuls };
     });
+    // v2.49-RGPD (confidentialité #5) : catégories manquantes — KYC, pourboires, blocs,
+    // signalements, brouillons, recharges, reçus, hashtags suivis, streaks, votes, achats séries, hors-ligne
+    const kyc = await safeRow(() => get1(
+      'SELECT id, country, doc_type, status, created_at, reviewed_at, review_reason FROM id_verifications WHERE user_id=?', req.userId));
+    const tips = await safeRows(() => allRows(
+      'SELECT id, video_id, from_user_id, to_user_id, coins, created_at FROM tips WHERE from_user_id=? OR to_user_id=? ORDER BY created_at DESC LIMIT 500', req.userId, req.userId));
+    const blocked_users = await safeRows(() => allRows(
+      'SELECT b.blocked_id AS id, u.username, b.created_at FROM blocks b LEFT JOIN users u ON u.id=b.blocked_id WHERE b.user_id=?', req.userId));
+    const my_reports = await safeRows(() => allRows(
+      'SELECT id, target_type, target_id, reason, status, created_at FROM reports WHERE reporter_id=? ORDER BY created_at DESC LIMIT 500', req.userId));
+    const drafts = await safeRows(() => allRows(
+      'SELECT id, description, created_at, updated_at FROM video_drafts WHERE user_id=? ORDER BY updated_at DESC', req.userId));
+    const recharges = await safeRows(() => allRows(
+      'SELECT id, method, coins, amount_usd, status, created_at FROM coin_recharges WHERE user_id=? ORDER BY created_at DESC LIMIT 500', req.userId));
+    const my_receipts = await safeRows(() => allRows(
+      'SELECT id, withdrawal_id, receipt_no, coins, usd, created_at FROM receipts WHERE user_id=? ORDER BY created_at DESC LIMIT 500', req.userId));
+    const followed_hashtags = await safeRows(() => allRows(
+      'SELECT tag, created_at FROM hashtag_follows WHERE user_id=?', req.userId));
+    const login_streak = await safeRow(() => get1(
+      'SELECT streak, last_day, updated_at FROM login_streaks WHERE user_id=?', req.userId));
+    const friend_streaks = await safeRows(() => allRows(
+      `SELECT CASE WHEN fs.user_a=? THEN fs.user_b ELSE fs.user_a END AS friend_id, u.username AS friend_username,
+        fs.streak, fs.last_day FROM friendship_streaks fs LEFT JOIN users u ON u.id=CASE WHEN fs.user_a=? THEN fs.user_b ELSE fs.user_a END
+       WHERE fs.user_a=? OR fs.user_b=?`, req.userId, req.userId, req.userId, req.userId));
+    const my_poll_votes = await safeRows(() => allRows(
+      'SELECT poll_id, option_id FROM poll_votes WHERE user_id=?', req.userId));
+    const my_series_purchases = await safeRows(() => allRows(
+      'SELECT sp.series_id, s.title, sp.created_at FROM series_purchases sp LEFT JOIN series s ON s.id=sp.series_id WHERE sp.user_id=?', req.userId));
+    const my_offline = await safeRows(() => allRows(
+      'SELECT video_id, created_at FROM offline_downloads WHERE user_id=?', req.userId));
     res.json({ user: u, videos, comments, stories, playlists, withdrawals, ledger,
       following, followers, liked_videos, collections, collection_items,
       conversations, messages, search_history, watch_history, video_views, notifications,
       sessions, devices, privacy_settings, content_prefs, appeals, verification_requests, calls, referrals,
+      kyc, tips, blocked_users, my_reports, drafts, recharges, my_receipts, followed_hashtags,
+      login_streak, friend_streaks, my_poll_votes, my_series_purchases, my_offline,
       exported_at: now() });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
@@ -4917,7 +4949,33 @@ app.delete('/api/account', auth, async (req, res) => {
     await runSql('DELETE FROM content_prefs WHERE user_id=?', uid);
     await runSql('DELETE FROM search_logs WHERE user_id=?', uid);
     await runSql('DELETE FROM activities WHERE user_id=?', uid);
-    await runSql('DELETE FROM bot_messages WHERE user_id=?', uid);
+    // FIX sécu 2026-10-05 (confidentialité #3 HAUTE) : bot_messages est créée paresseusement
+    // (au premier /api/bot/chat) — sans try/catch, un utilisateur n'ayant jamais parlé à Vigi
+    // faisait échouer TOUTE la suppression (500, compte conservé). Droit à l'effacement cassé.
+    try { await runSql('DELETE FROM bot_messages WHERE user_id=?', uid); } catch (e) {}
+    // FIX sécu 2026-10-05 (confidentialité #4 HAUTE) : 13 tables oubliées par la suppression
+    await runSql('DELETE FROM hashtag_follows WHERE user_id=?', uid);
+    await runSql('DELETE FROM login_streaks WHERE user_id=?', uid);
+    await runSql('DELETE FROM friendship_streaks WHERE user_a=? OR user_b=?', uid, uid);
+    await runSql('DELETE FROM video_translations WHERE video_id IN (SELECT id FROM videos WHERE user_id=?)', uid);
+    await runSql('DELETE FROM translation_quota WHERE user_id=?', uid);
+    await runSql('DELETE FROM offline_downloads WHERE user_id=?', uid);
+    await runSql('DELETE FROM retention_nudges WHERE user_id=?', uid);
+    await runSql('DELETE FROM premiere_reminders WHERE user_id=?', uid);
+    await runSql('DELETE FROM video_view_sources WHERE user_id=?', uid);
+    await runSql('DELETE FROM profile_views WHERE viewer_id=? OR viewed_id=?', uid, uid);
+    await runSql('DELETE FROM live_chat WHERE user_id=?', uid);
+    await runSql('DELETE FROM premiere_chat WHERE user_id=?', uid);
+    // devices : user_ids est un JSON — retire l'utilisateur, supprime les lignes devenues vides
+    try {
+      const _drows = await allRows('SELECT device_id, user_ids FROM devices');
+      for (const _dr of _drows) {
+        let _ids = []; try { _ids = JSON.parse(_dr.user_ids || '[]') || []; } catch (e) {}
+        const _keep = _ids.filter(x => Number(x) !== Number(uid));
+        if (!_keep.length) await runSql('DELETE FROM devices WHERE device_id=?', _dr.device_id);
+        else if (_keep.length !== _ids.length) await runSql('UPDATE devices SET user_ids=? WHERE device_id=?', JSON.stringify(_keep), _dr.device_id);
+      }
+    } catch (e) {}
     await runSql('DELETE FROM call_signals WHERE call_id IN (SELECT id FROM calls WHERE caller_id=? OR callee_id=?) OR to_user_id=? OR from_user_id=?', uid, uid, uid, uid);
     await runSql('DELETE FROM calls WHERE caller_id=? OR callee_id=?', uid, uid);
     await runSql('DELETE FROM live_signals WHERE to_user_id=? OR from_user_id=?', uid, uid);
@@ -12114,8 +12172,11 @@ function og404(req, res, title) {
 app.get('/v/:id', async (req, res) => {
   try {
     if (!/^\d+$/.test(req.params.id)) return og404(req, res, 'Vidéo introuvable');
-    const v = await get1('SELECT v.id, v.description, v.file, u.username, u.avatar FROM videos v JOIN users u ON u.id=v.user_id WHERE v.id=?', Number(req.params.id));
+    const v = await get1('SELECT v.id, v.description, v.file, v.visibility, u.username, u.avatar FROM videos v JOIN users u ON u.id=v.user_id WHERE v.id=?', Number(req.params.id));
     if (!v) return og404(req, res, 'Vidéo introuvable');
+    // FIX sécu 2026-10-05 (confidentialité #1 CRITIQUE) : la page publique /v/:id exposait
+    // les vidéos PRIVÉES (description + URL directe du fichier) sans authentification.
+    if ((v.visibility || 'public') !== 'public') return og404(req, res, 'Vidéo introuvable');
     const base = ogBaseOf(req);
     const fu = fileUrl(v.file || '');
     const absFu = /^https?:\/\//.test(fu) ? fu : base + fu;
@@ -13336,6 +13397,9 @@ app.get('/api/videos/:id/download-url', auth, async (req, res) => {
   try {
     const v = await get1('SELECT * FROM videos WHERE id=?', req.params.id);
     if (!v) return res.status(404).json({ error: 'vidéo introuvable' });
+    // FIX sécu 2026-10-05 (confidentialité #2 CRITIQUE) : download-url ignorait la visibilité —
+    // tout utilisateur authentifié pouvait télécharger la vidéo privée d'un autre.
+    if (!(await canSeeVideo(v, req.userId))) return res.status(403).json({ error: 'vidéo non accessible' });
     if (!Number(v.allow_download)) return res.status(403).json({ error: 'téléchargement non autorisé' });
     // B1 : la colonne s'appelle `file` (pas `url`) → construire l'URL via fileUrl()
     res.json({ ok: true, url: fileUrl(v.file || '') });
