@@ -13517,9 +13517,9 @@ app.get('/api/videos/:id/download-url', auth, async (req, res) => {
 // ==================== v2.49 : MISE À JOUR AUTO DE L'APP (sans Play Store) ====================
 // L'app appelle /api/app/version au démarrage (1x/jour) et propose le téléchargement
 // si versionCode > celui installé. L'APK est hébergée sur Cloudinary (URL stable).
-const APP_VERSION_CODE = 249;
-const APP_VERSION_NAME = '2.49';
-const APP_CHANGELOG = "Mise à jour auto dans l'app, motif des sanctions affiché, correctifs sécurité et concurrence.";
+const APP_VERSION_CODE = 250;
+const APP_VERSION_NAME = '2.50';
+const APP_CHANGELOG = "Fuseau horaire envoyé au serveur (séries et heures creuses corrigées en Haïti), lives programmés notifiés, correctifs sécurité et concurrence.";
 async function appConfigGet(key) {
   try { const r = await get1('SELECT value FROM app_config WHERE key=?', key); return r ? r.value : ''; }
   catch (e) { return ''; }
