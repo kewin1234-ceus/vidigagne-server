@@ -2247,6 +2247,8 @@ app.get('/api/search/insights', async (req, res) => {
   // SPEC-14 : compte protégé (13-15 ans) + accord parental
   await mig('users', 'teen_protected', `INTEGER NOT NULL DEFAULT 0`);
   await mig('users', 'parental_consent', `INTEGER NOT NULL DEFAULT 0`);
+  // SPEC-12 : mode audio seul pour les invités live
+  await mig('live_guests', 'mode', `TEXT NOT NULL DEFAULT 'video'`);
   // v2.33 : épinglage d'un message du chat live (live_chat.pinned)
   await mig('live_chat', 'pinned', `INTEGER NOT NULL DEFAULT 0`);
   // serveur v11 (V3) : boutique, live shopping, publicité, modération auto
@@ -5705,7 +5707,12 @@ app.get('/api/coins/recharge/paypal/callback', async (req, res) => {
     }
     const cfg = paypalCfg();
     const token = cfg ? await paypalToken() : null;
-    if (!token || !rc.paypal_order_id) return res.status(500).send('Paiement indisponible');
+    // FIX 2026-10-06 : sans ce reset, un token indisponible laissait la recharge bloquée
+    // en 'capturing' pour toujours (invisible à l'admin, retry impossible → 409).
+    if (!token || !rc.paypal_order_id) {
+      await runSql("UPDATE coin_recharges SET status='awaiting_payment' WHERE id=? AND status='capturing'", rid);
+      return res.status(500).send('Paiement indisponible');
+    }
     const cr = await fetch(cfg.api + '/v2/checkout/orders/' + encodeURIComponent(rc.paypal_order_id) + '/capture', {
       method: 'POST', headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' }, body: '{}'
     });
@@ -10578,9 +10585,9 @@ app.get('/api/live/:id/guests', auth, async (req, res) => {
     const isHost = Number(l.user_id) === Number(req.userId);
     const statusFilter = isHost ? "('pending','accepted')" : "('accepted')";
     const rows = await allRows(
-      "SELECT id, user_id, username, avatar, status, created_at FROM live_guests WHERE live_id=? AND status IN " + statusFilter + " ORDER BY created_at ASC LIMIT 20",
+      "SELECT id, user_id, username, avatar, status, mode, created_at FROM live_guests WHERE live_id=? AND status IN " + statusFilter + " ORDER BY created_at ASC LIMIT 20",
       l.id);
-    res.json({ guests: rows, is_host: isHost, max_guests: Math.max(1, Math.min(8, Number(l.max_guests) || 8)) });
+    res.json({ guests: rows.map(g => ({ ...g, mode: g.mode || 'video' })), is_host: isHost, max_guests: Math.max(1, Math.min(8, Number(l.max_guests) || 8)) });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 // Demande de participation (spectateur -> hôte)
@@ -10599,19 +10606,21 @@ app.post('/api/live/:id/guest-request', auth, async (req, res) => {
     const maxG = Math.max(1, Math.min(8, Number(l.max_guests) || 8));
     const nAcc = await get1("SELECT COUNT(*) AS c FROM live_guests WHERE live_id=? AND status='accepted'", l.id);
     if (Number(nAcc.c) >= maxG) return res.status(400).json({ error: 'Panel complet' });
+    // SPEC-12 : mode 'audio' (audio seul, sans caméra) ou 'video' pour l'invité
+    const mode = String((req.body || {}).mode || 'video') === 'audio' ? 'audio' : 'video';
     if (USE_PG) {
-      await runSql(`INSERT INTO live_guests(live_id,user_id,username,avatar,status,created_at) VALUES(?,?,?,?,?,?)
-        ON CONFLICT(live_id,user_id) DO UPDATE SET status='pending', username=EXCLUDED.username, avatar=EXCLUDED.avatar, created_at=EXCLUDED.created_at`,
-        l.id, req.userId, un, av, 'pending', now());
+      await runSql(`INSERT INTO live_guests(live_id,user_id,username,avatar,status,mode,created_at) VALUES(?,?,?,?,?,?,?)
+        ON CONFLICT(live_id,user_id) DO UPDATE SET status='pending', mode=EXCLUDED.mode, username=EXCLUDED.username, avatar=EXCLUDED.avatar, created_at=EXCLUDED.created_at`,
+        l.id, req.userId, un, av, 'pending', mode, now());
     } else {
-      await runSql(`INSERT OR REPLACE INTO live_guests(live_id,user_id,username,avatar,status,created_at) VALUES(?,?,?,?,?,?)`,
-        l.id, req.userId, un, av, 'pending', now());
+      await runSql(`INSERT OR REPLACE INTO live_guests(live_id,user_id,username,avatar,status,mode,created_at) VALUES(?,?,?,?,?,?,?)`,
+        l.id, req.userId, un, av, 'pending', mode, now());
     }
     // notifie l'hôte en temps réel via le canal signaux
     await runSql('INSERT INTO live_signals(live_id,to_user_id,from_user_id,kind,payload,created_at) VALUES(?,?,?,?,?,?)',
-      l.id, l.user_id, req.userId, 'guest_request', JSON.stringify({ username: un, avatar: av }), now()).catch(() => {});
+      l.id, l.user_id, req.userId, 'guest_request', JSON.stringify({ username: un, avatar: av, mode }), now()).catch(() => {});
     await notify(l.user_id, 'guest_request', req.userId, null, null).catch(() => {});
-    res.json({ ok: true });
+    res.json({ ok: true, mode });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 // Réponse de l'hôte (accepter / refuser une demande)
@@ -10651,17 +10660,19 @@ app.post('/api/live/:id/guest-invite', auth, async (req, res) => {
     if (!guestId || guestId === Number(req.userId)) return res.status(400).json({ error: 'user_id invalide' });
     const u = await get1('SELECT username, avatar FROM users WHERE id=?', guestId);
     if (!u) return res.status(404).json({ error: 'utilisateur introuvable' });
+    // SPEC-12 : l'hôte peut inviter en mode 'audio' (audio seul) ou 'video'
+    const imode = String((req.body || {}).mode || 'video') === 'audio' ? 'audio' : 'video';
     if (USE_PG) {
-      await runSql(`INSERT INTO live_guests(live_id,user_id,username,avatar,status,created_at) VALUES(?,?,?,?,?,?)
-        ON CONFLICT(live_id,user_id) DO UPDATE SET status='invited', created_at=EXCLUDED.created_at`,
-        l.id, guestId, u.username, u.avatar || '', 'invited', now());
+      await runSql(`INSERT INTO live_guests(live_id,user_id,username,avatar,status,mode,created_at) VALUES(?,?,?,?,?,?,?)
+        ON CONFLICT(live_id,user_id) DO UPDATE SET status='invited', mode=EXCLUDED.mode, created_at=EXCLUDED.created_at`,
+        l.id, guestId, u.username, u.avatar || '', 'invited', imode, now());
     } else {
-      await runSql(`INSERT OR REPLACE INTO live_guests(live_id,user_id,username,avatar,status,created_at) VALUES(?,?,?,?,?,?)`,
-        l.id, guestId, u.username, u.avatar || '', 'invited', now());
+      await runSql(`INSERT OR REPLACE INTO live_guests(live_id,user_id,username,avatar,status,mode,created_at) VALUES(?,?,?,?,?,?,?)`,
+        l.id, guestId, u.username, u.avatar || '', 'invited', imode, now());
     }
     await runSql('INSERT INTO live_signals(live_id,to_user_id,from_user_id,kind,payload,created_at) VALUES(?,?,?,?,?,?)',
-      l.id, guestId, req.userId, 'guest_invite', JSON.stringify({ live_id: l.id, title: l.title }), now()).catch(() => {});
-    res.json({ ok: true });
+      l.id, guestId, req.userId, 'guest_invite', JSON.stringify({ live_id: l.id, title: l.title, mode: imode }), now()).catch(() => {});
+    res.json({ ok: true, mode: imode });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 // Le spectateur répond à l'invitation de l'hôte
@@ -10688,6 +10699,24 @@ app.post('/api/live/:id/guest-leave', auth, async (req, res) => {
     const l = await liveById(req.params.id);
     if (!l) return res.status(404).json({ error: 'live introuvable' });
     await runSql("UPDATE live_guests SET status='cancelled' WHERE live_id=? AND user_id=? AND status IN ('pending','invited','accepted')", l.id, req.userId);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// SPEC-12 : l'hôte retire un invité (accepté, invité ou en attente)
+app.post('/api/live/:id/guest-remove', auth, async (req, res) => {
+  try {
+    const l = await liveById(req.params.id);
+    if (!l) return res.status(404).json({ error: 'live introuvable' });
+    if (Number(l.user_id) !== Number(req.userId)) return res.status(403).json({ error: 'réservé à l\'hôte' });
+    const guestId = Number((req.body || {}).user_id);
+    if (!guestId || guestId === Number(req.userId)) return res.status(400).json({ error: 'user_id invalide' });
+    const g = await get1("SELECT * FROM live_guests WHERE live_id=? AND user_id=? AND status IN ('pending','invited','accepted')", l.id, guestId);
+    if (!g) return res.status(404).json({ error: 'invité introuvable' });
+    await runSql("UPDATE live_guests SET status='removed' WHERE live_id=? AND user_id=?", l.id, guestId);
+    // signale l'invité retiré en temps réel (l'app ferme sa tuile)
+    await runSql('INSERT INTO live_signals(live_id,to_user_id,from_user_id,kind,payload,created_at) VALUES(?,?,?,?,?,?)',
+      l.id, guestId, req.userId, 'guest_removed', JSON.stringify({ live_id: l.id }), now()).catch(() => {});
+    await notify(guestId, 'guest_removed', req.userId, null, 'L\u2019hôte t\u2019a retiré du live.').catch(() => {});
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
