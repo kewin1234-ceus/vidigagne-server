@@ -5402,8 +5402,29 @@ async function maybeGiftEmail(destUserId, actorName, g) {
   } catch (_) {}
 }
 // ---------- retraits v2 : moyen enregistré + reçu ----------
+// ==================== v2.52 : RETRAITS EN ATTENTE (pas de revenus pub = pas d'argent) ====================
+// Tant que les publicités ne tournent pas, il n'y a pas d'argent derrière les retraits.
+// withdrawals_paused=1 (défaut) → les demandes sont refusées avec un message honnête,
+// les pièces restent sur le compte et continuent de s'accumuler. L'admin réactive via
+// POST /api/admin/app/withdrawals quand les revenus pub démarrent.
+async function withdrawalsPaused() {
+  const v = await appConfigGet('withdrawals_paused');
+  return v !== '0'; // défaut : en pause (aucune valeur = pas encore de revenus)
+}
+const WITHDRAW_PAUSED_MSG = 'Retraits en attente : ils ouvriront quand les revenus publicitaires démarreront. Tes pièces sont en sécurité et continuent de s\u2019accumuler.';
+app.post('/api/admin/app/withdrawals', adminAuth, async (req, res) => {
+  try {
+    const paused = (req.body || {}).paused === false || (req.body || {}).paused === '0' ? '0' : '1';
+    await runSql(`INSERT INTO app_config(key,value,updated_at) VALUES('withdrawals_paused',?,?)
+      ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at`,
+      paused, now());
+    res.json({ ok: true, withdrawals_paused: paused === '1' });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
 app.post('/api/withdraw', auth, async (req, res) => {
   try {
+    if (await withdrawalsPaused())
+      return res.status(403).json({ error: WITHDRAW_PAUSED_MSG, withdrawals_paused: true });
     const { coins, method, account, method_id } = req.body || {};
     const n = Math.floor(+coins);
     if (!n || n < 1000) return res.status(400).json({ error: 'minimum 1000 pièces (2 $)' });
@@ -9823,6 +9844,8 @@ app.get('/api/live/:id/summary', auth, async (req, res) => {
 // Retrait partiel depuis les gains du live (montant en USD)
 app.post('/api/live/withdraw', auth, async (req, res) => {
   try {
+    if (await withdrawalsPaused())
+      return res.status(403).json({ error: WITHDRAW_PAUSED_MSG, withdrawals_paused: true });
     const { live_id, amount_usd, method_id } = req.body || {};
     if (!live_id) return res.status(400).json({ error: 'live_id requis' });
     const amount = Math.round(Number(amount_usd) * 100) / 100;
@@ -13520,9 +13543,9 @@ app.get('/api/videos/:id/download-url', auth, async (req, res) => {
 // ==================== v2.49 : MISE À JOUR AUTO DE L'APP (sans Play Store) ====================
 // L'app appelle /api/app/version au démarrage (1x/jour) et propose le téléchargement
 // si versionCode > celui installé. L'APK est hébergée sur Cloudinary (URL stable).
-const APP_VERSION_CODE = 250;
-const APP_VERSION_NAME = '2.50';
-const APP_CHANGELOG = "Fuseau horaire envoyé au serveur (séries et heures creuses corrigées en Haïti), lives programmés notifiés, correctifs sécurité et concurrence.";
+const APP_VERSION_CODE = 252;
+const APP_VERSION_NAME = '2.52';
+const APP_CHANGELOG = "Retraits en attente (message honnête tant que les revenus pub n'ont pas démarré), correctif inscription e-mail.";
 async function appConfigGet(key) {
   try { const r = await get1('SELECT value FROM app_config WHERE key=?', key); return r ? r.value : ''; }
   catch (e) { return ''; }
@@ -13530,7 +13553,8 @@ async function appConfigGet(key) {
 app.get('/api/app/version', async (req, res) => {
   try {
     const apkUrl = (await appConfigGet('apk_url')) || process.env.APP_APK_URL || '';
-    res.json({ ok: true, versionCode: APP_VERSION_CODE, versionName: APP_VERSION_NAME, apkUrl, changelog: APP_CHANGELOG, mandatory: false });
+    res.json({ ok: true, versionCode: APP_VERSION_CODE, versionName: APP_VERSION_NAME, apkUrl, changelog: APP_CHANGELOG, mandatory: false,
+      withdrawals_paused: await withdrawalsPaused() });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 // Upload d'une nouvelle APK (admin) → Cloudinary (raw) → URL stable enregistrée
