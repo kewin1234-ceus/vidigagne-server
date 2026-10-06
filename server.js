@@ -2249,6 +2249,8 @@ app.get('/api/search/insights', async (req, res) => {
   await mig('users', 'parental_consent', `INTEGER NOT NULL DEFAULT 0`);
   // SPEC-12 : mode audio seul pour les invités live
   await mig('live_guests', 'mode', `TEXT NOT NULL DEFAULT 'video'`);
+  // Login Facebook (gratuit) : identifiant Facebook lié au compte
+  await mig('users', 'facebook_id', `TEXT`);
   // v2.33 : épinglage d'un message du chat live (live_chat.pinned)
   await mig('live_chat', 'pinned', `INTEGER NOT NULL DEFAULT 0`);
   // serveur v11 (V3) : boutique, live shopping, publicité, modération auto
@@ -9753,6 +9755,85 @@ app.get('/api/auth/google/poll', async (req, res) => {
   } catch (e) { res.json({ done: false }); }
 });
 
+// ---------- Facebook OAuth (gratuit) ----------
+// Variables d'environnement à renseigner (Meta for Developers → application) :
+//   FACEBOOK_APP_ID, FACEBOOK_APP_SECRET (+ FACEBOOK_REDIRECT_URI si besoin).
+// Tant qu'elles sont absentes, le bouton « Continuer avec Facebook » est masqué dans l'app.
+const FACEBOOK_OK = () => !!(process.env.FACEBOOK_APP_ID && process.env.FACEBOOK_APP_SECRET);
+const FACEBOOK_REDIRECT = () => process.env.FACEBOOK_REDIRECT_URI || 'https://vidigagne-server-production.up.railway.app/api/auth/facebook/callback';
+
+app.get('/api/auth/facebook/start', (req, res) => {
+  if (!FACEBOOK_OK()) return res.status(503).json({ error: 'Facebook non configuré' });
+  const session = (req.query.session || '').toString();
+  if (!validSession(session)) return res.status(400).json({ error: 'session invalide' });
+  const params = new URLSearchParams({
+    client_id: process.env.FACEBOOK_APP_ID,
+    redirect_uri: FACEBOOK_REDIRECT(),
+    state: session,
+    scope: 'email,public_profile',
+    response_type: 'code',
+  });
+  res.redirect('https://www.facebook.com/v19.0/dialog/oauth?' + params.toString());
+});
+
+app.get('/api/auth/facebook/callback', async (req, res) => {
+  try {
+    const { code, state } = req.query;
+    if (!code || !validSession(state || '')) return res.status(400).send('Session invalide');
+    const tParams = new URLSearchParams({
+      client_id: process.env.FACEBOOK_APP_ID,
+      client_secret: process.env.FACEBOOK_APP_SECRET,
+      redirect_uri: FACEBOOK_REDIRECT(),
+      code: String(code),
+    });
+    const tRes = await fetch('https://graph.facebook.com/v19.0/oauth/access_token?' + tParams.toString());
+    const tj = await tRes.json();
+    if (!tj.access_token) return res.status(400).send('Échec Facebook');
+    const uRes = await fetch('https://graph.facebook.com/me?fields=id,name,email&access_token=' + encodeURIComponent(tj.access_token));
+    const fb = await uRes.json();
+    if (!fb.id) return res.status(400).send('Profil Facebook incomplet');
+    const fbEmail = fb.email ? String(fb.email).toLowerCase() : null;
+    let u = await get1('SELECT * FROM users WHERE facebook_id=?', String(fb.id));
+    if (!u && fbEmail) {
+      const byMail = await get1('SELECT * FROM users WHERE email=?', fbEmail);
+      if (byMail) {
+        await runSql('UPDATE users SET facebook_id=? WHERE id=?', String(fb.id), byMail.id);
+        u = await get1('SELECT * FROM users WHERE id=?', byMail.id);
+      }
+    }
+    if (!u) {
+      let base = (fbEmail ? fbEmail.split('@')[0] : String(fb.name || 'user')).toLowerCase().replace(/[^a-z0-9._]/g, '').slice(0, 18) || 'user';
+      if (base.length < 2) base = 'user';
+      let username = base, n = 0;
+      while (await get1('SELECT 1 FROM users WHERE username=?', username)) { n++; username = (base + n).slice(0, 24); }
+      const id = await insertId(
+        'INSERT INTO users(username,name,email,facebook_id,pass_hash,pass_salt,created_at) VALUES(?,?,?,?,?,?,?)',
+        username, String(fb.name || username).slice(0, 40), fbEmail,
+        String(fb.id), crypto.randomBytes(16).toString('hex'), crypto.randomBytes(16).toString('hex'), now());
+      u = await get1('SELECT * FROM users WHERE id=?', id);
+    }
+    const token = crypto.randomBytes(32).toString('hex');
+    await runSql('INSERT INTO tokens(token,user_id,created_at) VALUES(?,?,?)', token, u.id, now());
+    await runSql('INSERT INTO oauth_sessions(session,token,user_id,created_at) VALUES(?,?,?,?)',
+      state, token, u.id, now());
+    res.send(`<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head><body style="font-family:sans-serif;text-align:center;padding:60px 20px"><div style="font-size:64px">✅</div><h2>Connexion réussie !</h2><p>Retourne dans l'application VidiGagne.</p></body></html>`);
+  } catch (e) { res.status(500).send('Erreur de connexion Facebook'); }
+});
+
+app.get('/api/auth/facebook/poll', async (req, res) => {
+  try {
+    const s = (req.query.session || '').toString();
+    await runSql('DELETE FROM oauth_sessions WHERE created_at<?', now() - 600000); // expire 10 min
+    if (!validSession(s)) return res.json({ done: false });
+    const row = await get1('SELECT token, user_id FROM oauth_sessions WHERE session=?', s);
+    if (!row) return res.json({ done: false });
+    await runSql('DELETE FROM oauth_sessions WHERE session=?', s); // usage unique
+    const u = await get1('SELECT * FROM users WHERE id=?', row.user_id);
+    const _pu = privUser(u); _pu.email = u.email || '';
+    res.json({ done: true, token: row.token, user: _pu, coins: u.coins });
+  } catch (e) { res.json({ done: false }); }
+});
+
 // ---------- Téléphone (Firebase) ----------
 let fbCerts = null, fbCertsAt = 0;
 async function verifyFirebaseToken(idToken) {
@@ -9820,6 +9901,7 @@ app.get('/api/health', (req, res) => res.json({
   db: USE_PG ? 'postgres' : 'sqlite',
   storage: USE_CLOUDINARY ? 'cloudinary' : 'local',
   google: GOOGLE_OK(), phone: !!process.env.FIREBASE_PROJECT_ID,
+  facebook: FACEBOOK_OK(), // login Facebook (gratuit) — bouton masqué dans l'app si false
   firebase: process.env.FIREBASE_PROJECT_ID || null,
   fbKey: process.env.FIREBASE_API_KEY || null, // clé Web Firebase : publique par design, requise par l'appli pour l'auth téléphone
 }));
