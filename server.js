@@ -3810,7 +3810,7 @@ app.get('/api/diag/fcm', async (req, res) => {
     let sdk = false, initErr = '';
     try { require('firebase-admin'); sdk = true; } catch (_) { sdk = false; }
     res.json({ ok: true, sdk_installed: sdk,
-      creds_set: !!process.env.GOOGLE_APPLICATION_CREDENTIALS,
+      creds_set: fcmCredsSet(),
       project: process.env.FIREBASE_PROJECT_ID || null });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
@@ -3820,9 +3820,12 @@ app.post('/api/diag/fcm', async (req, res) => {
     const fcmToken = String((req.body || {}).fcm_token || '').slice(0, 500);
     if (!fcmToken) return res.status(400).json({ error: 'fcm_token requis' });
     let adm;
-    try { adm = require('firebase-admin'); } catch (_) { return res.json({ ok: false, reason: 'admin_sdk_missing' }); }
-    if (!process.env.GOOGLE_APPLICATION_CREDENTIALS) return res.json({ ok: false, reason: 'no_credentials' });
-    if (adm.apps.length === 0) adm.initializeApp({ credential: adm.credential.applicationDefault() });
+    try { adm = fcmAdmin(); }
+    catch (e) {
+      const m = String((e && e.message) || e);
+      if (!fcmCredsSet()) return res.json({ ok: false, reason: 'no_credentials' });
+      return res.json({ ok: false, reason: m.slice(0, 120) });
+    }
     const msgId = await adm.messaging().send({
 token: fcmToken,
       notification: { title: 'VidiGagne ✅', body: 'Push de test — tout fonctionne !' },
@@ -8741,6 +8744,23 @@ app.post('/api/push/fcm-token', auth, async (req, res) => {
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
+// v2.53 : init Firebase Admin — accepte GOOGLE_APPLICATION_CREDENTIALS (chemin fichier)
+// OU FIREBASE_SERVICE_ACCOUNT_JSON (contenu JSON brut, pratique sur Railway).
+function fcmAdmin() {
+  const adm = require('firebase-admin');
+  if (adm.apps.length) return adm;
+  const rawJson = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+  if (rawJson) {
+    const creds = JSON.parse(rawJson);
+    adm.initializeApp({ credential: adm.credential.cert(creds) });
+  } else {
+    adm.initializeApp({ credential: adm.credential.applicationDefault() });
+  }
+  return adm;
+}
+function fcmCredsSet() {
+  return !!(process.env.GOOGLE_APPLICATION_CREDENTIALS || process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
+}
 // envoie un push FCM (utilise Firebase Admin SDK si configuré, sinon log)
 let _fcmAdmin = null;
 async function sendFcmPush(userId, title, body, data) {
@@ -8752,13 +8772,8 @@ async function sendFcmPush(userId, title, body, data) {
       body: String(body).slice(0, 200), at: Date.now() });
     if (_pushAttempts.length > 500) _pushAttempts.shift();
     if (VG_TEST_HOOKS) return { sent: false, reason: 'stubbed' };
-    // Firebase Admin SDK (nécessite GOOGLE_APPLICATION_CREDENTIALS sur Render)
-    if (!_fcmAdmin) {
-      try { _fcmAdmin = require('firebase-admin'); } catch (_) { return { sent: false, reason: 'admin_sdk_missing' }; }
-    }
-    if (_fcmAdmin.apps.length === 0) {
-      _fcmAdmin.initializeApp({ credential: _fcmAdmin.credential.applicationDefault() });
-    }
+    // Firebase Admin SDK (GOOGLE_APPLICATION_CREDENTIALS ou FIREBASE_SERVICE_ACCOUNT_JSON)
+    try { _fcmAdmin = fcmAdmin(); } catch (e) { return { sent: false, reason: 'fcm_init: ' + String((e && e.message) || e).slice(0, 80) }; }
     await _fcmAdmin.messaging().send({
       token: u.fcm_token,
       notification: { title: String(title).slice(0, 100), body: String(body).slice(0, 200) },
