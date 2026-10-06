@@ -12528,6 +12528,55 @@ const _legal = (f) => (req, res) => {
 };
 app.get('/privacy', _legal('privacy.html'));
 app.get('/terms', _legal('terms.html'));
+// SPEC-download : lib QR (MIT, Kazuhiko Arase) servie en statique pour la page /download
+app.use('/pub', express.static(path.join(__dirname, 'public'), { maxAge: '30d' }));
+// SPEC-download : page de téléchargement — logo, bouton APK (URL depuis /api/app/version),
+// QR code vers l'URL, guide d'installation FR + créole haïtien. 100 % statique, aucun service externe.
+app.get('/download', async (req, res) => {
+  try {
+    const apkUrl = (await appConfigGet('apk_url')) || process.env.APP_APK_URL || '';
+    res.type('html').send(downloadPageHtml(apkUrl));
+  } catch (e) { res.status(500).send('Page indisponible'); }
+});
+function downloadPageHtml(apkUrl) {
+  const esc = s => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
+  const dlBtn = apkUrl
+    ? '<a class="dlbtn" href="' + esc(apkUrl) + '">⬇️ Télécharger VidiGagne (Android)</a>'
+    : '<div class="dlbtn off">⏳ Lien de téléchargement bientôt disponible</div>';
+  const qrJs = apkUrl
+    ? "try{var qr=qrcode(0,'M');qr.addData(" + JSON.stringify(apkUrl) + ");qr.make();document.getElementById('qr').innerHTML=qr.createSvgTag({scalable:true});}catch(e){document.getElementById('qr').innerHTML='QR indisponible';}"
+    : "document.getElementById('qr').style.display='none';";
+  return '<!DOCTYPE html><html lang="fr"><head><meta charset="utf-8">'
+    + '<meta name="viewport" content="width=device-width,initial-scale=1">'
+    + '<title>Télécharger VidiGagne</title>'
+    + '<style>body{margin:0;background:#0b0b0f;color:#f5f5f5;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}'
+    + '.wrap{max-width:640px;margin:0 auto;padding:28px 18px 60px;text-align:center}'
+    + '.logo{width:96px;height:96px;margin:10px auto;background:#000;border:2px solid #d4af37;border-radius:24px;display:flex;align-items:center;justify-content:center;font-size:56px}'
+    + 'h1{color:#d4af37;margin:8px 0 2px;font-size:30px}.sub{color:#aaa;margin:0 0 22px}'
+    + '.dlbtn{display:inline-block;background:linear-gradient(135deg,#d4af37,#f5d76e);color:#111;font-weight:800;font-size:19px;padding:16px 34px;border-radius:14px;text-decoration:none;margin:8px 0 4px}'
+    + '.dlbtn.off{background:#333;color:#999}.note{color:#888;font-size:13px;margin:6px 0 20px}'
+    + '#qr{background:#fff;display:inline-block;padding:14px;border-radius:14px;margin:10px 0}#qr svg{width:200px;height:200px;display:block}'
+    + '.guide{text-align:left;background:#15151b;border:1px solid #2a2a33;border-radius:14px;padding:18px;margin:18px 0}'
+    + '.guide h2{margin:0 0 10px;font-size:18px;color:#d4af37}.guide ol{margin:0;padding-left:22px}.guide li{margin:8px 0;line-height:1.5;font-size:15px}'
+    + '.foot{color:#666;font-size:12px;margin-top:30px}</style></head><body><div class="wrap">'
+    + '<div class="logo">🎵</div><h1>VidiGagne</h1><p class="sub">Regarde des vidéos, gagne des pièces 💰</p>'
+    + dlBtn + '<p class="note">Android 8.0+ · gratuit · ~45 Mo</p>'
+    + '<div id="qr"></div><p class="note">Scanne ce QR code avec ton téléphone pour télécharger</p>'
+    + '<div class="guide"><h2>📲 Comment installer (sources inconnues)</h2><ol>'
+    + '<li>Appuie sur le bouton <b>Télécharger</b> ci-dessus.</li>'
+    + '<li>Ouvre le fichier téléchargé quand c\u2019est terminé.</li>'
+    + '<li>Ton téléphone demande l\u2019autorisation d\u2019installer des applications de <b>sources inconnues</b> : appuie sur <b>Autoriser</b>.</li>'
+    + '<li>Appuie sur <b>Installer</b>, puis ouvre VidiGagne et inscris-toi — c\u2019est gratuit !</li>'
+    + '</ol></div>'
+    + '<div class="guide"><h2>📲 Kijan pou enstale (sous enkoni)</h2><ol>'
+    + '<li>Peze bouton <b>Telechaje</b> anwo a.</li>'
+    + '<li>Louvri fichye a lè telechajman an fini.</li>'
+    + '<li>Telefòn ou ap mande pèmisyon pou enstale aplikasyon ki pa soti nan Play Store (<b>sous enkoni</b>) : peze <b>Pèmèt</b>.</li>'
+    + '<li>Peze <b>Enstale</b>, epi louvri VidiGagne epi enskri — se gratis !</li>'
+    + '</ol></div>'
+    + '<p class="foot">VidiGagne — 100 % gratuit, aucune carte bancaire requise.</p>'
+    + '</div><script src="/pub/qrcode-lib.js"></script><script>' + qrJs + '</script></body></html>';
+}
 
 // ==================== v2.44-EQA-OG : pages publiques de partage (OG tags) — Équipe A ====================
 // GET /v/:id, /u/:username, /@/:username, /live/:id → HTML avec Open Graph / Twitter Card
