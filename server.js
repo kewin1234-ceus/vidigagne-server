@@ -1023,6 +1023,7 @@ CREATE INDEX IF NOT EXISTS api_keys_key_idx ON api_keys(api_key);`;
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_name TEXT DEFAULT ''`);
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS birthdate TEXT DEFAULT ''`);
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS gender TEXT DEFAULT ''`);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS audience TEXT DEFAULT 'public'`); // v2.56 : préférence d'audience
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS ref_code TEXT`);
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by INTEGER`);
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS storage_bytes BIGINT DEFAULT 0`); // v1.54 : quota stockage
@@ -3440,6 +3441,48 @@ app.post('/api/auth/register', async (req, res) => {
     const u = await get1('SELECT * FROM users WHERE id=?', id);
     if (email) await consumeVerifiedToken((req.body || {}).verification_token);
     res.json({ token, user: privUser(u), coins: u.coins });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+
+// v2.56 : correctifs fouille "fonctionnalités mortes" (2026-10-06)
+// 1. Changement de mot de passe — l'app appelait POST /api/account/password (404 avant)
+app.post('/api/account/password', auth, async (req, res) => {
+  try {
+    const { old_password, password } = req.body || {};
+    if (!password || String(password).length < 8)
+      return res.status(400).json({ error: 'mot de passe : 8 caractères minimum' });
+    const u = await get1('SELECT * FROM users WHERE id=?', req.userId);
+    if (!u) return res.status(404).json({ error: 'compte introuvable' });
+    if (!u.pass_hash)
+      return res.status(400).json({ error: 'compte sans mot de passe (connexion sociale)' });
+    if (hashPass(String(old_password || ''), u.pass_salt) !== u.pass_hash)
+      return res.status(401).json({ error: 'ancien mot de passe incorrect' });
+    const salt = crypto.randomBytes(16).toString('hex');
+    await runSql('UPDATE users SET pass_hash=?, pass_salt=? WHERE id=?', hashPass(String(password), salt), salt, req.userId);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+
+// 4. Préférence d'audience — l'app appelait POST /api/me/audience (404 avant, échec silencieux)
+app.post('/api/me/audience', auth, async (req, res) => {
+  try {
+    const a = String((req.body || {}).audience || '');
+    if (!['public', 'friends', 'private'].includes(a))
+      return res.status(400).json({ error: 'audience invalide' });
+    await runSql('UPDATE users SET audience=? WHERE id=?', a, req.userId);
+    res.json({ ok: true, audience: a });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+
+// 3. Page hashtag — GET /api/hashtag/:tag (singulier, l'app l'appelait déjà)
+app.get('/api/hashtag/:tag', async (req, res) => {
+  try {
+    const tag = String(req.params.tag || '').toLowerCase().slice(0, 60);
+    const vids = await get1(
+      `SELECT COUNT(*) AS n FROM videos v JOIN video_hashtags h ON h.video_id=v.id
+       WHERE LOWER(h.tag)=? AND v.status='ok'`, tag);
+    const foll = await get1('SELECT COUNT(*) AS n FROM hashtag_follows WHERE LOWER(tag)=?', tag);
+    res.json({ ok: true, tag, videos: (vids && vids.n) || 0, followers: (foll && foll.n) || 0 });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 
@@ -7489,7 +7532,7 @@ app.post('/api/settings/comment-filter-mode', auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 // modération de la retenue : liste des commentaires en attente sur MES vidéos
-app.get('/comments/held', auth, async (req, res) => {
+async function heldList(req, res) {
   try {
     const rows = await allRows(
       `SELECT h.id AS hold_id, h.comment_id, h.video_id, h.author_id, h.keyword, h.created_at,
@@ -7499,9 +7542,12 @@ app.get('/comments/held', auth, async (req, res) => {
        WHERE h.owner_id=? ORDER BY h.created_at DESC LIMIT 100`, req.userId);
     res.json({ ok: true, held: rows });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
-});
+}
+app.get('/comments/held', auth, heldList);
+// v2.56 : alias /api (l'app appelle /api/comments/held)
+app.get('/api/comments/held', auth, heldList);
 // approuver (publie) ou supprimer un commentaire en retenue
-app.post('/comments/held/:id', auth, async (req, res) => {
+async function heldAction(req, res) {
   try {
     const action = String((req.body || {}).action || '').toLowerCase();
     const h = await get1('SELECT * FROM comment_hold WHERE id=? AND owner_id=?', Number(req.params.id), req.userId);
@@ -7516,7 +7562,10 @@ app.post('/comments/held/:id', auth, async (req, res) => {
     await runSql('DELETE FROM comment_hold WHERE id=?', h.id);
     res.json({ ok: true, action });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
-});
+}
+app.post('/comments/held/:id', auth, heldAction);
+// v2.56 : alias /api
+app.post('/api/comments/held/:id', auth, heldAction);
 
 app.post('/api/videos/:id/comments', auth, uploadMedia.fields([{name:'video',maxCount:1},{name:'audio',maxCount:1}]), async (req, res) => {
   try {
