@@ -2244,6 +2244,9 @@ app.get('/api/search/insights', async (req, res) => {
   // SPEC-13 : paliers d'abonnement — palier choisi + renouvellement auto
   await mig('creator_subs', 'tier_id', `INTEGER`);
   await mig('creator_subs', 'auto_renew', `INTEGER NOT NULL DEFAULT 1`);
+  // SPEC-14 : compte protégé (13-15 ans) + accord parental
+  await mig('users', 'teen_protected', `INTEGER NOT NULL DEFAULT 0`);
+  await mig('users', 'parental_consent', `INTEGER NOT NULL DEFAULT 0`);
   // v2.33 : épinglage d'un message du chat live (live_chat.pinned)
   await mig('live_chat', 'pinned', `INTEGER NOT NULL DEFAULT 0`);
   // serveur v11 (V3) : boutique, live shopping, publicité, modération auto
@@ -2894,6 +2897,29 @@ function validBirthdate(bd) {
   if (age > 120) return { ok: false, error: 'date de naissance invalide' };
   return { ok: true };
 }
+// SPEC-14 : âge à partir de la naissance (les 13-15 ans = compte protégé)
+function teenAge(bd) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(bd || '')) return null;
+  const d = new Date(bd + 'T12:00:00Z');
+  if (isNaN(d.getTime())) return null;
+  const n = new Date();
+  let age = n.getUTCFullYear() - d.getUTCFullYear();
+  const m = n.getUTCMonth() - d.getUTCMonth();
+  if (m < 0 || (m === 0 && n.getUTCDate() < d.getUTCDate())) age--;
+  return age;
+}
+// SPEC-14 : recalcule teen_protected (les anniversaires font entrer/sortir de la tranche 13-15)
+async function refreshTeenProtected() {
+  try {
+    const rows = await allRows("SELECT id, birthdate, teen_protected FROM users WHERE birthdate<>''");
+    for (const r of rows) {
+      const a = teenAge(r.birthdate);
+      const should = (a !== null && a >= 13 && a <= 15) ? 1 : 0;
+      if (Number(r.teen_protected) !== should)
+        await runSql('UPDATE users SET teen_protected=? WHERE id=?', should, r.id);
+    }
+  } catch (e) { console.error('refreshTeenProtected:', e.message); }
+}
 async function auth(req, res, next) {
   const h = req.headers.authorization || '';
   const m = h.match(/^Bearer (.+)$/);
@@ -3092,6 +3118,7 @@ function pubUser(u) {
   // v1.54 : JAMAIS de données personnelles ici (prénom/nom/naissance = privées, voir privUser)
   return { id: u.id, username: u.username, name: u.name, avatar: u.avatar, bio: u.bio, verified: !!u.verified,
     is_private: !!u.is_private,
+    teen_protected: !!u.teen_protected, // SPEC-14 : badge 🛡️ « compte protégé » (13-15 ans)
     account_type: u.account_type || 'personal', company_name: u.company_name || '',
     sub_enabled: Number(u.sub_enabled) || 0, sub_price: Number(u.sub_price) || 0, ref_code: u.ref_code || '' };
 }
@@ -3364,6 +3391,14 @@ app.post('/api/auth/register', async (req, res) => {
       if (/UNIQUE/i.test(String((e && e.message) || '')))
         return res.status(409).json({ error: 'ce pseudo est déjà pris' });
       throw e;
+    }
+    // SPEC-14 : 13-15 ans → compte protégé (teen_protected) + compte privé par défaut,
+    // comme TikTok. Le badge 🛡️ « compte protégé » est affiché sur le profil.
+    if (birthdate) {
+      const _ta = teenAge(birthdate);
+      if (_ta !== null && _ta >= 13 && _ta <= 15) {
+        await runSql('UPDATE users SET teen_protected=1, is_private=1 WHERE id=?', id);
+      }
     }
     // code parrain unique
     let refCode = null;
@@ -7514,6 +7549,16 @@ app.post('/api/conversations', auth, async (req, res) => {
       return res.status(400).json({ error: 'impossible de se parler à soi-même' });
     if (await isBlocked(req.userId, other.id))
       return res.status(403).json({ error: 'utilisateur bloqué' });
+    // SPEC-14 : 13-15 ans (compte protégé teen_protected) → DMs réservés aux amis
+    // MUTUELS : les deux comptes doivent se suivre. Protège les ados des inconnus.
+    const _tpMe = await get1('SELECT teen_protected FROM users WHERE id=?', req.userId);
+    const _tpOther = await get1('SELECT teen_protected FROM users WHERE id=?', other.id);
+    if (Number(_tpMe && _tpMe.teen_protected) === 1 || Number(_tpOther && _tpOther.teen_protected) === 1) {
+      const _mut1 = await get1('SELECT 1 FROM follows WHERE follower_id=? AND followed_id=?', req.userId, other.id);
+      const _mut2 = await get1('SELECT 1 FROM follows WHERE follower_id=? AND followed_id=?', other.id, req.userId);
+      if (!_mut1 || !_mut2)
+        return res.status(403).json({ error: 'compte protégé : les messages sont réservés aux amis mutuels 🛡️' });
+    }
     // FIX 2026-10-04 (bot chain-security-private) : appliquer la politique DM du destinataire
     // (dm_privacy était enregistrée par /api/me/privacy mais JAMAIS appliquée — n'importe qui
     // pouvait écrire à un compte réglé sur « personne »)
@@ -12359,6 +12404,8 @@ app.post('/api/family/pair', auth, async (req, res) => {
     await insertIgnore('INSERT OR IGNORE INTO family_links(parent_id,teen_id,created_at) VALUES(?,?,?)',
       fc.parent_id, req.userId, now());
     await insertIgnore('INSERT OR IGNORE INTO family_settings(teen_id) VALUES(?)', req.userId);
+    // SPEC-14 : le jumelage familial vaut accord parental (parental_consent)
+    await runSql('UPDATE users SET parental_consent=1 WHERE id=?', req.userId);
     await runSql('DELETE FROM family_codes WHERE code=?', code);
     res.json({ ok: true, parent_id: fc.parent_id });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
@@ -12422,7 +12469,11 @@ app.delete('/api/family/children/:teen_id', auth, async (req, res) => {
       req.userId, teenId, teenId, req.userId);
     const teenGone = asParent ? teenId : req.userId;
     const still = await get1('SELECT 1 FROM family_links WHERE teen_id=?', teenGone);
-    if (!still) await runSql('DELETE FROM family_settings WHERE teen_id=?', teenGone);
+    if (!still) {
+      await runSql('DELETE FROM family_settings WHERE teen_id=?', teenGone);
+      // SPEC-14 : plus de parent jumelé → l'accord parental tombe
+      await runSql('UPDATE users SET parental_consent=0 WHERE id=?', teenGone);
+    }
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
@@ -13803,6 +13854,8 @@ initDb().then(() => {
   setInterval(expireSubs, 86400000); // désactive les abonnements expirés toutes les 24 h
   renewSubs(); // SPEC-13 : renouvellement mensuel auto des abonnements
   setInterval(renewSubs, 86400000); // toutes les 24 h
+  refreshTeenProtected(); // SPEC-14 : recalcule les comptes protégés (13-15 ans)
+  setInterval(refreshTeenProtected, 86400000); // toutes les 24 h
   purgeOldLogs(); // FIX 2026-10-05 (audit DB) : purge des journaux techniques
   setInterval(purgeOldLogs, 86400000); // toutes les 24 h
   setInterval(runVerificationBot, 3600000); // 🤖 bot de vérification toutes les heures
