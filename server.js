@@ -4917,12 +4917,49 @@ app.get('/api/creator/stats/compare', auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 // ---------- live : démarrer (la liste et la fin sont en version v10 ci-dessous) ----------
+// FIX 2026-10-06 (cadeaux façon TikTok) : un créateur ne peut pas avoir 2 lives ouverts.
+// Si un ancien live n'a jamais été terminé (crash app...), on le termine PROPREMENT avec
+// son résumé — sinon les 50 % des cadeaux (désormais dans le pool uniquement, plus de
+// crédit immédiat) seraient inaccessibles au créateur.
+async function closeLiveWithSummary(liveId) {
+  const l = await liveById(liveId);
+  if (!l || l.ended_at) return null;
+  const t = now();
+  const durationS = Math.max(0, Math.round((t - Number(l.started_at)) / 1000));
+  const hbCount = await liveViewersCount(l.id);
+  const peak = Math.max(Number(l.peak_viewers) || 0, Number(l.viewers) || 0, hbCount);
+  const gr = await get1('SELECT COALESCE(SUM(cost),0) AS s FROM gifts WHERE live_id=?', l.id);
+  const cr = await get1('SELECT COUNT(*) AS c FROM live_chat WHERE live_id=?', l.id);
+  const uv = await get1('SELECT COUNT(DISTINCT user_id) AS c FROM live_viewers WHERE live_id=?', l.id);
+  const likes = Number(l.likes) || 0, shares = Number(l.shares) || 0;
+  const ce = await get1('SELECT COALESCE(SUM(creator_share),0) AS s FROM live_gifts WHERE live_id=? AND to_id=?', l.id, l.user_id);
+  const coinsEarned = Number(ce && ce.s) || 0;
+  const usdEarned = Math.floor(coinsEarned / 500 * 100) / 100;
+  await runSql('UPDATE lives SET ended_at=?, duration_s=?, peak_viewers=?, gifts_total=?, chat_total=? WHERE id=?',
+    t, durationS, peak, Number(gr.s) || 0, Number(cr.c) || 0, l.id);
+  const args = [l.id, l.user_id, l.title || '', Number(l.started_at), t, durationS, peak,
+    Number(uv && uv.c) || 0, likes, shares, Number(cr.c) || 0, coinsEarned, usdEarned, t];
+  if (USE_PG) {
+    await runSql(`INSERT INTO live_summaries(live_id,user_id,title,started_at,ended_at,duration_s,peak_viewers,unique_viewers,likes,shares,chat_total,coins_earned,usd_earned,created_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(live_id) DO UPDATE SET ended_at=EXCLUDED.ended_at,duration_s=EXCLUDED.duration_s,peak_viewers=EXCLUDED.peak_viewers,unique_viewers=EXCLUDED.unique_viewers,likes=EXCLUDED.likes,shares=EXCLUDED.shares,chat_total=EXCLUDED.chat_total,coins_earned=EXCLUDED.coins_earned,usd_earned=EXCLUDED.usd_earned`,
+      ...args);
+  } else {
+    await runSql(`INSERT OR REPLACE INTO live_summaries(live_id,user_id,title,started_at,ended_at,duration_s,peak_viewers,unique_viewers,likes,shares,chat_total,coins_earned,usd_earned,created_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, ...args);
+  }
+  await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
+    l.user_id, 0, 'récap live #' + l.id + ' : ' + coinsEarned + ' pièces (≈ $' + usdEarned.toFixed(2) + ')', t).catch(() => {});
+  return { id: l.id, usd_earned: usdEarned };
+}
 app.post('/api/live/start', auth, async (req, res) => {
   const title = String((req.body || {}).title || '').slice(0, 80);
   const liveType = String((req.body || {}).live_type || 'guests') === 'solo' ? 'solo' : 'guests';
   let maxGuests = parseInt((req.body || {}).max_guests, 10);
   if (!Number.isFinite(maxGuests)) maxGuests = 8;
   maxGuests = Math.max(1, Math.min(8, maxGuests));
+  // Termine proprement tout ancien live resté ouvert (avec son résumé/pool)
+  const stale = await allRows('SELECT id FROM lives WHERE user_id=? AND ended_at IS NULL', req.userId);
+  for (const s of stale) { try { await closeLiveWithSummary(s.id); } catch (_) {} }
   const id = await insertId('INSERT INTO lives(user_id,title,started_at,viewers,live_type,max_guests) VALUES(?,?,?,?,?,?)',
     req.userId, title, now(), 0, liveType, maxGuests);
   // v2.33 : push aux abonnés (in-app + FCM) — respecte les prefs notif_lives via notify()
@@ -5993,6 +6030,11 @@ function setupLiveWs(server) {
         return;
       }
       if (m.t === 'join') {
+        // FIX sécu 2026-10-06 : vérifier que le live existe et est en cours AVANT de créer
+        // la room — sinon n'importe quel liveId (inexistant ou terminé) crée une room fantôme
+        // (fuite mémoire, jamais nettoyée) et des viewers « rejoignent » un live mort.
+        const lj = await liveById(liveId);
+        if (!lj || lj.ended_at) { try { ws.close(); } catch (_) {} return; }
         // COIN-04 (2026-10-05) : un viewer peut rejoindre même si le broadcaster n'a pas
         // encore ouvert sa WS — avant, `if (!room) return` ignorait silencieusement le join
         // et le chat HTTP ne trouvait personne à qui diffuser.
