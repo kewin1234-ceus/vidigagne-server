@@ -4275,20 +4275,22 @@ app.post('/api/stories', auth, uploadStory.fields([{ name: 'video', maxCount: 1 
 // ---------- cadeaux ----------
 // Partage 50/50 VidiGagne : l'envoyeur est débité du coût total,
 // le créateur reçoit 50%, la plateforme 50% (commission).
-async function applyGiftSplit(fromId, toId, cost, giftId, liveId) {
+async function applyGiftSplit(fromId, toId, cost, giftId, liveId, immediate) {
   const creatorShare = Math.floor(cost / 2);
   const platformShare = cost - creatorShare;
-  // Façon TikTok (2026-10-06) : en LIVE, les 50 % du créateur vont dans son pool de gains
+  // Façon TikTok (2026-10-06) : en LIVE, les 50 % de l'HÔTE vont dans son pool de gains
   // (diamants) — convertibles via échange ou retrait live. PAS de crédit immédiat en pièces,
-  // sinon le créateur toucherait 100 % (50 % immédiat + 50 % via le pool).
-  // Hors live (cadeau sur vidéo) : pas de pool, donc crédit immédiat des 50 %.
-  if (!liveId) {
+  // sinon l'hôte toucherait 100 % (50 % immédiat + 50 % via le pool).
+  // Crédit immédiat dans 2 cas : hors live (cadeau sur vidéo, pas de pool) et cadeau à un
+  // INVITÉ (les invités n'ont pas de pool — sans ça leurs 50 % disparaîtraient).
+  const goesToPool = liveId && !immediate;
+  if (!goesToPool) {
     await runSql('UPDATE users SET coins=coins+? WHERE id=?', creatorShare, toId);
   }
   await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
     fromId, -cost, 'cadeau ' + giftId, now());
   await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
-    toId, creatorShare, liveId ? 'cadeau live ' + giftId + ' (50% → gains live)' : 'cadeau reçu ' + giftId + ' (50%)', now());
+    toId, creatorShare, goesToPool ? 'cadeau live ' + giftId + ' (50% → gains live)' : 'cadeau reçu ' + giftId + ' (50%)', now());
   await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
     0, platformShare, 'commission cadeau ' + giftId, now());
   if (liveId) {
@@ -10713,7 +10715,8 @@ app.post('/api/live/:id/gift', auth, async (req, res) => {
         await runSql('UPDATE pk_battles SET ' + col + '=' + col + '+? WHERE id=?', g.cost, _pkb.id);
       }
     } catch (_) {}
-    const split = await applyGiftSplit(req.userId, toUserId, g.cost, g.id, l.id);
+    const split = await applyGiftSplit(req.userId, toUserId, g.cost, g.id, l.id,
+      Number(toUserId) !== Number(l.user_id)); // invité : pas de pool → crédit immédiat
     await runSql('INSERT INTO gifts(from_id,to_id,video_id,live_id,gift,cost,created_at) VALUES(?,?,?,?,?,?,?)',
       req.userId, toUserId, null, l.id, g.id, g.cost, now());
     await runSql('UPDATE lives SET gifts_total=COALESCE(gifts_total,0)+? WHERE id=?', split.creatorShare, l.id).catch(() => {});
