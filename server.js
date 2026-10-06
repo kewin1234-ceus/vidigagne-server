@@ -3474,17 +3474,7 @@ app.post('/api/me/audience', auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 
-// 3. Page hashtag — GET /api/hashtag/:tag (singulier, l'app l'appelait déjà)
-app.get('/api/hashtag/:tag', async (req, res) => {
-  try {
-    const tag = String(req.params.tag || '').toLowerCase().slice(0, 60);
-    const vids = await get1(
-      `SELECT COUNT(*) AS n FROM videos v JOIN video_hashtags h ON h.video_id=v.id
-       WHERE LOWER(h.tag)=? AND v.status='ok'`, tag);
-    const foll = await get1('SELECT COUNT(*) AS n FROM hashtag_follows WHERE LOWER(tag)=?', tag);
-    res.json({ ok: true, tag, videos: (vids && vids.n) || 0, followers: (foll && foll.n) || 0 });
-  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
-});
+// (v2.56 : GET /api/hashtag/:tag existe déjà plus bas — pas de doublon)
 
 // v1.54 : rate-limit anti brute-force (5 essais / 15 min par IP+identifiant)
 const _loginAttempts = new Map();
