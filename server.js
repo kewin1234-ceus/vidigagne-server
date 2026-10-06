@@ -3802,6 +3802,35 @@ app.get('/api/diag/email-push-log', async (req, res) => {
       emails: _emailAttempts.slice(-100), pushes: _pushAttempts.slice(-100) });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
+// v2.53 : diagnostic FCM (admin) — vérifie la config sans jamais exposer le secret.
+// GET /api/diag/fcm → {sdk, creds_set}. POST /api/diag/fcm {fcm_token} → envoie un push de test.
+app.get('/api/diag/fcm', async (req, res) => {
+  try {
+    if (!checkAdmin(req, res)) return;
+    let sdk = false, initErr = '';
+    try { require('firebase-admin'); sdk = true; } catch (_) { sdk = false; }
+    res.json({ ok: true, sdk_installed: sdk,
+      creds_set: !!process.env.GOOGLE_APPLICATION_CREDENTIALS,
+      project: process.env.FIREBASE_PROJECT_ID || null });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.post('/api/diag/fcm', async (req, res) => {
+  try {
+    if (!checkAdmin(req, res)) return;
+    const fcmToken = String((req.body || {}).fcm_token || '').slice(0, 500);
+    if (!fcmToken) return res.status(400).json({ error: 'fcm_token requis' });
+    let adm;
+    try { adm = require('firebase-admin'); } catch (_) { return res.json({ ok: false, reason: 'admin_sdk_missing' }); }
+    if (!process.env.GOOGLE_APPLICATION_CREDENTIALS) return res.json({ ok: false, reason: 'no_credentials' });
+    if (adm.apps.length === 0) adm.initializeApp({ credential: adm.credential.applicationDefault() });
+    const msgId = await adm.messaging().send({
+token: fcmToken,
+      notification: { title: 'VidiGagne ✅', body: 'Push de test — tout fonctionne !' },
+      data: { type: 'test' },
+    });
+    res.json({ ok: true, message_id: msgId });
+  } catch (e) { res.json({ ok: false, reason: String((e && e.message) || e).slice(0, 200) }); }
+});
 app.post('/api/auth/send-code', async (req, res) => {
   try {
     const kind = ((req.body || {}).kind === 'phone') ? 'phone' : 'email';
