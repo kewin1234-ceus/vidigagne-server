@@ -4278,11 +4278,17 @@ app.post('/api/stories', auth, uploadStory.fields([{ name: 'video', maxCount: 1 
 async function applyGiftSplit(fromId, toId, cost, giftId, liveId) {
   const creatorShare = Math.floor(cost / 2);
   const platformShare = cost - creatorShare;
-  await runSql('UPDATE users SET coins=coins+? WHERE id=?', creatorShare, toId);
+  // Façon TikTok (2026-10-06) : en LIVE, les 50 % du créateur vont dans son pool de gains
+  // (diamants) — convertibles via échange ou retrait live. PAS de crédit immédiat en pièces,
+  // sinon le créateur toucherait 100 % (50 % immédiat + 50 % via le pool).
+  // Hors live (cadeau sur vidéo) : pas de pool, donc crédit immédiat des 50 %.
+  if (!liveId) {
+    await runSql('UPDATE users SET coins=coins+? WHERE id=?', creatorShare, toId);
+  }
   await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
     fromId, -cost, 'cadeau ' + giftId, now());
   await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
-    toId, creatorShare, 'cadeau reçu ' + giftId + ' (50%)', now());
+    toId, creatorShare, liveId ? 'cadeau live ' + giftId + ' (50% → gains live)' : 'cadeau reçu ' + giftId + ' (50%)', now());
   await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
     0, platformShare, 'commission cadeau ' + giftId, now());
   if (liveId) {
@@ -10102,12 +10108,12 @@ app.post('/api/live/withdraw', auth, async (req, res) => {
     if (coins < 500) return res.status(400).json({ error: 'minimum 500 pièces' });
     const pm = await get1('SELECT * FROM payment_methods WHERE id=? AND user_id=?', method_id, req.userId);
     if (!pm) return res.status(400).json({ error: 'moyen de paiement introuvable — ajoute-le dans Retirer mes gains' });
-    const vc = await validCoins(req.userId);
-    if (coins > vc.valid) return res.status(400).json({ error: 'pas assez de pièces valides (' + vc.valid + ' disponibles)' });
+    // Façon TikTok (2026-10-06) : les gains live vivent DANS le pool (diamants), pas dans les
+    // pièces. Le retrait réserve le montant dans le pool — aucun débit de pièces (le créateur
+    // ne les a jamais reçues en pièces, seulement en gains live).
     // FIX race 2026-10-05 (Équipe 8/10) : 2 retraits live simultanés passaient chacun
-    // les contrôles (gains restants + pièces valides) puis débitaient 2 fois.
-    // Le pool du live est décrémenté atomiquement (UPDATE conditionnel) et le
-    // contrôle des pièces valides + débit est sérialisé par utilisateur.
+    // les contrôles puis débitaient 2 fois. Le pool du live est décrémenté atomiquement
+    // (UPDATE conditionnel), sérialisé par utilisateur.
     const lwOut = await withUserLock(req.userId, async () => {
       const p2 = await livePool(live_id, req.userId);
       if (p2.err) { const e = new Error(p2.err); e.httpStatus = p2.code; throw e; }
@@ -10115,31 +10121,22 @@ app.post('/api/live/withdraw', auth, async (req, res) => {
         const e = new Error('montant supérieur aux gains restants (' + p2.remaining.toFixed(2) + ' $)');
         e.httpStatus = 400; throw e;
       }
-      const vc2 = await validCoins(req.userId);
-      if (coins > vc2.valid) {
-        const e = new Error('pas assez de pièces valides (' + vc2.valid + ' disponibles)');
-        e.httpStatus = 400; throw e;
-      }
       await raceGap(req); // crochet test concurrence (Équipe 8/10)
       const poolOk = await runSqlChanges(
         'UPDATE live_summaries SET withdrawn_usd=withdrawn_usd+? WHERE live_id=? AND (usd_earned - withdrawn_usd - exchanged_usd) >= ?',
         amount, p.live.id, amount);
       if (!poolOk) { const e = new Error('gains du live insuffisants'); e.httpStatus = 400; throw e; }
-      // débit atomique des pièces + suivi du pool du live
-      const debited = await runSqlChanges('UPDATE users SET coins=coins-? WHERE id=? AND coins>=?', coins, req.userId, coins);
-      if (!debited) {
-        await runSql('UPDATE live_summaries SET withdrawn_usd=withdrawn_usd-? WHERE live_id=?', amount, p.live.id);
-        const e = new Error('pas assez de pièces'); e.httpStatus = 400; throw e;
-      }
       return { ok: true };
     }).catch(e => {
       if (e.httpStatus) return { _err: e.message, _status: e.httpStatus };
       throw e;
     });
     if (lwOut._err) return res.status(lwOut._status).json({ error: lwOut._err });
-    await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
-      req.userId, -coins, 'retrait live #' + p.live.id + ' (' + pm.type + ')', now());
     const usd = Math.floor(coins / 500 * 100) / 100;
+    // Façon TikTok : aucune pièce débitée (les gains vivent dans le pool) — le ledger
+    // trace la réservation en USD, pas un mouvement de pièces.
+    await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
+      req.userId, 0, 'retrait live #' + p.live.id + ' (' + pm.type + ') : ' + usd.toFixed(2) + ' $ réservés', now());
     const wid = await insertId(
       'INSERT INTO withdrawals(user_id,coins,usd,method,account,status,created_at) VALUES(?,?,?,?,?,?,?)',
       req.userId, coins, usd, pm.type, pm.account, 'pending', now());
@@ -10157,12 +10154,13 @@ app.post('/api/live/withdraw', auth, async (req, res) => {
     const rem = Math.max(0, Math.round((Number(s2.usd_earned) - Number(s2.withdrawn_usd) - Number(s2.exchanged_usd)) * 100) / 100);
     res.json({ ok: true, id: wid, usd, coins, status: 'pending', receipt_no: receiptNo,
       coins_balance: bal ? bal.coins : 0, remaining_usd: rem,
-      note: 'Le reste (' + rem.toFixed(2) + ' $) reste dans ton solde principal ✓' });
+      note: 'Le reste (' + rem.toFixed(2) + ' $) reste dans tes gains du live ✓' });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 // Échange : convertir des gains USD du live en pièces virtuelles (1 $ = 500 pièces)
-// Les pièces sont déjà créditées au fur et à mesure des cadeaux : l'échange réserve
-// une part des gains pour booster des vidéos / envoyer des cadeaux en live.
+// Façon TikTok : les gains live (50 % des cadeaux) vivent dans le pool, PAS dans les pièces.
+// L'échange convertit une part du pool en pièces utilisables (booster des vidéos,
+// envoyer des cadeaux en live). C'est le SEUL endroit où ces gains deviennent des pièces.
 app.post('/api/live/exchange-coins', auth, async (req, res) => {
   try {
     const { live_id, amount_usd } = req.body || {};
@@ -10905,7 +10903,8 @@ app.post('/api/live/:id/end', auth, async (req, res) => {
   const uv = await get1('SELECT COUNT(DISTINCT user_id) AS c FROM live_viewers WHERE live_id=?', l.id);
   const likes = Number(l.likes) || 0, shares = Number(l.shares) || 0;
   const uniqueV = Number(uv && uv.c) || 0;
-  // pièces gagnées par le créateur pendant ce live (part 50% déjà créditée à chaque cadeau)
+  // pièces gagnées par le créateur pendant ce live : 50 % des cadeaux (façon TikTok —
+  // dans le pool de gains, pas créditées en pièces ; convertibles via échange/retrait)
   const ce = await get1('SELECT COALESCE(SUM(creator_share),0) AS s FROM live_gifts WHERE live_id=? AND to_id=?', l.id, l.user_id);
   const coinsEarned = Number(ce && ce.s) || 0;
   const usdEarned = Math.floor(coinsEarned / 500 * 100) / 100;
