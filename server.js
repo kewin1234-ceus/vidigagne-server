@@ -667,6 +667,19 @@ CREATE TABLE IF NOT EXISTS creator_subs(
   created_at BIGINT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS csub_active_idx ON creator_subs(creator_id, subscriber_id, active);
+-- ==================== SPEC-13 : PALIERS D'ABONNEMENT (façon TikTok) ====================
+CREATE TABLE IF NOT EXISTS creator_sub_tiers(
+  id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+  creator_id INTEGER NOT NULL,
+  name TEXT NOT NULL DEFAULT '',
+  price_coins INTEGER NOT NULL DEFAULT 0,
+  perks TEXT NOT NULL DEFAULT '[]',
+  badge_emoji TEXT NOT NULL DEFAULT '🏅',
+  position INTEGER NOT NULL DEFAULT 1,
+  active INTEGER NOT NULL DEFAULT 1,
+  created_at BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS csub_tiers_idx ON creator_sub_tiers(creator_id, active, position);
 -- ==================== V3 : BOUTIQUE ====================
 CREATE TABLE IF NOT EXISTS categories(
   id ${USE_PG ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
@@ -2228,6 +2241,9 @@ app.get('/api/search/insights', async (req, res) => {
   await mig('lives', 'current_effect', `TEXT NOT NULL DEFAULT ''`);
   await mig('gifts', 'live_id', `INTEGER`);
   await mig('gifts', 'thanked', `INTEGER NOT NULL DEFAULT 0`); // v2.37 : remerciement cadeau
+  // SPEC-13 : paliers d'abonnement — palier choisi + renouvellement auto
+  await mig('creator_subs', 'tier_id', `INTEGER`);
+  await mig('creator_subs', 'auto_renew', `INTEGER NOT NULL DEFAULT 1`);
   // v2.33 : épinglage d'un message du chat live (live_chat.pinned)
   await mig('live_chat', 'pinned', `INTEGER NOT NULL DEFAULT 0`);
   // serveur v11 (V3) : boutique, live shopping, publicité, modération auto
@@ -5643,6 +5659,15 @@ app.get('/api/coins/recharge/paypal/callback', async (req, res) => {
     if (rc.status === 'completed') {
       return res.send('<html><body style="font-family:sans-serif;text-align:center;padding:40px"><h2>✅ Déjà crédité</h2><p>Tes pièces sont sur ton compte VidiGagne.</p></body></html>');
     }
+    // FIX paiements 2026-10-06 : 2 callbacks simultanés passaient chacun le contrôle
+    // 'completed' puis créditaient 2 fois les pièces. Claim atomique : un seul capture.
+    const claimed = await runSqlChanges("UPDATE coin_recharges SET status='capturing' WHERE id=? AND status='awaiting_payment'", rid);
+    if (!claimed) {
+      const rc2 = await get1('SELECT status FROM coin_recharges WHERE id=?', rid);
+      if (rc2 && rc2.status === 'completed')
+        return res.send('<html><body style="font-family:sans-serif;text-align:center;padding:40px"><h2>✅ Déjà crédité</h2><p>Tes pièces sont sur ton compte VidiGagne.</p></body></html>');
+      return res.status(409).send('Paiement déjà en cours de traitement. Patiente quelques secondes puis reviens.');
+    }
     const cfg = paypalCfg();
     const token = cfg ? await paypalToken() : null;
     if (!token || !rc.paypal_order_id) return res.status(500).send('Paiement indisponible');
@@ -5652,7 +5677,7 @@ app.get('/api/coins/recharge/paypal/callback', async (req, res) => {
     const cd = await cr.json().catch(() => ({}));
     const captured = cd.status === 'COMPLETED' || (cd.purchase_units || []).some(p => (p.payments || {}).captures);
     if (!captured) {
-      await runSql("UPDATE coin_recharges SET status='failed' WHERE id=?", rid);
+      await runSql("UPDATE coin_recharges SET status='failed' WHERE id=? AND status='capturing'", rid);
       return res.status(400).send('Le paiement n\'a pas pu être capturé. Réessaie.');
     }
     await runSql('UPDATE users SET coins=coins+? WHERE id=?', rc.coins, rc.user_id);
@@ -5685,6 +5710,10 @@ app.post('/api/admin/recharges/:id/approve', adminAuth, async (req, res) => {
     const rc = await get1('SELECT * FROM coin_recharges WHERE id=?', Number(req.params.id));
     if (!rc) return res.status(404).json({ error: 'introuvable' });
     if (rc.status !== 'pending') return res.status(400).json({ error: 'déjà traitée' });
+    // FIX paiements 2026-10-06 : 2 approbations simultanées passaient chacune le contrôle
+    // 'pending' puis créditaient 2 fois. Claim atomique : une seule gagne.
+    const claimed = await runSqlChanges("UPDATE coin_recharges SET status='processing' WHERE id=? AND status='pending'", rc.id);
+    if (!claimed) return res.status(400).json({ error: 'déjà traitée' });
     const approve = String((req.body || {}).action || 'approve') === 'approve';
     if (approve) {
       await runSql('UPDATE users SET coins=coins+? WHERE id=?', rc.coins, rc.user_id);
@@ -9967,9 +9996,17 @@ app.post('/api/live/exchange-coins', auth, async (req, res) => {
     if (amount > p.remaining) return res.status(400).json({ error: 'montant supérieur aux gains restants (' + p.remaining.toFixed(2) + ' $)' });
     const coins = Math.floor(amount * 500);
     if (coins < 1) return res.status(400).json({ error: 'montant trop petit' });
-    await runSql('UPDATE live_summaries SET exchanged_usd=exchanged_usd+? WHERE live_id=?', amount, p.live.id);
+    // FIX paiements 2026-10-06 : 1) l'ancien code décrémentait le pool (exchanged_usd)
+    // SANS créditer les pièces à l'utilisateur → gains perdus ! 2) race : 2 échanges
+    // simultanés passaient chacun le contrôle puis dépassaient les gains restants.
+    // Décrément atomique conditionnel + crédit réel des pièces.
+    const poolOk = await runSqlChanges(
+      'UPDATE live_summaries SET exchanged_usd=exchanged_usd+? WHERE live_id=? AND (usd_earned - withdrawn_usd - exchanged_usd) >= ?',
+      amount, p.live.id, amount);
+    if (!poolOk) return res.status(400).json({ error: 'montant supérieur aux gains restants' });
+    await runSql('UPDATE users SET coins=coins+? WHERE id=?', coins, req.userId);
     await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
-      req.userId, 0, 'échange live #' + p.live.id + ' : ' + amount.toFixed(2) + ' $ → ' + coins + ' 🪙 réservées (boost / cadeaux live)', now()).catch(() => {});
+      req.userId, coins, 'échange live #' + p.live.id + ' : ' + amount.toFixed(2) + ' $ → ' + coins + ' 🪙', now());
     const s2 = await get1('SELECT withdrawn_usd, exchanged_usd, usd_earned FROM live_summaries WHERE live_id=?', p.live.id);
     const rem = Math.max(0, Math.round((Number(s2.usd_earned) - Number(s2.withdrawn_usd) - Number(s2.exchanged_usd)) * 100) / 100);
     const bal = await get1('SELECT coins FROM users WHERE id=?', req.userId);
@@ -10837,9 +10874,24 @@ app.post('/api/users/:username/subscribe', auth, async (req, res) => {
     const u = await get1('SELECT * FROM users WHERE username=?', String(req.params.username).toLowerCase());
     if (!u) return res.status(404).json({ error: 'utilisateur introuvable' });
     if (Number(u.id) === Number(req.userId)) return res.status(400).json({ error: 'impossible' });
-    // le prix est fixé par le CRÉATEUR, jamais par le client (anti-fraude)
-    const price = Math.max(10, Math.min(100000, Math.floor(Number(u.sub_price) || 0)));
-    if (Number(u.sub_enabled) !== 1 || !price) return res.status(400).json({ error: 'abonnement non proposé par ce créateur' });
+    // SPEC-13 : paliers — si le créateur a des paliers actifs, le prix vient du palier choisi
+    // (le prix est fixé par le CRÉATEUR, jamais par le client — anti-fraude).
+    // Sinon : comportement historique (prix unique sub_price).
+    let tierId = null, tierName = '';
+    const tiers = await allRows('SELECT * FROM creator_sub_tiers WHERE creator_id=? AND active=1 ORDER BY position ASC', u.id);
+    let price;
+    if (tiers.length) {
+      tierId = Number((req.body || {}).tier_id) || 0;
+      const tier = tiers.find(t => Number(t.id) === tierId);
+      if (!tier) return res.status(400).json({ error: 'choisis un palier d\u2019abonnement' });
+      price = Math.max(10, Math.min(100000, Math.floor(Number(tier.price_coins) || 0)));
+      tierName = tier.name;
+    } else {
+      // le prix est fixé par le CRÉATEUR, jamais par le client (anti-fraude)
+      price = Math.max(10, Math.min(100000, Math.floor(Number(u.sub_price) || 0)));
+    }
+    if (!tiers.length && (Number(u.sub_enabled) !== 1 || !price)) return res.status(400).json({ error: 'abonnement non proposé par ce créateur' });
+    if (tiers.length && !price) return res.status(400).json({ error: 'abonnement non proposé par ce créateur' });
     // FIX race 2026-10-05 (Équipe 8/10) : double-clic « S'abonner » — section
     // débit+insert sérialisée par abonné ; un 2e appel < 15 s après la création
     // (double-clic réseau) est idempotent : pas de 2e débit. Avant : 2 requêtes
@@ -10860,14 +10912,14 @@ app.post('/api/users/:username/subscribe', auth, async (req, res) => {
       const t = now(), exp = t + 30 * 86400000;
       const cur = await get1('SELECT * FROM creator_subs WHERE creator_id=? AND subscriber_id=? AND active=1 AND expires_at>?', u.id, req.userId, t);
       if (cur) {
-        await runSql('UPDATE creator_subs SET expires_at=?, price_coins=? WHERE id=?', Number(cur.expires_at) + 30 * 86400000, price, cur.id);
+        await runSql('UPDATE creator_subs SET expires_at=?, price_coins=?, tier_id=? WHERE id=?', Number(cur.expires_at) + 30 * 86400000, price, tierId || null, cur.id);
       } else {
-        await insertId('INSERT INTO creator_subs(creator_id,subscriber_id,price_coins,started_at,expires_at,active,created_at) VALUES(?,?,?,?,?,1,?)',
-          u.id, req.userId, price, t, exp, t);
+        await insertId('INSERT INTO creator_subs(creator_id,subscriber_id,price_coins,tier_id,auto_renew,started_at,expires_at,active,created_at) VALUES(?,?,?,?,?,?,?,1,?)',
+          u.id, req.userId, price, tierId || null, 1, t, exp, t);
       }
       const sub = await get1('SELECT * FROM creator_subs WHERE creator_id=? AND subscriber_id=? AND active=1 ORDER BY expires_at DESC', u.id, req.userId);
-      await notify(u.id, 'subscribe', req.userId, null, '');
-      return { ok: true, expires_at: Number(sub.expires_at) };
+      await notify(u.id, 'subscribe', req.userId, null, tierName ? 'Nouvel abonné palier « ' + tierName + ' » 🏅' : '');
+      return { ok: true, expires_at: Number(sub.expires_at), tier_id: tierId || null, tier_name: tierName };
     }).catch(e => {
       if (e.httpStatus) return { _err: e.message, _status: e.httpStatus };
       throw e;
@@ -10886,7 +10938,17 @@ app.get('/api/users/:username/subscription', auth, async (req, res) => {
   // ne s'affichait jamais. On garde {subscription} pour compatibilité.
   const price = Math.max(10, Math.min(100000, Math.floor(Number(u.sub_price) || 0)));
   const enabled = Number(u.sub_enabled) === 1 && price > 0;
-  res.json({ enabled, price, subscribed: !!s,
+  // SPEC-13 : paliers + palier actuel de l'abonné
+  const tiers = await allRows('SELECT * FROM creator_sub_tiers WHERE creator_id=? AND active=1 ORDER BY position ASC', u.id);
+  let tier = null;
+  if (s && s.tier_id) {
+    const t = tiers.find(x => Number(x.id) === Number(s.tier_id));
+    if (t) tier = { id: Number(t.id), name: t.name, badge_emoji: t.badge_emoji || '🏅' };
+  }
+  res.json({ enabled: enabled || tiers.length > 0, price, subscribed: !!s,
+    tiers: tiers.map(t => ({ id: Number(t.id), name: t.name, price_coins: Number(t.price_coins),
+      perks: JSON.parse(t.perks || '[]'), badge_emoji: t.badge_emoji || '🏅', position: Number(t.position) })),
+    tier,
     subscription: s ? { active: true, expires_at: Number(s.expires_at), price_coins: Number(s.price_coins) } : { active: false } });
 });
 // v2.36 : désabonnement d'un créateur (fin de période, sans remboursement — standard des abonnements)
@@ -10897,6 +10959,99 @@ app.delete('/api/users/:username/subscribe', auth, async (req, res) => {
     const s = await get1('SELECT * FROM creator_subs WHERE creator_id=? AND subscriber_id=? AND active=1', u.id, req.userId);
     if (!s) return res.status(404).json({ error: 'aucun abonnement actif' });
     await runSql('UPDATE creator_subs SET active=0 WHERE id=?', s.id);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// ==================== SPEC-13 : PALIERS D'ABONNEMENT (façon TikTok) ====================
+// Un créateur définit jusqu'à 3 paliers (position 1,2,3) avec nom, prix mensuel,
+// perks (avantages, JSON) et badge emoji. Les fans choisissent un palier ;
+// le renouvellement mensuel est automatique (renewSubs, cron quotidien).
+// "Sub Space" : fil des vidéos réservées aux abonnés (visibility='subscribers').
+app.get('/api/creator/sub-tiers', auth, async (req, res) => {
+  try {
+    const tiers = await allRows('SELECT * FROM creator_sub_tiers WHERE creator_id=? AND active=1 ORDER BY position ASC', req.userId);
+    res.json({ tiers: tiers.map(t => ({ id: Number(t.id), name: t.name, price_coins: Number(t.price_coins),
+      perks: JSON.parse(t.perks || '[]'), badge_emoji: t.badge_emoji || '🏅', position: Number(t.position) })) });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.put('/api/creator/sub-tiers', auth, async (req, res) => {
+  try {
+    const list = Array.isArray((req.body || {}).tiers) ? (req.body || {}).tiers.slice(0, 3) : [];
+    const clean = [];
+    for (let i = 0; i < list.length; i++) {
+      const t = list[i] || {};
+      const price = Math.max(10, Math.min(100000, Math.floor(Number(t.price_coins) || 0)));
+      if (!price) continue;
+      let perks = [];
+      try { perks = Array.isArray(t.perks) ? t.perks.map(x => String(x).slice(0, 80)).slice(0, 8) : JSON.parse(String(t.perks || '[]')).slice(0, 8); }
+      catch (_) { perks = []; }
+      clean.push({ name: String(t.name || ('Palier ' + (i + 1))).slice(0, 30),
+        price_coins: price, perks: JSON.stringify(perks),
+        badge_emoji: String(t.badge_emoji || '🏅').slice(0, 8), position: i + 1 });
+    }
+    await runSql('UPDATE creator_sub_tiers SET active=0 WHERE creator_id=?', req.userId);
+    for (const c of clean) {
+      await runSql(`INSERT INTO creator_sub_tiers(creator_id,name,price_coins,perks,badge_emoji,position,active,created_at)
+        VALUES(?,?,?,?,?,?,1,?)`, req.userId, c.name, c.price_coins, c.perks, c.badge_emoji, c.position, now());
+    }
+    // si le créateur définit des paliers, son prix unique historique est désactivé
+    if (clean.length) await runSql('UPDATE users SET sub_enabled=0 WHERE id=?', req.userId);
+    res.json({ ok: true, count: clean.length });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+app.get('/api/users/:id/sub-tiers', async (req, res) => {
+  try {
+    const u = await get1('SELECT id, username FROM users WHERE id=?', Number(req.params.id));
+    if (!u) return res.status(404).json({ error: 'utilisateur introuvable' });
+    const tiers = await allRows('SELECT * FROM creator_sub_tiers WHERE creator_id=? AND active=1 ORDER BY position ASC', u.id);
+    res.json({ user_id: Number(u.id), username: u.username,
+      tiers: tiers.map(t => ({ id: Number(t.id), name: t.name, price_coins: Number(t.price_coins),
+        perks: JSON.parse(t.perks || '[]'), badge_emoji: t.badge_emoji || '🏅', position: Number(t.position) })) });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// Sub Space : vidéos réservées aux abonnés, des créateurs auxquels je suis abonné(e)
+app.get('/api/sub-space', auth, async (req, res) => {
+  try {
+    const rows = await allRows(
+      `SELECT v.* FROM videos v WHERE v.visibility='subscribers'
+       AND EXISTS (SELECT 1 FROM creator_subs cs WHERE cs.creator_id=v.user_id AND cs.subscriber_id=? AND cs.active=1 AND cs.expires_at>?)
+       ORDER BY v.created_at DESC LIMIT 50`, req.userId, now());
+    const videos = [];
+    for (const v of rows) { try { videos.push(await videoJSON(v, req.userId)); } catch (_) {} }
+    res.json({ videos });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+// Renouvellement mensuel automatique des abonnements (cron quotidien)
+async function renewSubs() {
+  try {
+    const t = now();
+    const due = await allRows('SELECT * FROM creator_subs WHERE active=1 AND auto_renew=1 AND expires_at<=?', t + 86400000);
+    for (const s of due) {
+      await withUserLock(s.subscriber_id, async () => {
+        const cur = await get1('SELECT * FROM creator_subs WHERE id=? AND active=1', s.id);
+        if (!cur || Number(cur.expires_at) > t + 86400000) return; // déjà renouvelé
+        const price = Math.max(1, Math.floor(Number(cur.price_coins) || 0));
+        const debited = await runSqlChanges('UPDATE users SET coins=coins-? WHERE id=? AND coins>=?', price, cur.subscriber_id, price);
+        if (!debited) {
+          await runSql('UPDATE creator_subs SET active=0 WHERE id=?', cur.id);
+          await notify(cur.subscriber_id, 'sub_expired', cur.creator_id, null, 'Ton abonnement a expiré (pas assez de pièces pour le renouvellement).');
+          return;
+        }
+        await runSql('UPDATE users SET coins=coins+? WHERE id=?', price, cur.creator_id);
+        await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)', cur.subscriber_id, -price, 'renouvellement abonnement', t);
+        await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)', cur.creator_id, price, 'abonnement renouvelé', t);
+        await runSql('UPDATE creator_subs SET expires_at=? WHERE id=?', Number(cur.expires_at) + 30 * 86400000, cur.id);
+        await notify(cur.subscriber_id, 'sub_renewed', cur.creator_id, null, 'Ton abonnement a été renouvelé (' + price + ' 🪙).');
+      }).catch(() => {});
+    }
+  } catch (e) { console.error('renewSubs:', e.message); }
+}
+// Déclencheur admin du renouvellement (tests + forçage manuel)
+app.post('/api/admin/subs/renew', async (req, res) => {
+  try {
+    const t = req.headers['x-admin-token'];
+    if (!process.env.ADMIN_TOKEN || t !== process.env.ADMIN_TOKEN) return res.status(403).json({ error: 'non autorisé' });
+    await renewSubs();
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
@@ -13646,6 +13801,8 @@ initDb().then(() => {
   setInterval(publishDue, 60000); // vérifie les publications dues toutes les 60 s
   expireSubs();
   setInterval(expireSubs, 86400000); // désactive les abonnements expirés toutes les 24 h
+  renewSubs(); // SPEC-13 : renouvellement mensuel auto des abonnements
+  setInterval(renewSubs, 86400000); // toutes les 24 h
   purgeOldLogs(); // FIX 2026-10-05 (audit DB) : purge des journaux techniques
   setInterval(purgeOldLogs, 86400000); // toutes les 24 h
   setInterval(runVerificationBot, 3600000); // 🤖 bot de vérification toutes les heures
