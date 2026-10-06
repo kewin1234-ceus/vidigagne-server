@@ -13989,9 +13989,9 @@ app.get('/api/videos/:id/download-url', auth, async (req, res) => {
 // ==================== v2.49 : MISE À JOUR AUTO DE L'APP (sans Play Store) ====================
 // L'app appelle /api/app/version au démarrage (1x/jour) et propose le téléchargement
 // si versionCode > celui installé. L'APK est hébergée sur Cloudinary (URL stable).
-const APP_VERSION_CODE = 252;
-const APP_VERSION_NAME = '2.52';
-const APP_CHANGELOG = "Retraits en attente (message honnête tant que les revenus pub n'ont pas démarré), correctif inscription e-mail.";
+const APP_VERSION_CODE = 253;
+const APP_VERSION_NAME = '2.53';
+const APP_CHANGELOG = "Paliers d'abonnement (3 niveaux, badge abonné), badge compte protégé 🛡️ (13-15 ans), live « Audio seul » + retrait d'invité, programmation des lives, login Facebook (quand configuré), page /download.";
 async function appConfigGet(key) {
   try { const r = await get1('SELECT value FROM app_config WHERE key=?', key); return r ? r.value : ''; }
   catch (e) { return ''; }
