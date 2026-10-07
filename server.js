@@ -12743,6 +12743,20 @@ const _legal = (f) => (req, res) => {
 };
 app.get('/privacy', _legal('privacy.html'));
 app.get('/terms', _legal('terms.html'));
+// Bananito Publisher (appli TikTok Developer de Kewin) : documents exigés par le portail développeur
+app.get('/bananito/tos', _legal('bananito-tos.html'));
+app.get('/bananito/privacy', _legal('bananito-privacy.html'));
+// Bananito Publisher : callback OAuth TikTok (redirect URI https). Affiche le code à copier.
+app.get('/tiktok/callback', (req, res) => {
+  const esc = (s) => String(s || '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const code = req.query.code, err = req.query.error, errDesc = req.query.error_description;
+  const body = err
+    ? `<div style="font-weight:800;font-size:18px;color:#b00;margin-bottom:10px">Autorisation refusée ou erreur</div><p>${esc(err)}${errDesc ? ' — ' + esc(errDesc) : ''}</p><p style="color:#888">Fermez cette page et recommencez l'autorisation.</p>`
+    : code
+    ? `<div style="font-weight:800;font-size:18px;color:#0a0;margin-bottom:10px">Autorisation réussie ✅</div><p>Copiez ce code et transmettez-le :</p><div style="font-size:26px;font-weight:800;letter-spacing:2px;background:#f4f4f4;border:1px solid #ddd;border-radius:8px;padding:16px;word-break:break-all;user-select:all">${esc(code)}</div><p style="color:#888">Vous pouvez fermer cette page.</p>`
+    : `<div style="font-weight:800;font-size:18px;margin-bottom:10px">Callback TikTok</div><p style="color:#888">Aucun code reçu. Si vous venez d'autoriser l'application, recommencez.</p>`;
+  res.type('html').send(`<!DOCTYPE html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Bananito Publisher — autorisation TikTok</title><style>body{font-family:system-ui,sans-serif;max-width:700px;margin:0 auto;padding:24px;background:#fff;color:#222}</style></head><body>${body}</body></html>`);
+});
 // SPEC-download : lib QR (MIT, Kazuhiko Arase) servie en statique pour la page /download
 app.use('/pub', express.static(path.join(__dirname, 'public'), { maxAge: '30d' }));
 // SPEC-download : page de téléchargement — logo, bouton APK (URL depuis /api/app/version),
