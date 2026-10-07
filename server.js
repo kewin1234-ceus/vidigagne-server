@@ -9071,6 +9071,14 @@ app.post('/api/me/tz', auth, async (req, res) => {
     res.json({ ok: true, tz });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
+// FIX 2026-10-07 : heartbeat léger + enregistrement du device (1 identité par installation, v2.32).
+// Utilisé par l'app au démarrage et par les bots anti-fraude (header X-Device-Id).
+app.post('/api/me/ping', auth, async (req, res) => {
+  try {
+    await recordDevice(req, req.userId);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
 app.get('/api/me/campaign-notifs', auth, async (req, res) => {
   try {
     const u = await get1('SELECT campaign_notifs FROM users WHERE id=?', req.userId);
@@ -14096,9 +14104,9 @@ app.get('/api/videos/:id/download-url', auth, async (req, res) => {
 // ==================== v2.49 : MISE À JOUR AUTO DE L'APP (sans Play Store) ====================
 // L'app appelle /api/app/version au démarrage (1x/jour) et propose le téléchargement
 // si versionCode > celui installé. L'APK est hébergée sur Cloudinary (URL stable).
-const APP_VERSION_CODE = 258;
-const APP_VERSION_NAME = '2.58';
-const APP_CHANGELOG = "FIX CRITIQUE auth : la connexion Facebook/e-mail était cassée (boutons sans action) → réparée. Tous les parcours d'inscription vérifiés.";
+const APP_VERSION_CODE = 259;
+const APP_VERSION_NAME = '2.59';
+const APP_CHANGELOG = "Fix 2026-10-07 : placeOrder() ne crashe plus si le panneau panier n'est pas ouvert. Serveur : nouvel endpoint /api/me/ping.";
 async function appConfigGet(key) {
   try { const r = await get1('SELECT value FROM app_config WHERE key=?', key); return r ? r.value : ''; }
   catch (e) { return ''; }
