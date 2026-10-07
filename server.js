@@ -2464,7 +2464,7 @@ async function distributeAdRevenue(dayStr) {
   try {
     const day = await get1('SELECT ad_revenue_usd FROM ad_daily WHERE day=?', dayStr);
     const revenue = day ? Number(day.ad_revenue_usd) || 0 : 0;
-    if (revenue <= 0) return { day: dayStr, distributed: 0, note: 'aucun revenu pub' };
+    if (revenue <= 0) return { day: dayStr, distributed: 0, distributed_usd: 0, note: 'aucun revenu pub' };
     const creatorPool = revenue * 0.5;
     // impressions pubs du jour par vidéo (avec score qualité)
     const rows = await allRows(`SELECT ai.video_id, COUNT(*) AS imp, v.user_id AS creator_id
@@ -2472,7 +2472,7 @@ async function distributeAdRevenue(dayStr) {
       WHERE ai.created_at >= ? AND ai.created_at < ? AND v.hidden=0
       GROUP BY ai.video_id, v.user_id`,
       new Date(dayStr + 'T00:00:00Z').getTime(), new Date(dayStr + 'T00:00:00Z').getTime() + 86400000);
-    if (!rows.length) return { day: dayStr, distributed: 0, note: 'aucune impression pub' };
+    if (!rows.length) return { day: dayStr, distributed: 0, distributed_usd: 0, note: 'aucune impression pub' };
     // calcule le poids de chaque vidéo : impressions × score qualité
     let totalWeight = 0;
     const weighted = [];
@@ -2486,7 +2486,7 @@ async function distributeAdRevenue(dayStr) {
       totalWeight += w;
       weighted.push({ ...r, weight: w, quality: q });
     }
-    if (!weighted.length || totalWeight <= 0) return { day: dayStr, distributed: 0, note: 'aucune vidéo éligible' };
+    if (!weighted.length || totalWeight <= 0) return { day: dayStr, distributed: 0, distributed_usd: 0, note: 'aucune vidéo éligible' };
     let distributed = 0;
     for (const w of weighted) {
       const share = creatorPool * (w.weight / totalWeight);
@@ -8217,16 +8217,22 @@ app.get('/api/admin/integrity/counters', async (req, res) => {
     if (!checkAdmin(req, res)) return;
     const checks = [];
     let total = 0;
+    // FIX 2026-10-07 : filtre optionnel ?id= — la liste est tronquée à 100 (LIMIT),
+    // un écart précis devenait introuvable quand >100 écarts existent (cas réel
+    // sur base de test chargée : 992 vidéos, 100+ écarts). ?id= permet de vérifier
+    // un enregistrement précis (ex. bot chain-integrity-counters).
+    const onlyId = /^\d+$/.test(String(req.query.id || '')) ? Number(req.query.id) : 0;
     for (const c of COUNTER_CHECKS) {
       let mismatches = [], supported = true, checked = 0;
       try {
         const cnt = await get1(`SELECT COUNT(*) AS c FROM ${c.table}`);
         checked = Number(cnt ? cnt.c : 0);
+        const idFilter = onlyId ? ` AND t.${c.pk} = ${onlyId}` : '';
         mismatches = await allRows(
           `SELECT ${c.pk} AS id, COALESCE(${c.column},0) AS stored,` +
           ` (SELECT COUNT(*) FROM ${c.ref_table} r WHERE r.${c.ref_column} = t.${c.pk}) AS real` +
           ` FROM ${c.table} t WHERE COALESCE(t.${c.column},0) !=` +
-          ` (SELECT COUNT(*) FROM ${c.ref_table} r WHERE r.${c.ref_column} = t.${c.pk}) LIMIT 100`);
+          ` (SELECT COUNT(*) FROM ${c.ref_table} r WHERE r.${c.ref_column} = t.${c.pk})${idFilter} LIMIT 100`);
       } catch (e) { supported = false; }
       total += mismatches.length;
       checks.push({ key: c.key, label: c.label, table: c.table, column: c.column,
@@ -14072,9 +14078,9 @@ app.get('/api/videos/:id/download-url', auth, async (req, res) => {
 // ==================== v2.49 : MISE À JOUR AUTO DE L'APP (sans Play Store) ====================
 // L'app appelle /api/app/version au démarrage (1x/jour) et propose le téléchargement
 // si versionCode > celui installé. L'APK est hébergée sur Cloudinary (URL stable).
-const APP_VERSION_CODE = 257;
-const APP_VERSION_NAME = '2.57';
-const APP_CHANGELOG = "Fix parrainage : le code parrain affiché pouvait être faux (ancien cache) → rechargé depuis le serveur. Thème « Bleu Royal » partout.";
+const APP_VERSION_CODE = 258;
+const APP_VERSION_NAME = '2.58';
+const APP_CHANGELOG = "FIX CRITIQUE auth : la connexion Facebook/e-mail était cassée (boutons sans action) → réparée. Tous les parcours d'inscription vérifiés.";
 async function appConfigGet(key) {
   try { const r = await get1('SELECT value FROM app_config WHERE key=?', key); return r ? r.value : ''; }
   catch (e) { return ''; }
