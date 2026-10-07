@@ -12757,6 +12757,10 @@ app.get('/tiktok/callback', (req, res) => {
     : `<div style="font-weight:800;font-size:18px;margin-bottom:10px">Callback TikTok</div><p style="color:#888">Aucun code reçu. Si vous venez d'autoriser l'application, recommencez.</p>`;
   res.type('html').send(`<!DOCTYPE html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Bananito Publisher — autorisation TikTok</title><style>body{font-family:system-ui,sans-serif;max-width:700px;margin:0 auto;padding:24px;background:#fff;color:#222}</style></head><body>${body}</body></html>`);
 });
+// Bananito Publisher : vérification de domaine TikTok Developer (URL prefix method)
+app.get('/tiktoksiy2o1qmX7AfxJVgsdGw4yUfygDLPvhi.txt', (req, res) => {
+  res.type('text/plain').send('tiktok-developers-site-verification=siy2o1qmX7AfxJVgsdGw4yUfygDLPvhi');
+});
 // SPEC-download : lib QR (MIT, Kazuhiko Arase) servie en statique pour la page /download
 app.use('/pub', express.static(path.join(__dirname, 'public'), { maxAge: '30d' }));
 // SPEC-download : page de téléchargement — logo, bouton APK (URL depuis /api/app/version),
