@@ -14072,9 +14072,9 @@ app.get('/api/videos/:id/download-url', auth, async (req, res) => {
 // ==================== v2.49 : MISE À JOUR AUTO DE L'APP (sans Play Store) ====================
 // L'app appelle /api/app/version au démarrage (1x/jour) et propose le téléchargement
 // si versionCode > celui installé. L'APK est hébergée sur Cloudinary (URL stable).
-const APP_VERSION_CODE = 256;
-const APP_VERSION_NAME = '2.56';
-const APP_CHANGELOG = "Thème « Aurore Créole » partout : fond animé violet/rose/orange/or + étoiles, panneaux en verre dépoli, boutons sunset, mode sombre par défaut. Écran de connexion or/noir, pluie de pièces dorées.";
+const APP_VERSION_CODE = 257;
+const APP_VERSION_NAME = '2.57';
+const APP_CHANGELOG = "Fix parrainage : le code parrain affiché pouvait être faux (ancien cache) → rechargé depuis le serveur. Thème « Bleu Royal » partout.";
 async function appConfigGet(key) {
   try { const r = await get1('SELECT value FROM app_config WHERE key=?', key); return r ? r.value : ''; }
   catch (e) { return ''; }
