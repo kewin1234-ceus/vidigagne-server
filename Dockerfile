@@ -13,6 +13,7 @@ RUN python3 -c "import urllib.request,zipfile,os; \
 COPY package.json package-lock.json ./
 RUN npm install --omit=dev --no-audit --no-fund
 COPY server.js transcribe.py ./
+COPY legal ./legal
 RUN mkdir -p data/uploads
 ENV PORT=3000
 EXPOSE 3000
