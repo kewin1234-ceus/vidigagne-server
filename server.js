@@ -4323,7 +4323,7 @@ async function applyGiftSplit(fromId, toId, cost, giftId, liveId, immediate) {
   await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
     fromId, -cost, 'cadeau ' + giftId, now());
   await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
-    toId, creatorShare, goesToPool ? 'cadeau live ' + giftId + ' (50% → gains live)' : 'cadeau reçu ' + giftId + ' (50%)', now());
+    toId, goesToPool ? 0 : creatorShare, goesToPool ? 'cadeau live ' + giftId + ' (50% → gains live)' : 'cadeau reçu ' + giftId + ' (50%)', now());
   await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
     0, platformShare, 'commission cadeau ' + giftId, now());
   if (liveId) {
@@ -14104,9 +14104,9 @@ app.get('/api/videos/:id/download-url', auth, async (req, res) => {
 // ==================== v2.49 : MISE À JOUR AUTO DE L'APP (sans Play Store) ====================
 // L'app appelle /api/app/version au démarrage (1x/jour) et propose le téléchargement
 // si versionCode > celui installé. L'APK est hébergée sur Cloudinary (URL stable).
-const APP_VERSION_CODE = 259;
-const APP_VERSION_NAME = '2.59';
-const APP_CHANGELOG = "Fix 2026-10-07 : placeOrder() ne crashe plus si le panneau panier n'est pas ouvert. Serveur : nouvel endpoint /api/me/ping.";
+const APP_VERSION_CODE = 260;
+const APP_VERSION_NAME = '2.60';
+const APP_CHANGELOG = "Fix 2026-10-08 : ledger cohérent quand un cadeau live va au pool (montant 0, pas de crédit fantôme). Bot chain-gift-full : fin du live + échange des gains avant le retrait.";
 async function appConfigGet(key) {
   try { const r = await get1('SELECT value FROM app_config WHERE key=?', key); return r ? r.value : ''; }
   catch (e) { return ''; }
