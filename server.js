@@ -9158,6 +9158,23 @@ app.get('/api/users/:username/reposts', async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 
+// FIX 2026-10-09 : vidéos d'un utilisateur (onglet « Vidéos » du profil) — l'app affichait
+// seulement VIDEOS.filter(mine) (feed paginé) → profil incomplet. PAGINATION ?page=N (30/page).
+app.get('/api/users/:username/videos', async (req, res) => {
+  try {
+    const u = await get1('SELECT * FROM users WHERE username=?', String(req.params.username).toLowerCase());
+    if (!u) return res.status(404).json({ error: 'utilisateur introuvable' });
+    const meId = await optUserId(req);
+    const rpage = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const rows = await allRows('SELECT * FROM videos WHERE user_id=? AND hidden=0 AND (scheduled_at IS NULL OR scheduled_at <= ?) ORDER BY id DESC LIMIT 31 OFFSET ' + ((rpage - 1) * 30), u.id, now());
+    const videos = [];
+    for (const v of rows.slice(0, 30)) {
+      if (await canSeeVideo(v, meId)) { const j = await videoJSON(v, meId); if (j) videos.push(j); }
+    }
+    res.json({ videos, page: rpage, has_more: rows.length > 30 });
+  } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
+});
+
 // ---------- blocage ----------
 app.post('/api/blocks', auth, async (req, res) => {
   try {
@@ -9801,7 +9818,8 @@ app.post('/api/search/image', auth, uploadImg.single('image'), async (req, res) 
     const videos = [];
     for (const s of scored.slice(0, 20)) {
       const v = await get1('SELECT * FROM videos WHERE id=?', s.id);
-      if (v) videos.push(await videoJSON(v, req.userId));
+      // FIX 2026-10-09 : videoJSON() peut retourner null (canSeeVideo) → ne pas pousser null.
+      if (v) { const j = await videoJSON(v, req.userId); if (j) videos.push(j); }
     }
     res.json({ videos, hash: qhash });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
@@ -11337,7 +11355,8 @@ app.get('/api/sub-space', auth, async (req, res) => {
        AND EXISTS (SELECT 1 FROM creator_subs cs WHERE cs.creator_id=v.user_id AND cs.subscriber_id=? AND cs.active=1 AND cs.expires_at>?)
        ORDER BY v.created_at DESC LIMIT 50`, req.userId, now());
     const videos = [];
-    for (const v of rows) { try { videos.push(await videoJSON(v, req.userId)); } catch (_) {} }
+    // FIX 2026-10-09 : videoJSON() peut retourner null → ne pas pousser null.
+    for (const v of rows) { try { const j = await videoJSON(v, req.userId); if (j) videos.push(j); } catch (_) {} }
     res.json({ videos });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
