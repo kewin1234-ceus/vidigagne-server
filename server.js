@@ -3104,6 +3104,12 @@ async function canSeeVideo(v, meId) {
       v.user_id, meId, now());
     return !!s;
   }
+  if (vis === 'friends') {
+    // Amitié mutuelle : chacun suit l'autre
+    const f1 = await get1('SELECT 1 FROM follows WHERE follower_id=? AND followed_id=?', meId, v.user_id);
+    const f2 = await get1('SELECT 1 FROM follows WHERE follower_id=? AND followed_id=?', v.user_id, meId);
+    return !!(f1 && f2);
+  }
   return false; // private
 }
 // upsert historique de visionnage
@@ -4189,9 +4195,13 @@ app.post('/api/videos', auth, upload.single('video'), async (req, res) => {
         if (visibility === 'public' && !scheduledAt) {
           const me = await get1('SELECT username FROM users WHERE id=?', req.userId);
           const fols = await allRows('SELECT follower_id FROM follows WHERE followed_id=?', req.userId);
+          // FIX 2026-10-09 : les accès SQLite sont SYNCHRONES (node:sqlite) — sans yield,
+          // 1000+ notifs bloquent la boucle d'événements ~20 s et affament les autres requêtes.
+          let _ni = 0;
           for (const f of (fols || [])) {
             await notify(f.follower_id, 'new_video', req.userId, id,
               '🎬 @' + (me ? me.username : 'créateur') + ' a publié une nouvelle vidéo');
+            if (++_ni % 25 === 0) await new Promise(_r => setImmediate(_r));
           }
         }
       } catch (_) {}
@@ -5002,9 +5012,12 @@ app.post('/api/live/start', auth, async (req, res) => {
     try {
       const me = await get1('SELECT username FROM users WHERE id=?', req.userId);
       const fols = await allRows('SELECT follower_id FROM follows WHERE followed_id=?', req.userId);
+      // FIX 2026-10-09 : yield anti-blocage (cf. POST /api/videos) — SQLite synchrone.
+      let _ni2 = 0;
       for (const f of fols) {
         await notify(f.follower_id, 'live', req.userId, null,
           '🔴 @' + (me ? me.username : 'créateur') + ' est en direct' + (title ? ' : ' + title : '') + ' !');
+        if (++_ni2 % 25 === 0) await new Promise(_r => setImmediate(_r));
       }
     } catch (_) {}
   })();
@@ -7751,12 +7764,16 @@ app.get('/api/conversations/:id/messages', auth, async (req, res) => {
   try {
     const c = await convOf(req.params.id, req.userId);
     if (!c) return res.status(404).json({ error: 'conversation introuvable' });
+    // FIX 2026-10-09 : l'app (loadConv) lit r.d.other.username pour l'en-tête —
+    // sans ce champ, le rendu plantait (TypeError) et #conv-input n'apparaissait jamais.
+    const otherId = Number(c.user1_id) === Number(req.userId) ? c.user2_id : c.user1_id;
+    const ou = await get1('SELECT id,username,avatar FROM users WHERE id=?', otherId);
     const before = Number(req.query.before) || 0;
     const rows = before > 0
       ? await allRows('SELECT * FROM messages WHERE conversation_id=? AND id<? ORDER BY id DESC LIMIT 50', c.id, before)
       : await allRows('SELECT * FROM messages WHERE conversation_id=? ORDER BY id DESC LIMIT 50', c.id);
     rows.reverse(); // ordre chronologique
-    res.json({ messages: rows.map(function (m) {
+    res.json({ other: ou ? { id: ou.id, username: ou.username, avatar: ou.avatar } : null, messages: rows.map(function (m) {
       return { id: m.id, sender_id: m.sender_id, text: m.text, audio_url: m.audio_url || '',
         image_url: m.image_url || '', video_url: m.video_url || '',
         deleted_for_all: Number(m.deleted_for_all || 0), created_at: Number(m.created_at) };
@@ -8981,9 +8998,12 @@ async function updateScheduledLives() {
       if (!changed) continue; // déjà traité par une exécution concurrente
       const followers = await allRows('SELECT follower_id FROM follows WHERE followed_id=?', s.user_id);
       const me = await get1('SELECT username FROM users WHERE id=?', s.user_id);
+      // FIX 2026-10-09 : yield anti-blocage (cf. POST /api/videos) — SQLite synchrone.
+      let _ni3 = 0;
       for (const f of (followers || [])) {
         await notify(f.follower_id, 'live_started', s.user_id, null,
           '@' + (me ? me.username : '?') + ' est en live : ' + s.title + ' 🔴', null);
+        if (++_ni3 % 25 === 0) await new Promise(_r => setImmediate(_r));
       }
     }
   } catch (e) { console.error('updateScheduledLives:', e.message); }
@@ -10326,9 +10346,12 @@ app.post('/api/live/schedule', auth, async (req, res) => {
     // notifier les abonnés
     const followers = await allRows('SELECT follower_id FROM follows WHERE followed_id=?', req.userId);
     const me = await get1('SELECT username FROM users WHERE id=?', req.userId);
+    // FIX 2026-10-09 : yield anti-blocage (cf. POST /api/videos) — SQLite synchrone.
+    let _ni4 = 0;
     for (const f of (followers || [])) {
       await insertId('INSERT INTO notifications(user_id,type,actor_id,text,title,is_read,created_at) VALUES(?,?,?,?,?,0,?)',
         f.follower_id, 'live_scheduled', req.userId, '@' + (me ? me.username : '?') + ' prévoit un live : ' + title, '📅 Live programmé', now());
+      if (++_ni4 % 25 === 0) await new Promise(_r => setImmediate(_r));
     }
     res.json({ ok: true, id, notified: (followers || []).length });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
@@ -11565,9 +11588,13 @@ app.get('/api/shop/products/:id', async (req, res) => {
 async function shopSearch(req, res) {
   const q = '%' + String(req.query.q || '').toLowerCase() + '%';
   const cat = (req.query.category_id || req.query.category) ? Number(req.query.category_id || req.query.category) : null;
+  const maxP = req.query.max_price ? Number(req.query.max_price) : null;
+  const minP = req.query.min_price ? Number(req.query.min_price) : null;
   let sql = 'SELECT * FROM products WHERE active=1 AND stock>0 AND (LOWER(title) LIKE ? OR LOWER(description) LIKE ?)';
   const params = [q, q];
   if (cat) { sql += ' AND category_id=?'; params.push(cat); }
+  if (maxP !== null && !isNaN(maxP)) { sql += ' AND price_coins<=?'; params.push(maxP); }
+  if (minP !== null && !isNaN(minP)) { sql += ' AND price_coins>=?'; params.push(minP); }
   sql += ' ORDER BY created_at DESC LIMIT 50';
   const rows = await allRows(sql, ...params);
   res.json({ products: rows.map(productJSON) });
@@ -14104,9 +14131,9 @@ app.get('/api/videos/:id/download-url', auth, async (req, res) => {
 // ==================== v2.49 : MISE À JOUR AUTO DE L'APP (sans Play Store) ====================
 // L'app appelle /api/app/version au démarrage (1x/jour) et propose le téléchargement
 // si versionCode > celui installé. L'APK est hébergée sur Cloudinary (URL stable).
-const APP_VERSION_CODE = 260;
-const APP_VERSION_NAME = '2.60';
-const APP_CHANGELOG = "Fix 2026-10-08 : ledger cohérent quand un cadeau live va au pool (montant 0, pas de crédit fantôme). Bot chain-gift-full : fin du live + échange des gains avant le retrait.";
+const APP_VERSION_CODE = 261;
+const APP_VERSION_NAME = '2.61';
+const APP_CHANGELOG = "Fix 2026-10-09 : compte privé qui ne pouvait plus repasser en public (togglePrivate) ; conversation : correspondant manquant (champ de saisie invisible) + brouillon effacé par le rafraîchissement auto ; visibilité « Amis » désormais honorée par le serveur ; recherche boutique : filtres prix min/max. Bots : 291/298 isolés, 382/465 enchaînement (7 échecs attendus SPEC-15..21).";
 async function appConfigGet(key) {
   try { const r = await get1('SELECT value FROM app_config WHERE key=?', key); return r ? r.value : ''; }
   catch (e) { return ''; }
