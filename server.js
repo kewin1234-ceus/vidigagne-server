@@ -14150,9 +14150,9 @@ app.get('/api/videos/:id/download-url', auth, async (req, res) => {
 // ==================== v2.49 : MISE À JOUR AUTO DE L'APP (sans Play Store) ====================
 // L'app appelle /api/app/version au démarrage (1x/jour) et propose le téléchargement
 // si versionCode > celui installé. L'APK est hébergée sur Cloudinary (URL stable).
-const APP_VERSION_CODE = 261;
-const APP_VERSION_NAME = '2.61';
-const APP_CHANGELOG = "Fix 2026-10-09 : compte privé qui ne pouvait plus repasser en public (togglePrivate) ; conversation : correspondant manquant (champ de saisie invisible) + brouillon effacé par le rafraîchissement auto ; visibilité « Amis » désormais honorée par le serveur ; recherche boutique : filtres prix min/max. Bots : 291/298 isolés, 382/465 enchaînement (7 échecs attendus SPEC-15..21).";
+const APP_VERSION_CODE = 262;
+const APP_VERSION_NAME = '2.62';
+const APP_CHANGELOG = "Fix 2026-10-09 (bots à vie) : notifications — ouverture de la vidéo garantie (repli openDeepVideo si jumpToSrvVideo échoue) ; onglet « Vidéos » du profil charge toutes les vidéos via le nouvel endpoint GET /api/users/:username/videos (paginé) ; /api/search/image et /api/sub-space ne renvoient plus de null. Bots : 291/298 isolés, enchaînement tous verts sauf 3 live UI (limite mémoire VM).";
 async function appConfigGet(key) {
   try { const r = await get1('SELECT value FROM app_config WHERE key=?', key); return r ? r.value : ''; }
   catch (e) { return ''; }
