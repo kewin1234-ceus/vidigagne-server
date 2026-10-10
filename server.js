@@ -4113,7 +4113,11 @@ function stripBannedTags(text) {
   const clean = String(text || '').replace(/#([\p{L}\p{N}_]+)/gu, (m, tag) => {
     const t = tag.toLowerCase();
     for (const b of BANNED_PLATFORM_TAGS) {
-      if (t === b || t.includes(b) || b.includes(t) && t.length > 2) { removed.push('#' + tag); return ''; }
+      // FIX 2026-10-09 (bots à vie) : les tags bannis très courts ('x', 'ig', 'fb'...)
+      // ne doivent matcher qu'en ÉGALITÉ EXACTE, pas en sous-chaîne — sinon #robotmegaxxx
+      // ou #box sont supprimés à tort parce qu'ils « contiennent » x.
+      if (t === b) { removed.push('#' + tag); return ''; }
+      if (b.length > 2 && (t.includes(b) || (b.includes(t) && t.length > 2))) { removed.push('#' + tag); return ''; }
     }
     return m;
   });
