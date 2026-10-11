@@ -7287,6 +7287,11 @@ app.post('/api/videos/:id/like', auth, async (req, res) => {
     const v = await get1('SELECT * FROM videos WHERE id=?', req.params.id);
     if (!v) return res.status(404).json({ error: 'vidéo introuvable' });
     const alreadyLiked = await get1('SELECT 1 FROM likes WHERE user_id=? AND video_id=?', req.userId, v.id);
+    // FIX race 2026-10-11 (bot chain-concurrent-likes) : l'insert ET le COUNT final doivent
+    // être sérialisés par vidéo — sinon sous charge concurrente une réponse peut renvoyer
+    // un compteur périmé (ex. likes=9 alors que 10 likes sont en base). withKeyLock, pas de
+    // changement de logique métier.
+    const likes = await withKeyLock('like:' + v.id, async () => {
     await insertIgnore('INSERT OR IGNORE INTO likes(user_id,video_id,created_at) VALUES(?,?,?)',
       req.userId, v.id, now());
     // v2.41 : vélocité anti-fraude — >15 likes en 5 min = comportement de bot (farme de likes).
@@ -7329,12 +7334,16 @@ app.post('/api/videos/:id/like', auth, async (req, res) => {
         }
       });
     }
-    const likes = Number((await get1('SELECT COUNT(*) AS c FROM likes WHERE video_id=?', v.id)).c);
+    const _likes = Number((await get1('SELECT COUNT(*) AS c FROM likes WHERE video_id=?', v.id)).c);
+    return _likes;
+    }); // fin withKeyLock('like:'+v.id)
     res.json({ likes, liked: true });
   } catch (e) { res.status(500).json({ error: 'erreur serveur' }); }
 });
 
 app.delete('/api/videos/:id/like', auth, async (req, res) => {
+  // FIX race 2026-10-11 : sérialise delete+count par vidéo (même race que POST /like).
+  const likes = await withKeyLock('like:' + req.params.id, async () => {
   await runSql('DELETE FROM likes WHERE user_id=? AND video_id=?', req.userId, req.params.id);
   // v2.38 : unlike → décrémente les scores de tags « Pour toi » (plancher 0)
   try {
@@ -7345,7 +7354,9 @@ app.delete('/api/videos/:id/like', auth, async (req, res) => {
         req.userId, _t);
     }
   } catch (_) {}
-  const likes = Number((await get1('SELECT COUNT(*) AS c FROM likes WHERE video_id=?', req.params.id)).c);
+  const _likes = Number((await get1('SELECT COUNT(*) AS c FROM likes WHERE video_id=?', req.params.id)).c);
+  return _likes;
+  }); // fin withKeyLock('like:'+id)
   res.json({ likes, liked: false });
 });
 
@@ -14154,9 +14165,9 @@ app.get('/api/videos/:id/download-url', auth, async (req, res) => {
 // ==================== v2.49 : MISE À JOUR AUTO DE L'APP (sans Play Store) ====================
 // L'app appelle /api/app/version au démarrage (1x/jour) et propose le téléchargement
 // si versionCode > celui installé. L'APK est hébergée sur Cloudinary (URL stable).
-const APP_VERSION_CODE = 262;
-const APP_VERSION_NAME = '2.62';
-const APP_CHANGELOG = "Fix 2026-10-09 (bots à vie) : notifications — ouverture de la vidéo garantie (repli openDeepVideo si jumpToSrvVideo échoue) ; onglet « Vidéos » du profil charge toutes les vidéos via le nouvel endpoint GET /api/users/:username/videos (paginé) ; /api/search/image et /api/sub-space ne renvoient plus de null. Bots : 291/298 isolés, enchaînement tous verts sauf 3 live UI (limite mémoire VM).";
+const APP_VERSION_CODE = 263;
+const APP_VERSION_NAME = '2.63';
+const APP_CHANGELOG = "Fix 2026-10-11 (bots à vie) : race condition POST/DELETE /api/videos/:id/like — l'insert et le COUNT sont désormais sérialisés par vidéo (withKeyLock), la réponse ne renvoie plus un compteur périmé sous likes concurrents. Bots : 291/298 isolés (7 specs non implémentées), enchaînement tous verts après triage sauf 3 live UI (limite mémoire VM).";
 async function appConfigGet(key) {
   try { const r = await get1('SELECT value FROM app_config WHERE key=?', key); return r ? r.value : ''; }
   catch (e) { return ''; }
