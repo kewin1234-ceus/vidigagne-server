@@ -9829,9 +9829,16 @@ app.post('/api/search/image', auth, uploadImg.single('image'), async (req, res) 
         if (d <= 12) scored.push({ id: r.id, d });
       } catch (_) {}
     }
-    scored.sort((a, b) => a.d - b.d);
+    // FIX 2026-10-12 : ex-aequo → les plus récentes d'abord. Avant, une vidéo tout juste
+    // publiée avec un match exact (distance 0) était départagée par id croissant et se
+    // retrouvait dernière des ex-aequo → la moins susceptible d'apparaître dans le top-20.
+    scored.sort((a, b) => (a.d - b.d) || (b.id - a.id));
     const videos = [];
-    for (const s of scored.slice(0, 20)) {
+    // FIX 2026-10-12 : filtrer les null de videoJSON() AVANT le plafond de 20.
+    // Avant, scored.slice(0, 20) s'appliquait avant le filtre → moins de 20 résultats
+    // valides alors que des matchs valides existaient au-delà du top-20.
+    for (const s of scored) {
+      if (videos.length >= 20) break;
       const v = await get1('SELECT * FROM videos WHERE id=?', s.id);
       // FIX 2026-10-09 : videoJSON() peut retourner null (canSeeVideo) → ne pas pousser null.
       if (v) { const j = await videoJSON(v, req.userId); if (j) videos.push(j); }
@@ -14165,9 +14172,9 @@ app.get('/api/videos/:id/download-url', auth, async (req, res) => {
 // ==================== v2.49 : MISE À JOUR AUTO DE L'APP (sans Play Store) ====================
 // L'app appelle /api/app/version au démarrage (1x/jour) et propose le téléchargement
 // si versionCode > celui installé. L'APK est hébergée sur Cloudinary (URL stable).
-const APP_VERSION_CODE = 263;
-const APP_VERSION_NAME = '2.63';
-const APP_CHANGELOG = "Fix 2026-10-11 (bots à vie) : race condition POST/DELETE /api/videos/:id/like — l'insert et le COUNT sont désormais sérialisés par vidéo (withKeyLock), la réponse ne renvoie plus un compteur périmé sous likes concurrents. Bots : 291/298 isolés (7 specs non implémentées), enchaînement tous verts après triage sauf 3 live UI (limite mémoire VM).";
+const APP_VERSION_CODE = 264;
+const APP_VERSION_NAME = '2.64';
+const APP_CHANGELOG = "Fix 2026-10-12 (bots à vie) : 1) POST /api/search/image — les résultats valides au-delà du top-20 n'étaient plus perdus (filtre appliqué avant le plafond) et une vidéo tout juste publiée avec un match exact apparaît désormais en premier des ex-aequo. 2) Visualiseur stories — réouvrir les stories sans les fermer ne laisse plus l'ancien minuteur tourner en arrière-plan. Bots : 291/298 isolés (7 specs non implémentées), 330+23+33+25 enchaînements verts après triage, 13 bots corrigés.";
 async function appConfigGet(key) {
   try { const r = await get1('SELECT value FROM app_config WHERE key=?', key); return r ? r.value : ''; }
   catch (e) { return ''; }
