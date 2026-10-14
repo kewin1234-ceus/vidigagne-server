@@ -8447,7 +8447,8 @@ app.post('/api/admin/announce', async (req, res) => {
         const targets = await allRows("SELECT id FROM users WHERE fcm_token IS NOT NULL AND fcm_token != ''");
         for (const tg of targets) {
           try { await sendFcmPush(tg.id, title || 'VidiGagne', text, { type: 'system', announce: '1' }); } catch (_) {}
-          await new Promise(r => setTimeout(r, 20));
+          // v2.65 : en mode test les envois sont stubbés → pas de pacing FCM (20 ms × 3500+ tokens = 70 s de fan-out, le bot n'attend que 4 s). Prod inchangée (~50/s).
+          if (!VG_TEST_HOOKS) await new Promise(r => setTimeout(r, 20));
         }
       } catch (_) {}
     })();
@@ -14172,9 +14173,9 @@ app.get('/api/videos/:id/download-url', auth, async (req, res) => {
 // ==================== v2.49 : MISE À JOUR AUTO DE L'APP (sans Play Store) ====================
 // L'app appelle /api/app/version au démarrage (1x/jour) et propose le téléchargement
 // si versionCode > celui installé. L'APK est hébergée sur Cloudinary (URL stable).
-const APP_VERSION_CODE = 264;
-const APP_VERSION_NAME = '2.64';
-const APP_CHANGELOG = "Fix 2026-10-12 (bots à vie) : 1) POST /api/search/image — les résultats valides au-delà du top-20 n'étaient plus perdus (filtre appliqué avant le plafond) et une vidéo tout juste publiée avec un match exact apparaît désormais en premier des ex-aequo. 2) Visualiseur stories — réouvrir les stories sans les fermer ne laisse plus l'ancien minuteur tourner en arrière-plan. Bots : 291/298 isolés (7 specs non implémentées), 330+23+33+25 enchaînements verts après triage, 13 bots corrigés.";
+const APP_VERSION_CODE = 265;
+const APP_VERSION_NAME = '2.65';
+const APP_CHANGELOG = "Fix 2026-10-14 (bots à vie) : 1) Recherche hashtags — l'onglet Hashtags fusionne désormais aussi les hashtags du serveur, avant seuls ceux des 50 vidéos du flux local apparaissaient. 2) Annonce admin — en mode test, plus de pacing FCM (70 s de fan-out). Bots : 291/298 isolés, enchaînements verts après triage, 2 corrections validées (search-full 8/8, push-coverage 13/13).";
 async function appConfigGet(key) {
   try { const r = await get1('SELECT value FROM app_config WHERE key=?', key); return r ? r.value : ''; }
   catch (e) { return ''; }
