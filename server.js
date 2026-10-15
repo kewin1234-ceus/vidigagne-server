@@ -12099,9 +12099,12 @@ app.post('/api/ads/campaigns', auth, async (req, res) => {
       const p = await get1('SELECT * FROM products WHERE id=? AND seller_id=? AND active=1', product_id, req.userId);
       if (!p) return res.status(400).json({ error: 'produit invalide' });
     }
-    const me = await get1('SELECT coins FROM users WHERE id=?', req.userId);
-    if (!me || Number(me.coins) < budget) return res.status(400).json({ error: 'pas assez de pièces' });
-    await runSql('UPDATE users SET coins=coins-? WHERE id=?', budget, req.userId);
+    // FIX 2026-10-15 (bots à vie) : débit ATOMIQUE gardé — l'ancien check-then-debit
+    // (SELECT coins puis UPDATE sans garde) laissait 2 créations concurrentes passer
+    // le check et débiter 2× le budget → solde négatif possible. Même pattern que les
+    // autres débits (runSqlChanges + AND coins>=?).
+    const debited = await runSqlChanges('UPDATE users SET coins=coins-? WHERE id=? AND coins>=?', budget, req.userId, budget);
+    if (!debited) return res.status(400).json({ error: 'pas assez de pièces' });
     await runSql('INSERT INTO ledger(user_id,amount,reason,created_at) VALUES(?,?,?,?)',
       req.userId, -budget, 'campagne publicitaire', now());
     const id = await insertId(
